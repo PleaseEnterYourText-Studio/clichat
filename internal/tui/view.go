@@ -426,13 +426,16 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 	}
 
 	out := make([]string, 0, 8)
-	// 布局：自己的靠右对齐、无底色；对方的左起一格缩进、铺满一条灰底，
-	// 一直铺到版面右沿。两边在余光里就能分开（paintPeerRow 里说明了
-	// 为什么不能直接把整行丢给 style.Render）。
+	// 布局：自己的靠右对齐，对方的左起一格缩进。两边都**不铺底色** ——
+	// 靠对齐方向 + 名字颜色区分就够了。
+	//
+	// 这里原本给对方的整行铺了一条灰底（paintPeerRow），后来去掉了：
+	// 一整片灰把正文的对比度压下去，长会话读起来很累，而它想解决的
+	// 「谁在说」其实靠对齐和名字颜色已经能分开。
 	if mine {
 		out = append(out, padLeft(head, width-2))
 	} else {
-		out = append(out, paintPeerRow(padRight(" "+head, width-2)))
+		out = append(out, padRight(" "+head, width-2))
 	}
 	// 正文里存的是 Markdown（见 mail.HTMLToMarkdown），这里渲染成终端样式。
 	//
@@ -443,7 +446,7 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 		if mine {
 			out = append(out, padLeft(line, width-2))
 		} else {
-			out = append(out, paintPeerRow(padRight(" "+line, width-2)))
+			out = append(out, padRight(" "+line, width-2))
 		}
 	}
 	return append(out, "")
