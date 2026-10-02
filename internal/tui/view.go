@@ -27,45 +27,157 @@ func (m Model) View() string {
 		return m.viewFolderPicker()
 	}
 
-	if m.width < singlePaneWidth {
-		return m.viewSinglePane()
+	l := m.layout()
+	if !l.twoPane {
+		return m.viewSinglePane(l)
 	}
-	return m.viewTwoPane()
+	return m.viewTwoPane(l)
 }
 
-// ---- 尺寸 ----
+// ---- 尺寸与布局 ----
 
-// listWidth 是左侧会话栏的宽度。
-func (m Model) listWidth() int {
-	w := m.width / 3
-	if w < 24 {
-		w = 24
+// maxTabs 是顶部会话标签页最多显示几个。
+//
+// 4 个是「一眼扫完」的上限：再多就得靠读，而这一行的全部意义就是
+// 不用读 —— 想切会话的人按 Ctrl+↑/↓ 更快。
+const maxTabs = 4
+
+// layout 是整个界面的几何：每个区域在屏幕上的行与列。
+//
+// **渲染和鼠标命中测试共用这一份。** 这件事不是洁癖 —— 两处各算一遍
+// 坐标，迟早有一处被改而另一处忘了，表现是「点到的位置和看到的不一致」，
+// 而且只在某些窗口尺寸下才错。那种 bug 极难复现，所以从源头掐掉：
+// 只要画的时候用的是这个结构，点的时候也用这个结构，就不可能漂移。
+type layout struct {
+	twoPane bool
+
+	// tabsRow 是顶部会话标签页所在的行；-1 表示这一行不存在
+	// （单栏模式、或者最近没开过第二个会话）。
+	tabsRow int
+
+	// bodyTop / bodyH 是主体区（各栏）的行范围。
+	bodyTop int
+	bodyH   int
+
+	// inputTop / inputRows 是浮起输入区的行范围。
+	inputTop  int
+	inputRows int
+
+	statusRow int
+
+	// 横向：导航列 / 会话列表列 / 会话流。
+	// 单栏模式下只有 list 有效（list 和 chat 都是整幅宽，互斥显示）。
+	navX, navW   int
+	listX, listW int
+	chatX, chatW int
+
+	// contentX 是内容区左边缘，contentW 是它到最右一列之间的列数（末列
+	// 留给一格右边距）。
+	//
+	// 内容区里的四样东西 —— 顶部标签页、会话列表、浮起的输入框、状态栏
+	// —— 都从这里起步。各自少缩进一格的话，一眼就能看出左边缘参差不齐，
+	// 而「对齐」这种事没人会专门去提 bug，只会觉得「说不上哪里别扭」。
+	//
+	// 内容区从侧栏**之后再空一格**开始（navWidth + navGutter），所以
+	// 单栏模式下它是 0，和以前一样。
+	contentX, contentW int
+}
+
+// layout 算一遍界面几何。
+func (m Model) layout() layout {
+	var l layout
+	l.twoPane = m.width >= singlePaneWidth
+
+	row := 0
+	l.tabsRow = -1
+	// 标签页只在双栏、并且真的有得切的时候才出现。
+	// 只有一个会话时它既没内容也没用，白占一行。
+	if l.twoPane && len(m.tabThreads()) >= 2 {
+		l.tabsRow = row
+		row++
 	}
-	if w > 36 {
-		w = 36
+	l.bodyTop = row
+
+	l.statusRow = m.height - 1
+	l.inputRows = m.inputBlockRows()
+	l.inputTop = l.statusRow - l.inputRows
+	if l.inputTop < l.bodyTop+1 {
+		// 终端太矮，留白先让给正文：输入区退回单行贴底。
+		l.inputRows = 1
+		l.inputTop = l.statusRow - 1
+	}
+
+	l.bodyH = l.inputTop - l.bodyTop
+	if l.bodyH < 1 {
+		l.bodyH = 1
+	}
+
+	if l.twoPane {
+		// 导航列自带右边那一格空隙，所以 navW 比侧栏本身宽一格。
+		// 让空隙算在导航这一栏里，后面几栏的 x 坐标就不用各自 +1 ——
+		// 「谁该缩进」这种账分摊到四处，迟早有一处漏掉。
+		l.navX, l.navW = 0, navWidth+navGutter
+		l.listX = l.navW
+		l.listW = m.listWidth()
+		l.chatX = l.listX + l.listW + 1 // +1 是那根竖线
+		l.chatW = m.width - l.chatX
+		if l.chatW < 1 {
+			l.chatW = 1
+		}
+	} else {
+		l.navX, l.navW = 0, 0
+		l.listX, l.listW = 0, m.width
+		l.chatX, l.chatW = 0, m.width
+	}
+
+	l.contentX = l.listX
+	l.contentW = m.width - l.contentX - 1
+	if l.contentW < 1 {
+		l.contentW = 1
+	}
+	return l
+}
+
+// inputBlockRows 是浮起输入区占的行数。
+//
+// 高度不够时退回 1 行（贴底的单行）—— 留白是奢侈品，正文优先。
+// 12 行是「3 行输入区之后还剩 8 行给正文」的下限，再矮就没法读了。
+func (m Model) inputBlockRows() int {
+	if m.height < 12 {
+		return 1
+	}
+	return inputBlockHeight
+}
+
+// listWidth 是左侧会话列表栏的宽度。
+//
+// 它和导航列是分开算的：导航列固定 navWidth，这里只算列表自己。
+// 原来取 width/3（24..36），加上导航列之后会挤掉正文，所以收窄成
+// width/4（22..30）—— 列表只要能放下「Alice, Bob」这样的名字就够，
+// 主题本来就会被截断。
+func (m Model) listWidth() int {
+	w := m.width / 4
+	if w < 22 {
+		w = 22
+	}
+	if w > 30 {
+		w = 30
 	}
 	return w
 }
 
-// bodyHeight 是除去分隔线、输入行、状态栏之后正文区的高度。
+// bodyHeight 是主体区的高度（含每栏自己的标题行）。
 func (m Model) bodyHeight() int {
-	h := m.height - 3
-	if h < 3 {
-		h = 3
-	}
-	return h
+	return m.layout().bodyH
 }
 
 // chatPaneWidth 是会话流那一栏的总宽度（含最右那一列滚动条）。
 //
-// 双栏时它是右栏 —— 左边一栏加中间那根竖线之外的全部；单栏时就是整幅。
-// 抽出来是因为「正文折成几行」和「正文画多宽」必须是同一个数，两边各
-// 算一遍的话，改了布局里的一处、另一处就开始骗人。
+// 双栏时它是右栏 —— 左边导航列、列表栏、中间那根竖线之外的全部；
+// 单栏时就是整幅。抽出来是因为「正文折成几行」和「正文画多宽」必须是
+// 同一个数，两边各算一遍的话，改了布局里的一处、另一处就开始骗人。
 func (m Model) chatPaneWidth() int {
-	if m.width < singlePaneWidth {
-		return m.width
-	}
-	return m.width - m.listWidth() - 1
+	return m.layout().chatW
 }
 
 // chatBodyWidth 是正文文字可用的宽度 —— 从 chatPaneWidth 里让出最右一列
@@ -83,8 +195,8 @@ func (m Model) chatBodyWidth() int {
 
 // chatViewHeight 是会话正文区能显示的行数。
 //
-// 传进来的是 bodyHeight()（标题 + 正文 + 补白那一整块），减 1 是顶部
-// 那行会话标题。单栏双栏都一样：renderChat 永远先画一行标题。
+// 传进来的是 bodyH（标题 + 正文 + 补白那一整块），减 1 是顶部那行
+// 会话标题。单栏双栏都一样：renderChat 永远先画一行标题。
 func chatViewHeight(bodyH int) int {
 	if bodyH < 2 {
 		return 1
@@ -94,49 +206,321 @@ func chatViewHeight(bodyH int) int {
 
 // ---- 主布局 ----
 
-func (m Model) viewTwoPane() string {
-	bodyH := m.bodyHeight()
-	listW := m.listWidth()
-
+// viewTwoPane 拼三栏：导航 / 会话列表 / 会话流。
+//
+// **中间不画横线** —— 各区域靠底色与留白分开。层次是：导航列有底色
+// （最外一层，而且从上到下贯通）→ 列表栏无底色 → 一条竖线 → 会话流。
+//
+// 竖线留着，不像参照的设计那样全去掉：终端里纯靠底色分出「列表到哪儿
+// 结束」不够可靠（底色深浅随用户的主题走，浅色主题上两档灰几乎一样），
+// 而这条竖线是**功能性**的 —— 它同时是滚动条那一列的对齐基准。
+func (m Model) viewTwoPane(l layout) string {
 	panes := lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		m.renderThreadList(listW, bodyH),
+		m.renderNav(l),
+		m.renderThreadList(l.listW, l.bodyH),
 		"│",
-		m.renderChat(m.chatPaneWidth(), bodyH),
+		m.renderChat(l.chatW, l.bodyH),
 	)
 
-	return strings.Join([]string{
-		panes,
-		strings.Repeat("─", m.width),
-		m.renderInput(),
-		m.renderStatus(),
-	}, "\n")
+	out := make([]string, 0, m.height)
+	if l.tabsRow >= 0 {
+		out = append(out, m.renderTabs(l))
+	}
+	out = append(out, strings.Split(panes, "\n")...)
+	out = append(out, m.renderInputBlock(l)...)
+	out = append(out, m.withNavStrip(m.renderStatus(l.contentW), l))
+	return strings.Join(out, "\n")
 }
 
-func (m Model) viewSinglePane() string {
-	bodyH := m.bodyHeight()
-
+func (m Model) viewSinglePane(l layout) string {
 	var body string
 	if m.mode == modeChat || m.mode == modeNewChat {
-		body = m.renderChat(m.width, bodyH)
+		body = m.renderChat(l.chatW, l.bodyH)
 	} else {
-		body = m.renderThreadList(m.width, bodyH)
+		body = m.renderThreadList(l.listW, l.bodyH)
 	}
 
-	return strings.Join([]string{
-		body,
-		strings.Repeat("─", m.width),
-		m.renderInput(),
-		m.renderStatus(),
-	}, "\n")
+	out := strings.Split(body, "\n")
+	out = append(out, m.renderInputBlock(l)...)
+	out = append(out, m.renderStatus(l.contentW+1))
+	return strings.Join(out, "\n")
+}
+
+// withNavStrip 给一行的左边补上导航列那条底色和它右边的空隙。
+//
+// 底下的输入区和状态栏不走 renderNav，不补这一下侧栏就在半空中断掉，
+// 看着像「导航栏只有一半高」。补的是一段实底空格 + 一格空隙，不是给整行
+// 上色 —— 整行上色会把右边的输入框也染成导航的底色。
+func (m Model) withNavStrip(line string, l layout) string {
+	if l.navW <= 0 {
+		return line
+	}
+	return paintRowBg(strings.Repeat(" ", navWidth), navBgSeq()) +
+		strings.Repeat(" ", navGutter) + line
+}
+
+// ---- 左侧导航 ----
+
+// renderNav 画左侧导航列（两级：组标题 + 组里的项）。
+//
+// 底色的铺法：先按纯文本把每一行拼到 navWidth 宽，再**逐行**重压底色 ——
+// 不能指望 styleNav.Render(整块)，那样只有第一行有底色（原因见
+// paintRowBg 的注释）。空隙那一格**不铺**，见 navGutter。
+func (m Model) renderNav(l layout) string {
+	if l.navW <= 0 {
+		return ""
+	}
+	rows := m.navRows()
+	out := make([]string, 0, l.bodyH)
+	for i := 0; i < l.bodyH; i++ {
+		line := ""
+		if i < len(rows) {
+			line = rows[i]
+		}
+		out = append(out, paintRowBg(padRight(line, navWidth), navBgSeq())+
+			strings.Repeat(" ", navGutter))
+	}
+	return strings.Join(out, "\n")
+}
+
+// navRows 返回导航列的每一行（纯渲染内容，不含底色）。
+//
+// 返回的是**画出来的行**，和点鼠标时的命中测试共用同一套换算 ——
+// 见 navRowIndexAt。
+func (m Model) navRows() []string {
+	var out []string
+	for gi, g := range m.navGroups() {
+		if gi > 0 {
+			// 组与组之间空一行。这个空行就是「两级」在视觉上的分界 ——
+			// 没有它，两个组的标题会连成一片，看成六个平级的项。
+			out = append(out, "")
+		}
+		out = append(out, styleGroupTitle.Render(" "+truncate(g.title, navWidth-2)))
+		for _, it := range g.items {
+			out = append(out, m.navItemRow(it))
+		}
+	}
+	return out
+}
+
+// navItemRow 画导航里的一项。
+//
+// 选中项的那块底色要**铺满整列**，所以顺序是「先补齐宽度、再上色」：
+// 反过来的话底色只盖住文字那几个字，看起来像被划了一道而不是一行选中。
+func (m Model) navItemRow(it navItem) string {
+	label := "  " + it.label
+	if it.unread > 0 {
+		label += " " + fmt.Sprint(it.unread)
+	}
+	label = truncate(label, navWidth)
+	padded := padRight(label, navWidth)
+
+	if it.folder == m.activeFolder {
+		return styleNavActive.Render(padded)
+	}
+	return styleNavIdle.Render(padded)
+}
+
+// navRowIndexAt 把导航列里的一行（相对主体区顶部的偏移）映射回 navRows 的下标。
+//
+// 返回值 <0 表示这一行不是可点的项（组标题、组之间的空行、超出内容的补白）。
+func (m Model) navRowIndexAt(off int) (navItem, bool) {
+	if off < 0 {
+		return navItem{}, false
+	}
+	// 与 navRows 的排布一一对应地重走一遍：组标题和空行占位、跳过。
+	row := 0
+	for gi, g := range m.navGroups() {
+		if gi > 0 {
+			if row == off {
+				return navItem{}, false
+			}
+			row++
+		}
+		if row == off {
+			return navItem{}, false
+		}
+		row++
+		for _, it := range g.items {
+			if row == off {
+				return it, true
+			}
+			row++
+		}
+	}
+	return navItem{}, false
+}
+
+// ---- 顶部标签页 ----
+
+// renderTabs 画顶部那一排会话标签页。
+//
+// 按**列**拼而不是用 JoinHorizontal：每个标签的起点来自 tabChips，
+// 和鼠标命中测试用的是同一份坐标。中间的空隙也照坐标补，于是
+// 「看到的」和「点到的」在结构上就不可能错开。
+func (m Model) renderTabs(l layout) string {
+	chips := m.tabChips(l)
+	if len(chips) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	col := 0
+	for _, c := range chips {
+		for col < c.x0 {
+			b.WriteByte(' ')
+			col++
+		}
+		text := padRight(" "+c.label+" ", c.x1-c.x0)
+		if c.id == m.activeID {
+			b.WriteString(styleTabActive.Render(text))
+		} else {
+			b.WriteString(styleTabIdle.Render(text))
+		}
+		col = c.x1
+	}
+	// 后面还有没画出来的会话时留个省略号：一个也不说，用户只会以为
+	// 标签页的数量就是全部。
+	if remaining := len(m.tabThreads()) - len(chips); remaining > 0 && col+1 < m.width {
+		b.WriteString(styleMuted.Render("…"))
+	}
+	return m.withNavStrip(b.String(), l)
+}
+
+// tabChipAt 找出落在列 x 上的那个标签页。
+//
+// x 是**屏幕列**（鼠标传来的是什么就是什么）。标签的坐标是内容区里的
+// 相对列，所以这里减一次侧栏 —— 和 renderTabs 里 withNavStrip 加的那
+// 一次正好抵消。少了这一步，标签画在哪儿和点得着哪儿就差一个侧栏宽。
+func (m Model) tabChipAt(l layout, x int) (tabChip, bool) {
+	x -= l.contentX
+	for _, c := range m.tabChips(l) {
+		if x >= c.x0 && x < c.x1 {
+			return c, true
+		}
+	}
+	return tabChip{}, false
 }
 
 // ---- 会话列表 ----
 
+// listRow 是会话列表里画出来的一行。
+//
+// 之所以要有「行」这一层、而不是直接按下标画 m.visible：分组（未读 / 已读）
+// 和每条会话占两行这两件事，都会让「第几行」和「第几条会话」不再是一回事。
+// 渲染、窗口滚动、鼠标命中测试三处都必须用**同一套换算**，所以换算只有
+// 这一个出处 —— 各自算一遍的话，会分头漂移，而且只在有未读、或者窗口
+// 刚够放下某几条的时候才错。
+type listRow struct {
+	// group 非空表示这是一行分组标题。
+	group string
+	// idx 是这一行对应的会话在 m.visible 里的下标；标题行是 -1。
+	idx int
+	// first 表示这是该会话的第一行（标题行，第二行是主题）。
+	first bool
+}
+
+// listRows 把当前列表摊成待渲染的行。
+//
+// 分组只在**两组都有内容**时才画标题：全是未读或全是已读的时候，
+// 一条孤零零的「未读 37」只是白占一行。
+func (m Model) listRows() []listRow {
+	if len(m.visible) == 0 {
+		return nil
+	}
+
+	var unread, read []int
+	for i, th := range m.visible {
+		if th.Unread > 0 {
+			unread = append(unread, i)
+		} else {
+			read = append(read, i)
+		}
+	}
+
+	out := make([]listRow, 0, len(m.visible)*2+2)
+	both := len(unread) > 0 && len(read) > 0
+	add := func(title string, idxs []int) {
+		if both {
+			out = append(out, listRow{group: title, idx: -1})
+		}
+		for _, i := range idxs {
+			out = append(out, listRow{idx: i, first: true}, listRow{idx: i})
+		}
+	}
+	add(fmt.Sprintf("未读 %d", len(unread)), unread)
+	add(fmt.Sprintf("已读 %d", len(read)), read)
+	return out
+}
+
+// cursorRowIndex 是光标所在会话的**标题行**在 rows 里的下标。
+//
+// 拿标题行而不是主题行：窗口滚动时要把它作为一对的起点。
+// 找不到返回 -1（光标还没落到任何一条上）。
+func (m Model) cursorRowIndex(rows []listRow) int {
+	for i, r := range rows {
+		if r.first && r.idx == m.cursor {
+			return i
+		}
+	}
+	return -1
+}
+
+// listWindow 算出列表该画 rows 的哪一段 [start, end)。
+//
+// height 是整个列表栏的高度（含标题行）。窗口跟着光标走，保证光标那
+// 一对（标题 + 主题）始终在窗口里。
+func (m Model) listWindow(rows []listRow, height int) (int, int) {
+	capacity := height - 1 // 第一行是「会话 · INBOX」那个标题
+	if capacity < 1 {
+		capacity = 1
+	}
+	if len(rows) <= capacity {
+		return 0, len(rows)
+	}
+
+	start := 0
+	if cr := m.cursorRowIndex(rows); cr >= 0 {
+		if cr >= capacity {
+			start = cr - capacity + 1
+		}
+		// 光标那一对的两行都得进来：只露标题、主题被切掉，
+		// 看着就像这封邮件少了一行。
+		if cr+2 > start+capacity {
+			start = cr + 2 - capacity
+		}
+		if start > cr {
+			start = cr
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	// 起点对齐到某条会话的标题行 —— 从主题行开始画，上面那封邮件的
+	// 标题就被切掉了，而它并没有被滚过去，只是被截断。
+	for start > 0 && start < len(rows) && !rows[start].first {
+		start++
+	}
+	end := start + capacity
+	if end > len(rows) {
+		end = len(rows)
+	}
+	if start >= end {
+		start = 0
+		end = capacity
+		if end > len(rows) {
+			end = len(rows)
+		}
+	}
+	return start, end
+}
+
 // renderThreadList 画左侧的会话列表。
 //
 // 标题行带上当前文件夹和未读总数 —— 过滤生效时如果不显示，用户会
-// 以为邮件丢了。
+// 以为邮件丢了。搜索词也一样：搜索是可以回车保留的，不留痕迹的话，
+// 用户会以为「列表里就剩这几封了」。
 func (m Model) renderThreadList(width, height int) string {
 	lines := make([]string, 0, height)
 	lines = append(lines, styleTitle.Render(truncate(m.listHeader(), width-2)))
@@ -146,63 +530,83 @@ func (m Model) renderThreadList(width, height int) string {
 		return fillPane(lines, width, height)
 	}
 
-	// 每条会话占两行：标题 + 主题。标题行已经占掉一行，所以可显示条数要减一。
-	const perItem = 2
-	capacity := (height - 1) / perItem
-	if capacity < 1 {
-		capacity = 1
+	rows := m.listRows()
+	start, end := m.listWindow(rows, height)
+	for _, r := range rows[start:end] {
+		lines = append(lines, m.renderListRow(r, width))
+	}
+	return fillPane(lines, width, height)
+}
+
+// renderListRow 画列表里的一行。
+//
+// 选中的那一条：两行**都**铺底色块，用 padRight 补到满宽才有「整行」
+// 的效果。底色外不再叠前景样式 —— 块里字色深浅不一，整块底色的边界
+// 就看不清了，反而比反白更乱。
+func (m Model) renderListRow(r listRow, width int) string {
+	if r.group != "" {
+		return styleGroupTitle.Render(padRight(truncate("  "+r.group, width-2), width-2))
 	}
 
-	start := 0
-	if m.cursor >= capacity {
-		start = m.cursor - capacity + 1
+	th := m.visible[r.idx]
+	text := m.listRowText(th, r.first, width)
+
+	if r.idx == m.cursor {
+		return styleRowSelected.Render(padRight(text, width-2))
 	}
-	end := start + capacity
-	if end > len(m.visible) {
-		end = len(m.visible)
+	switch {
+	case !r.first:
+		return styleMuted.Render(text)
+	case th.Unread > 0:
+		return styleUnread.Render(text)
+	default:
+		return styleTitle.Render(text)
 	}
+}
 
-	for i := start; i < end; i++ {
-		th := m.visible[i]
-		marker := "  "
-		if th.Unread > 0 {
-			marker = "● "
-		}
-
-		// 星标紧跟在未读标记后面：两个标记的列宽都是两列，
-		// 所以有没有星标都不会让后面的名字错位。
-		star := "  "
-		if th.IsStarred() {
-			star = "★ "
-		}
-
-		title := truncate(marker+star+threadTitle(th), width-2)
+// listRowText 是列表某一行的纯文本（未上色）。
+//
+// 先拼纯文本、再上色是硬约束：带上转义序列之后再截断，会把序列剪断
+// （styles.go 里那条）。
+func (m Model) listRowText(th thread.Thread, first bool, width int) string {
+	if !first {
 		// 副行是「现在在聊什么」—— 会话里最新一条的主题。一个会话可以
 		// 横跨很多话题，所以它和标题（对方的名字）回答的是两个问题。
 		subject := th.Subject
 		if subject == "" {
 			subject = "(无主题)"
 		}
-		subject = truncate("    "+subject, width-2)
-
-		if i == m.cursor {
-			// 选中行整行反白，用 padRight 补到满宽才有「整行」的效果。
-			lines = append(lines,
-				styleSelected.Render(padRight(title, width-2)),
-				styleSelected.Render(padRight(subject, width-2)),
-			)
-			continue
-		}
-
-		if th.Unread > 0 {
-			lines = append(lines, styleUnread.Render(title))
-		} else {
-			lines = append(lines, styleTitle.Render(title))
-		}
-		lines = append(lines, styleMuted.Render(subject))
+		return truncate("    "+subject, width-2)
 	}
 
-	return fillPane(lines, width, height)
+	marker := "  "
+	if th.Unread > 0 {
+		marker = "● "
+	}
+	// 星标紧跟在未读标记后面：两个标记的列宽都是两列，
+	// 所以有没有星标都不会让后面的名字错位。
+	star := "  "
+	if th.IsStarred() {
+		star = "★ "
+	}
+	return truncate(marker+star+threadTitle(th), width-2)
+}
+
+// listRowAt 把列表栏里的一行（相对主体区顶部的偏移）映射回一条会话。
+//
+// 和 renderThreadList 共用 listRows + listWindow，所以点到的行就是
+// 看到的那一行。
+func (m Model) listRowAt(width, height, off int) (int, bool) {
+	rows := m.listRows()
+	start, end := m.listWindow(rows, height)
+	i := start + off - 1 // 减 1 是那行标题
+	if i < 0 || i >= end {
+		return 0, false
+	}
+	if rows[i].idx < 0 {
+		return 0, false
+	}
+	return rows[i].idx, true
 }
 
 // listHeader 是会话列表的标题行。
@@ -210,6 +614,9 @@ func (m Model) listHeader() string {
 	title := "会话"
 	if m.activeFolder != "" {
 		title += " · " + m.activeFolder
+	}
+	if m.query != "" {
+		title += " · 「" + m.query + "」"
 	}
 
 	unread := 0
@@ -443,44 +850,155 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 	return append(out, "")
 }
 
-// ---- 输入行与状态栏 ----
+// ---- 输入区与状态栏 ----
 
-func (m Model) renderInput() string {
+// renderInputBlock 画底部那一块浮起的输入区。
+//
+// 返回的行数**恒等于** l.inputRows：界面的行号是布局算出来的，画的时候
+// 少一行多一行，下面的状态栏和鼠标的命中测试会整体错开一格 ——
+// 那种错只在某些窗口尺寸下出现，最难查。
+//
+// 「浮起」在字符网格里只能这么表达：上下各留一整行空白，左右各留一列
+// 边距，中间那一行铺一条比周围亮一档的底色。终端里没有圆角、没有阴影、
+// 没有 z 轴，但「被空白包围的独立色块」已经足够让眼睛把它读成一层浮在
+// 内容之上的东西 —— 而不是又一条贴底的横带。留白不是浪费，是这个方案
+// 成立的前提。
+func (m Model) renderInputBlock(l layout) []string {
+	plain := m.width - l.navW
+	if plain < 1 {
+		plain = 1
+	}
+
+	if l.inputRows <= 1 {
+		// 终端太矮，留白让给了正文。退回单行贴底 —— 和以前一样。
+		return []string{m.withNavStrip(m.renderInputLine(plain), l)}
+	}
+
+	blank := m.withNavStrip(strings.Repeat(" ", plain), l)
+
+	if !m.inputFloats() {
+		// 列表模式没有输入框，这一行留给常驻快捷键提示。**不套底色块**：
+		// 给一行提示铺上输入框的底色，等于告诉用户那里能打字。
+		return []string{blank, m.withNavStrip(m.renderInputLine(plain), l), blank}
+	}
+
+	// 浮起输入框的那一块：占满内容区（左边和标签页、列表对齐，右边留
+	// 一格），块内两端再各留一列空白，所以文字可用的宽度是 blockW-2。
+	blockW := l.contentW
+	if blockW < 8 {
+		// 窄到放不下边距，就贴满 —— 有边距却只剩三个字，不如不要边距。
+		blockW = m.width - l.contentX
+	}
+	if blockW < 3 {
+		blockW = 3
+	}
+
+	// 底色**必须**用 paintRowBg 重压，不能 styleInputRow.Render(整行)：
+	// 行里有输入框的光标、提示文字这些自带 ^[[0m 的片段，重置会把底色
+	// 一起清掉，于是底色只剩几段零零碎碎的（styles.go 的 paintRowBg
+	// 里记着这条坑）。
+	block := paintRowBg(
+		" "+padRight(m.renderInputLine(blockW-2), blockW-2)+" ",
+		bgSeqOf(styleInputRow))
+	return []string{blank, m.withNavStrip(block, l), blank}
+}
+
+// inputFloats 说当前这一行要不要画成浮起的输入框。
+//
+// 只有真的在等用户打字的那几个模式才画：确认框、文件夹选择这些
+// 只是借这一行显示一句提示，套上输入框的底色会让人以为还能打字。
+func (m Model) inputFloats() bool {
+	switch m.mode {
+	case modeChat, modeNewChat, modeSearch, modeForward:
+		return true
+	}
+	return false
+}
+
+// renderInputLine 是输入区那一行的内容（不含底色）。
+//
+// width 是这一行可用的列数：单行贴底时是全宽，浮起时还要减掉块内两端
+// 的空白。提示文字的截断必须按这个宽度来 —— 以前用 m.width，长输入会把
+// 提示顶出屏幕，右边那栏的边框跟着歪。
+//
+// **返回的显示宽度不会超过 width。** 下面那块的宽度是布局算出来的，
+// 这一行多出去几列，右边那条边距就没了，浮起的效果也跟着散掉。
+func (m Model) renderInputLine(width int) string {
+	if width < 1 {
+		width = 1
+	}
+
 	switch m.mode {
 	case modeConfirm:
 		// 确认框占用这一行：不显示输入框，免得用户以为还能打字。
-		return styleError.Render(truncate(m.confirmPrompt(), m.width))
+		return styleError.Render(truncate(m.confirmPrompt(), width))
 
 	case modeSearch:
-		return stylePrompt.Render(m.input.View()) +
-			styleMuted.Render("   （回车保留过滤，Esc 清空）")
+		return m.withNote(width, "   （回车保留过滤，Esc 清空）")
 
 	case modeForward:
-		return stylePrompt.Render(m.input.View()) +
-			styleMuted.Render("   （转发最后一条，回车发送，Esc 取消）")
+		return m.withNote(width, "   （转发最后一条，回车发送，Esc 取消）")
 
 	case modeNewChat:
-		return stylePrompt.Render(m.input.View()) +
-			styleMuted.Render("   （回车确定，Esc 取消）")
+		return m.withNote(width, "   （回车确定，Esc 取消）")
 
 	case modeChat:
-		hint := m.chatHint()
-		// 先按剩余宽度截断提示**再**上色。输入框里的字数是没上限的
-		// （textinput 不会自己折行），用户敲长句时提示会把这一行顶出
-		// 屏幕，右边那栏的边框就歪了。反过来先上色再截断会把转义序列
-		// 剪断（styles.go 那条硬约束）。
-		//
-		// 输入框自己的宽度用 lipgloss.Width 量 —— 它带 SGR 和光标，
-		// textWidth 那把尺子不认识转义序列。
-		if room := m.width - lipgloss.Width(m.input.View()); textWidth(hint) > room {
-			hint = truncate(hint, room)
-		}
-		return stylePrompt.Render(m.input.View()) + styleMuted.Render(hint)
+		return m.withNote(width, m.chatHint())
 	}
 
 	// 列表模式没有输入框，这一行留给常驻快捷键提示。
 	// 界面上的功能之所以长期"不存在"，就是因为它们只活在代码里。
-	return styleMuted.Render(truncate(listHints(), m.width))
+	return styleMuted.Render(truncate(listHints(), width))
+}
+
+// minInputWidth 是浮起输入框最少要留多少列。
+//
+// 24 列 ≈ 12 个汉字，够写一句话。比这更窄的话，把提示全丢掉也不够用，
+// 不如就让输入框占满 —— 一个只能看见四个字的输入框等于不能用。
+const minInputWidth = 24
+
+// withNote 拼「输入框 + 右边一句提示」，两者一起正好不超过 width 列。
+//
+// 提示放不下就截短，剩不下 8 列就不显示：残句（「   （Tab：发」）比
+// 没有更碍眼，还会让人以为界面坏了。
+func (m Model) withNote(width int, note string) string {
+	inW := width - textWidth(note) - 1
+	if inW < minInputWidth {
+		inW = minInputWidth
+	}
+	if inW+textWidth(note) > width {
+		note = truncate(note, width-inW-1)
+		if textWidth(note) < 8 {
+			return m.sizedInput(width)
+		}
+	}
+	return m.sizedInput(inW) + styleMuted.Render(note)
+}
+
+// sizedInput 把输入框渲染成正好 width 列宽。
+//
+// 为什么要「量一遍再补差」：textinput 的 Width 口径和 lipgloss.Width 差着
+// 三列 —— 它把提示符（2 列）和光标（1 列）算在 Width 之外（实测
+// Width=40 → View 宽 43）。那 3 列是它的实现细节，不该抄到这里当成常数；
+// 直接量一遍、把它多占的列数补回去，它哪天变了这里也不会错。
+//
+// 宽度必须准：这一行是拼在浮起的底色块里的，宽了几列就会把右边那列
+// 边距顶掉，整块看着就「漏」了。
+func (m Model) sizedInput(width int) string {
+	if width < 1 {
+		width = 1
+	}
+	in := m.input
+	in.Width = width
+	if got := lipgloss.Width(in.View()); got > width {
+		in.Width -= got - width
+		if in.Width < 1 {
+			in.Width = 1
+		}
+	}
+	// 包一层而不是改 textinput 自己的 Prompt：它的 Prompt 会参与宽度计算
+	// 和光标定位，从外面套样式进去，它算的还是原样。
+	return stylePrompt.Render(in.View())
 }
 
 // chatHint 是会话内输入行右侧那串提示。
@@ -607,7 +1125,14 @@ func (m Model) viewFolderPicker() string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderStatus() string {
+// renderStatus 画最底下那行状态栏。
+//
+// width 是这一行可用的列数 —— 双栏时它比终端窄 navW 列，因为左边那条
+// 导航底色要一直贯到底。
+func (m Model) renderStatus(width int) string {
+	if width < 1 {
+		width = 1
+	}
 	var parts []string
 	switch {
 	case m.busy:
@@ -638,7 +1163,7 @@ func (m Model) renderStatus() string {
 		line += "   " + m.status
 	}
 	// 先截断再上色：截断会破坏 ANSI 转义序列。
-	line = truncate(line, m.width)
+	line = truncate(line, width)
 
 	switch {
 	case m.status != "":

@@ -68,6 +68,11 @@ func newFeatureModel(t *testing.T) (Model, *mail.Fake) {
 	m := NewWithApp(cfg, app.New(cfg, fake, idx))
 	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = syncOnce(t, m)
+	// 开机时那条「拉文件夹列表」的命令也要跑一遍。左侧导航里的「已发送 /
+	// 已删除」用的是规范名，得靠这份列表解析成服务端上真实的写法；夹具里
+	// 少了这一步，导航就会指着一个不存在的文件夹，点进去永远是空的 ——
+	// 而这正是启动时该发生的事（见 Model.Init）。
+	m = runCmd(t, m, m.foldersCmd(false))
 	return m, fake
 }
 
@@ -103,6 +108,8 @@ func TestHelp_DocumentsCoreActions(t *testing.T) {
 		"ctrl+y", "ctrl+u", "ctrl+t", "ctrl+d",
 		"f1",
 		"上一个", "下一个",
+		// 空间布局那一轮加的东西：不写进帮助页，用户就不知道它们存在。
+		"ctrl+g", "侧栏", "标签页", "滚轮",
 	}
 	for _, want := range required {
 		if !strings.Contains(help, strings.ToLower(want)) {
@@ -391,29 +398,64 @@ func TestStar_TogglesAndShowsMarker(t *testing.T) {
 func TestUnread_MarksFromList(t *testing.T) {
 	m, _ := newFeatureModel(t)
 
-	// 光标在第 0 个（Sent 里那条，本来就是已读）。
-	if m.visible[0].Unread != 0 {
-		t.Fatalf("前提不成立：Unread=%d", m.visible[0].Unread)
+	// 挑一条**已读**的会话来标记：列表按未读排在前面分组，所以「第 0 个」
+	// 一定是未读的那条，不再是以前那个「Sent 里最新的一条」。
+	// 位置也不能拿来断言（标记完它会被挪走），只认主题。
+	idx := -1
+	for i, th := range m.visible {
+		if th.Unread == 0 {
+			idx = i
+			break
+		}
 	}
+	if idx < 0 {
+		t.Fatal("前提不成立：列表里一条已读的都没有")
+	}
+	m.cursor = idx
+	victim := m.visible[idx].Subject
 
 	m, cmd := update(m, keyMsg("u"))
 	m = runCmd(t, m, cmd)
 
-	if m.visible[0].Unread != 1 {
-		t.Errorf("标记未读没生效, Unread=%d", m.visible[0].Unread)
+	got, ok := threadBySubject(m.visible, victim)
+	if !ok {
+		t.Fatalf("标记未读之后 %q 不见了", victim)
 	}
+	if got.Unread != 1 {
+		t.Errorf("标记未读没生效, %q 的 Unread=%d", victim, got.Unread)
+	}
+}
+
+// threadBySubject 按主题在列表里找一条会话。
+//
+// 按主题而不是按下标：列表会随着未读状态重排（未读浮到前面），
+// 任何「第 N 条」的断言在这次重排之后量的都是另一条会话。
+func threadBySubject(list []thread.Thread, subject string) (thread.Thread, bool) {
+	for _, th := range list {
+		if th.Subject == subject {
+			return th, true
+		}
+	}
+	return thread.Thread{}, false
 }
 
 func TestNextUnread_JumpsToUnread(t *testing.T) {
 	m, _ := newFeatureModel(t)
 
+	// 从**末尾**出发。未读的分组排在前面，光标初始位置（第 0 条）本来
+	// 就是未读的 —— 那样按 ] 只是原地不动，量不出「它会跳」。
+	m, _ = update(m, keyMsg("end"))
 	if m.visible[m.cursor].Unread != 0 {
-		t.Fatal("前提不成立：起点应该是已读的")
+		t.Fatalf("前提不成立：末尾应该是已读的，实际 Unread=%d", m.visible[m.cursor].Unread)
 	}
 
 	m, _ = update(m, keyMsg("]"))
 	if m.visible[m.cursor].Unread == 0 {
 		t.Errorf("] 应该跳到未读会话上，实际停在 %q", m.visible[m.cursor].Subject)
+	}
+	// 到底之后绕回第一组未读，所以该停在最前面那条上。
+	if first := firstUnread(m.visible, 0, 1); m.cursor != first {
+		t.Errorf("] 绕回后应该停在第一个未读（下标 %d），实际 %d", first, m.cursor)
 	}
 }
 

@@ -95,6 +95,13 @@ type Model struct {
 	// activeFolder 为空串表示不按文件夹过滤。
 	activeFolder string
 
+	// recent 是最近打开过的会话 ID，最近的在最前。
+	//
+	// 顶部那几个标签页从这里来。用「打开过的」而不是「列表里最上面的」：
+	// 标签页回答的是「我刚才在跟谁说话」，那是操作历史；按时间排是左边
+	// 列表已经在做的事，在顶上再抄一遍等于没有信息量。
+	recent []string
+
 	// helpScroll 是帮助页的滚动位置（从顶部算起的行数）。
 	helpScroll int
 	// helpReturn 记录帮助页是从哪个界面打开的，关掉时退回去。
@@ -168,6 +175,8 @@ type actionResultMsg struct {
 type foldersResultMsg struct {
 	folders []string
 	err     error
+	// open 表示这次拉取是为了打开 Tab 选择器（见 foldersCmd）。
+	open bool
 }
 
 // allMailResultMsg 是「接收全部邮件」开关切换完成的回执。
@@ -235,7 +244,12 @@ func (m Model) Init() tea.Cmd {
 	if m.mode != modeList && m.mode != modeChat {
 		return textinput.Blink
 	}
-	return tea.Batch(m.syncCmd(), m.pollCmd(), textinput.Blink)
+	// 文件夹列表要开机就拉：左侧导航里的「已发送 / 已删除」是**规范名**
+	// （SENT / TRASH），各家服务端上真正的写法可能是 Sent、已发送邮件……
+	// 列表没到手之前，那两项会被原样当成 "SENT" 去过滤，点进去永远是空的。
+	// 以前只有 Tab 选择器用得到它，按一下 Tab 就有了；现在导航一开机就
+	// 把那两项摆在那儿，所以得在开机时把它取回来。
+	return tea.Batch(m.syncCmd(), m.foldersCmd(false), m.pollCmd(), textinput.Blink)
 }
 
 // ---- 命令 ----
@@ -373,11 +387,16 @@ func (m Model) copyLastBodyCmd(th thread.Thread) tea.Cmd {
 	}
 }
 
-func (m Model) foldersCmd() tea.Cmd {
+// foldersCmd 生成一个「问服务端要文件夹列表」的命令。
+//
+// open 表示这次拉取的目的是**打开选择器**（Tab）：只有这条路才需要转圈、
+// 才该把失败报给用户。开机那一次是后台补齐，安静地做就行 —— 服务端不支
+// 持 LIST 的时候，不值得为一件用户没要求的事弹一条错。
+func (m Model) foldersCmd(open bool) tea.Cmd {
 	a := m.app
 	return func() tea.Msg {
 		f, err := a.Folders()
-		return foldersResultMsg{folders: f, err: err}
+		return foldersResultMsg{folders: f, err: err, open: open}
 	}
 }
 
@@ -404,6 +423,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 帮助页同理（帮助内容的行数只取决于宽度），两处一起收。
 		m.clampChatScroll()
 		m.clampHelpScroll()
+		// 输入框自己也得有个宽度上限：它的 Width 为 0 时完全不裁剪。
+		// 这里给的是**整页视图**（解锁、配置向导）里那个独占一行的输入框
+		// 用的粗上限；会话里那个浮起输入框的宽度要精确到列，由
+		// renderInputLine 按那一行实际剩多少现算（它才知道提示要占多宽）。
+		m.input.Width = m.pageInputWidth()
 		return m, nil
 
 	case pollTickMsg:
@@ -445,6 +469,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 新会话在发出去之前不存在于列表里，发完才出现 —— 把视图切过去。
 		if msg.id != "" {
 			m.activeID = msg.id
+			m.noteRecent(msg.id)
 		}
 		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
 
@@ -491,12 +516,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case foldersResultMsg:
-		m.busy = false
 		if msg.err != nil {
-			m.status = "取文件夹列表失败：" + shortErr(msg.err)
+			// 开机那次拉不到就安静地算了（导航会退回按规范名过滤，
+			// 和以前一样）；按 Tab 才需要告诉用户为什么选择器没开。
+			if msg.open {
+				m.busy = false
+				m.status = "取文件夹列表失败：" + shortErr(msg.err)
+			}
 			return m, nil
 		}
 		m.folders = msg.folders
+		if !msg.open {
+			return m, nil
+		}
+		m.busy = false
 		// 打开选择器时把光标停在当前选中的那一项上，而不是从头开始。
 		m.folderCursor = 0
 		for i, name := range m.folderChoices() {
@@ -851,6 +884,28 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "R":
 		return m.openActive(true)
 
+	// Ctrl+G 循环切换左侧导航（文件夹）。用「循环」而不是给每一项配键：
+	// 见 cycleNav 的说明。
+	case "ctrl+g":
+		m.cycleNav()
+
+	// Esc 一次收起一层筛选：先退掉文件夹，再退掉搜索词。两层都干净时
+	// 什么也不做 —— 列表模式下没有「上一层」可退，凭空把光标挪回顶部
+	// 只会让人以为按错了。
+	//
+	// 这两层筛选**都必须有键盘退路**：导航是可以点出来的（鼠标），
+	// 搜索词是回车保留的（键盘），只进不出就成了死胡同。
+	case "esc":
+		switch {
+		case m.activeFolder != "":
+			m.setFolder("")
+		case m.query != "":
+			m.query = ""
+			m.refreshVisible()
+			m.cursor = 0
+			m.clampCursor()
+		}
+
 	case "n":
 		m.mode = modeNewChat
 		m.input.EchoMode = textinput.EchoNormal
@@ -874,7 +929,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// 文件夹列表要问服务端，所以先转个圈再开选择器。
 		m.busy = true
-		return m, m.foldersCmd()
+		return m, m.foldersCmd(true)
 
 	case "r":
 		if m.app != nil {
@@ -994,6 +1049,8 @@ func (m Model) enterThread(th thread.Thread, solo, keepDraft bool) (tea.Model, t
 		m.input.SetValue("")
 	}
 	m.input.Focus()
+	// 记进「最近打开」，顶部标签页按这个顺序排。
+	m.noteRecent(th.ID)
 
 	return m, tea.Batch(
 		textinput.Blink,
@@ -1220,8 +1277,12 @@ func (m *Model) setThreads(list []thread.Thread) {
 }
 
 // refreshVisible 按当前文件夹与搜索词重算要显示的会话。
+//
+// 顺序也在这一步定下来（未读排前面），因为列表的分组要靠它 ——
+// 光标索引的就是这个切片，重排和不重排必须发生在同一个地方，否则
+// 「按一下 ↓ 跳到哪儿」和「屏幕上第几行亮」会对不上。
 func (m *Model) refreshVisible() {
-	m.visible = filterThreads(m.threads, m.activeFolder, m.query)
+	m.visible = groupUnreadFirst(filterThreads(m.threads, m.activeFolder, m.query))
 }
 
 // currentThread 返回光标所在的会话。
@@ -1344,26 +1405,81 @@ func (m *Model) moveCursor(dir int) {
 	m.clampCursor()
 }
 
-// handleMouse 处理鼠标事件。
+// ---- 鼠标 ----
+
+// hitRegion 是屏幕上一块可交互的区域。
+type hitRegion int
+
+const (
+	hitNone hitRegion = iota
+	hitNav
+	hitTabs
+	hitList
+	hitDivider
+	hitChat
+	hitInput
+	hitStatus
+)
+
+// hitTest 判断一个坐标落在哪一块。
 //
-// 只认滚轮。左键点击（点一条会话、点一个按钮）需要先把每一行对应回
-// 是哪条消息，那是另一件事 —— 半吊子的点击比没有点击更让人困惑。
-//
-// 「滚谁」按指针落在哪一栏定：双栏时在左栏挪光标（不打开，打开是回车
-// 或点击的事），在右栏滚正文；单栏只有一栏，按当前看的是列表还是会话
-// 来分。这正是「聚焦」在鼠标这一侧的正解 —— 指针在哪，滚轮就管哪，
-// 不用先按一个键把焦点挪过去。
-func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if msg.Action != tea.MouseActionPress {
-		return m, nil
+// 判断全部走 layout()，和画界面用的是同一份几何。这是本轮「点得到」
+// 能算数（而不是「差不多能点」）的唯一原因：只要画的时候用的是这份
+// 几何，点的时候也用这份，两者就不可能漂移。
+func (m Model) hitTest(x, y int) (hitRegion, layout) {
+	l := m.layout()
+	if x < 0 || y < 0 || x >= m.width || y >= m.height {
+		return hitNone, l
 	}
-	var dir int
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		dir = 1
-	case tea.MouseButtonWheelDown:
-		dir = -1
-	default:
+
+	switch {
+	case l.tabsRow >= 0 && y == l.tabsRow:
+		// 标签页占的是内容区那一行；左边那块还是导航。
+		if x < navWidth {
+			return hitNav, l
+		}
+		if x < l.contentX {
+			return hitNone, l
+		}
+		return hitTabs, l
+
+	case y >= l.inputTop && y < l.inputTop+l.inputRows:
+		return hitInput, l
+
+	case y == l.statusRow:
+		return hitStatus, l
+
+	case y >= l.bodyTop && y < l.bodyTop+l.bodyH:
+		switch {
+		case x < navWidth:
+			return hitNav, l
+		case x < l.listX:
+			// 侧栏右边那一格空隙：不属于任何一栏。点它不该有反应 ——
+			// 归给左边会让人误按到文件夹，归给右边会误开一封邮件。
+			return hitNone, l
+		case x < l.listX+l.listW:
+			return hitList, l
+		case x == l.listX+l.listW:
+			return hitDivider, l
+		default:
+			return hitChat, l
+		}
+	}
+	return hitNone, l
+}
+
+// handleMouse 处理鼠标事件：滚轮滚动，左键点击。
+//
+// 滚轮按**指针落在哪一栏**分流：在导航或列表上挪光标，在会话流上滚正文。
+// 这就是「聚焦」在鼠标这一侧的正解 —— 指针在哪，滚轮就管哪，不用先按
+// 一个键把焦点挪过去。
+//
+// 左边那一栏也归滚轮管（而不是「只要进了会话，滚轮就只滚正文」）：
+// 用户看着某一条会话想往下挪，手自然会放到那一条上面。
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// 只认「按下」这一下。滚轮的松开事件也带着同一个 Button，不挡掉的话
+	// 一格滚轮会滚两格。
+	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
 
@@ -1371,28 +1487,141 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// 少了这一条的话，在帮助页上滚滚轮会去动底下那个列表的光标 ——
 	// 屏幕上看不见任何变化，用户只会觉得轮子坏了。
 	if m.mode == modeHelp {
-		m.helpScroll -= dir * wheelStep
-		m.clampHelpScroll()
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.helpScroll -= wheelStep
+			m.clampHelpScroll()
+		case tea.MouseButtonWheelDown:
+			m.helpScroll += wheelStep
+			m.clampHelpScroll()
+		}
 		return m, nil
 	}
 
-	switch {
-	case m.mode == modeChat || m.mode == modeNewChat:
-		// 在会话里。单栏时整幅都是会话；双栏时指针在左栏就挪光标 ——
-		// 「左边那一栏也归滚轮管」比「只要进了会话，滚轮就只滚正文」
-		// 更符合指针在哪滚哪的直觉。
-		if m.width >= singlePaneWidth && msg.X < m.listWidth() {
-			m.moveCursor(-dir)
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		return m.handleWheel(1, msg.X, msg.Y)
+	case tea.MouseButtonWheelDown:
+		return m.handleWheel(-1, msg.X, msg.Y)
+	case tea.MouseButtonLeft:
+		return m.handleClick(msg.X, msg.Y)
+	}
+	return m, nil
+}
+
+// handleWheel 处理滚轮。up>0 表示向上滚。
+func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
+	region, _ := m.hitTest(x, y)
+
+	switch m.mode {
+	case modeChat, modeNewChat:
+		if region == hitNav || region == hitList {
+			m.moveCursor(-up)
 		} else {
-			m.scrollChat(dir * wheelStep)
+			m.scrollChat(up * wheelStep)
 		}
-	case m.mode == modeList:
-		m.moveCursor(-dir)
+	case modeList:
+		m.moveCursor(-up)
 	}
 	// 其余模式（搜索、文件夹选择、确认框、配置向导、解锁）不接管滚轮：
 	// 它们要么是弹在最上面的一小条，要么在等一个明确的答复，
 	// 让滚轮去改背后那些状态只会造出「屏幕上没变、底下却变了」的怪事。
 	return m, nil
+}
+
+// handleClick 处理左键点击。
+//
+// 会话内的点击一律用 keepDraft=true 进新会话：点击比回车「手滑」得多，
+// 打了一半的字不该因为点到别处就没了。草稿跨会话保留本来就是这个界面
+// 已有的行为（Ctrl+↑/↓ 走的就是它）。
+func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
+	region, l := m.hitTest(x, y)
+
+	switch region {
+	case hitTabs:
+		if c, ok := m.tabChipAt(l, x); ok && c.id != m.activeID {
+			th, ok := m.threadByID(c.id)
+			if !ok {
+				return m, nil
+			}
+			return m.enterThread(th, false, true)
+		}
+
+	case hitNav:
+		// 导航只认「主体区里的那几行」；上下留白和贯通到底的那一条
+		// 都不该有点击效果。
+		if y < l.bodyTop || y >= l.bodyTop+l.bodyH {
+			return m, nil
+		}
+		if it, ok := m.navRowIndexAt(y - l.bodyTop); ok {
+			m.setFolder(it.folder)
+		}
+
+	case hitList:
+		if m.mode != modeList {
+			return m, nil
+		}
+		idx, ok := m.listRowAt(l.listW, l.bodyH, y-l.bodyTop)
+		if !ok {
+			return m, nil
+		}
+		m.cursor = idx
+		return m.enterThread(m.visible[idx], false, true)
+
+	case hitChat:
+		if m.mode != modeChat && m.mode != modeNewChat {
+			return m, nil
+		}
+		// 点在正文最右那一列（滚动条那一列）上就跳过去。
+		if x == l.chatX+l.chatW-1 {
+			m.scrollToBar(y - l.bodyTop - 1)
+		}
+	}
+	return m, nil
+}
+
+// scrollToBar 把正文滚到滚动条上第 row 行对应的位置。
+//
+// 换算里带那个 -1 的 offset，是因为正文第一行是会话标题，滚动条从
+// 标题下面才开始（renderChat 里画的就是这样）。少了它，点最上面
+// 一格会差一行 —— 看着「点到底了还差一点」。
+func (m *Model) scrollToBar(row int) {
+	total := m.chatBodyLines()
+	viewH := chatViewHeight(m.bodyHeight())
+	max := total - viewH
+	if max <= 0 {
+		return
+	}
+	if row < 0 {
+		row = 0
+	}
+	if row >= viewH {
+		row = viewH - 1
+	}
+	// 滑块顶端在滚动条上的位置：off = row * (max) / (viewH - 1)。
+	// viewH 为 1 时没有可插值的地方，直接滚到底。
+	off := 0
+	if viewH > 1 {
+		off = row * max / (viewH - 1)
+	}
+	m.scroll = max - off
+	m.clampChatScroll()
+}
+
+// pageInputWidth 是整页视图里那个独占一行的输入框的上限。
+//
+// textinput 的 Width 为 0 时**不裁剪**：用户敲一长句就会把这一行顶出屏幕。
+// 解锁页和配置向导的输入框自己占一整行，给它一个略小于终端宽度的上限
+// 就够了 —— 不需要精确，因为那一行没有别的东西要跟它分地方。
+//
+// 会话里那个浮起输入框走的是另一条路（renderInputLine 现算宽度），
+// 因为它要和右侧的提示文字分同一行，宽度必须精确到列。
+func (m Model) pageInputWidth() int {
+	w := m.width - 6
+	if w < 10 {
+		w = 10
+	}
+	return w
 }
 
 // activeThread 返回当前打开的会话。

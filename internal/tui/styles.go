@@ -9,7 +9,36 @@ import (
 )
 
 // 终端宽度低于这个值就从两栏降级成单栏。
-const singlePaneWidth = 80
+//
+// 从 80 提到 96，是因为双栏现在多了一列导航（navWidth）。80 列时硬塞
+// 导航 + 列表会只剩 30 来列给正文，邮件正文在那个宽度下折得没法读 ——
+// 与其挤，不如老实降级。
+const singlePaneWidth = 96
+
+// navWidth 是左侧导航列的宽度。
+//
+// 12 列 = 两格缩进 + 最多 8 列的标签 + 数字计数。8 列刚好放下
+// 「已发送」（3 个汉字 = 6 列）、「垃圾邮件」（4 个汉字 = 8 列）这类
+// 最常见的文件夹名；再长的会被截断成「病毒文件…」，那没关系 ——
+// 服务端文件夹那一组里通常只有一两个长名字。
+//
+// 再宽就是浪费：它只是一个文件夹切换器，每多一列都是从正文身上拿的。
+const navWidth = 12
+
+// navGutter 是侧栏右边那一格空隙。
+//
+// 它不铺任何底色 —— 这**正是它的作用**：整屏没有一条竖着贯通的硬线，
+// 「侧栏到哪儿结束」全靠这一格留白。参照的设计里那条缝也是留白，只是
+// 浏览器里能做得更宽；终端里一格已经够，再宽就是从正文身上拿。
+const navGutter = 1
+
+// inputBlockHeight 是浮起输入区占的行数：上下各留一行空白，中间一行
+// 是输入行。
+//
+// 那两行留白不是浪费，是**这个方案成立的前提**：字符网格里没有圆角、
+// 没有阴影、没有 z 轴，"浮起"只能靠「被空白包围的独立色块」来表达。
+// 去掉留白，输入行就退回成又一条贴底的横带——也就是现在这样。
+const inputBlockHeight = 3
 
 var (
 	styleTitle    = lipgloss.NewStyle().Bold(true)
@@ -30,13 +59,53 @@ var (
 	// 看得见，足够了。
 	styleTag = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
+	// ---- 分层用的底色 ----
+	//
+	// 这一组是「用底色代替线条」那套方案的落点。参照的设计里整屏没有
+	// 一条分割线，层次全靠底的深浅 —— 终端里同样能做，只是要克制：
+	// 底色只用来区分**区域**，不参与强调。
+	//
+	// 每一对都贴着各自的终端背景走（深色终端用比背景亮一两档的灰，
+	// 浅色终端用比背景暗一两档的灰），因为写死一个灰必然在另一种
+	// 终端上糊掉。
+
+	// styleNav      是导航列的底色，让它在最左边自成一条。
+	styleNav = lipgloss.NewStyle().Background(navBg)
+	// styleNavActive / styleNavIdle 是导航项的两态。
+	//
+	// 选中态用的是和列表、标签页**同一块**底色（rowSelectedBg）：整个界面
+	// 里「选中」只有这一种表达方式，用户学会一次就够了。加上加粗和亮色，
+	// 是因为导航列的底色本身已经在参与分层，单靠一块底色不够醒目。
+	styleNavActive = lipgloss.NewStyle().Bold(true).
+			Foreground(lipgloss.Color("141")).Background(rowSelectedBg)
+	styleNavIdle = lipgloss.NewStyle().Faint(true)
+
+	// styleRowSelected 是会话列表里选中项那条底色块。
+	//
+	// 替代了原先的整行反白（styleSelected）。反白是终端里最大的对比度，
+	// 一行反白会在视野里炸开；底色块只是「比周围亮一档」，选中位置照样
+	// 一眼看得见，但不会把整个列表压下去。参照的设计用的就是这种。
+	//
+	// 导航项的选中态和顶部标签页的当前页用的也是这一块 —— 见 styleNavActive。
+	styleRowSelected = lipgloss.NewStyle().Background(rowSelectedBg).Bold(true)
+	// styleGroupTitle 是列表里「未读 / 已读」这类分组小标题。
+	styleGroupTitle = lipgloss.NewStyle().Faint(true)
+
+	// styleInputRow 是浮起输入行的底色。
+	styleInputRow = lipgloss.NewStyle().Background(inputRowBg)
+
+	// styleTabActive / styleTabIdle 是顶部会话标签页的两态。
+	//
+	// 当前那一页铺底色块（和列表选中同一块），其余淡着 —— 标签页是一排
+	// 并列的东西，靠底色指明「你在哪一页」比靠颜色更稳。
+	styleTabActive = lipgloss.NewStyle().Bold(true).
+			Foreground(lipgloss.Color("141")).Background(rowSelectedBg)
+	styleTabIdle = lipgloss.NewStyle().Faint(true)
+
 	// styleScrollBar / styleScrollThumb 是会话正文右侧那条滚动条。
 	//
 	// 轨道用低调的灰、滑块用亮一些的灰：它是**背景信息**，告诉用户
 	// 「这里还有内容、能滚」，不该比正文本身更抢眼。
-	//
-	// 深浅自适应走和 stylePeerRow 一样的路子 —— 轨道在浅色终端上要用
-	// 浅灰（250），在深色终端上要用深灰（238），写死一个在这边会糊掉。
 	styleScrollBar   = lipgloss.NewStyle().Foreground(scrollBarFg)
 	styleScrollThumb = lipgloss.NewStyle().Foreground(scrollThumbFg)
 
@@ -51,11 +120,26 @@ var (
 	stylePeerRow = lipgloss.NewStyle().Background(peerRowBg)
 )
 
+// 分层用的底色（各区域自成一档，互不相同）。
+//
+// 深色终端上是一条「越靠前越亮」的梯子：导航 235 < 对方的消息 236 <
+// 输入框 237 < 选中 238，都在背景之上，相邻两档只差一格 —— 差得出来、
+// 又不刺眼。浅色终端同理，只是方向反过来（越靠前越暗）。
+var (
+	navBg         = lipgloss.AdaptiveColor{Light: "255", Dark: "235"}
+	inputRowBg    = lipgloss.AdaptiveColor{Light: "252", Dark: "237"}
+	rowSelectedBg = lipgloss.AdaptiveColor{Light: "250", Dark: "238"}
+)
+
 // peerRowBg 是对对方消息行铺的那个灰。
 //
 // 253 = 很浅的灰（浅色终端上刚刚看得出来），236 = 很深的灰（深色终端上
 // 同样只差一档）。两边都刻意贴着各自的背景走：这是**分区**用的底色，
 // 不是高亮，抢了正文的对比度就本末倒置了。
+//
+// 它和 inputRowBg 各占梯子上的一格：两块灰离得很远（一封邮件 vs 底部
+// 输入区），共用一档本来也看不出来，但既然是一条要维护的梯子，就不留
+// 「这两个常量值一样，是巧合还是故意的」这种要靠猜的空档。
 var peerRowBg = lipgloss.AdaptiveColor{Light: "253", Dark: "236"}
 
 // scrollBarFg / scrollThumbFg 是滚动条轨道与滑块的前景色。
@@ -68,24 +152,34 @@ var (
 )
 
 // peerRowBgSeq 返回当前终端上该用的底色序列；终端不支持颜色时返回空串。
+func peerRowBgSeq() string {
+	return bgSeqOf(stylePeerRow)
+}
+
+// navBgSeq 是导航列底色对应的序列。
+func navBgSeq() string {
+	return bgSeqOf(styleNav)
+}
+
+// bgSeqOf 从一个样式的渲染结果里取出它的「设置」序列（探针见下）。
 //
 // 借 lipgloss 把自适应色解析成具体序列，而不是自己去判断终端深浅 ——
 // 深浅判断（COLORFGBG / OSC 11 查询）和色彩降级（真彩 → 256 → 16）都是
 // lipgloss/termenv 的活，手抄一遍迟早和别处的上色对不上。
-func peerRowBgSeq() string {
+func bgSeqOf(s lipgloss.Style) string {
 	// 探针字符只是为了把「样式前缀」和「内容」分开；用一个宽度为 0、
 	// 不可能出现在正文里的字符，就不用担心它在别处出现。
 	const probe = "\x00"
-	rendered := stylePeerRow.Render(probe)
+	rendered := s.Render(probe)
 	if i := strings.Index(rendered, probe); i > 0 {
 		return rendered[:i]
 	}
 	return ""
 }
 
-// paintPeerRow 给对方消息的整整一行铺上底色（右侧一直铺到版面边沿）。
+// paintRowBg 给一整行铺上底色序列 seq。
 //
-// ⚠️ 不能简单地写 stylePeerRow.Render(line)。行里已经套着各种前景色样式
+// ⚠️ 不能简单地写 style.Render(line)。行里已经套着各种前景色样式
 // （发件人名字、标题、链接、行内代码），每一段结尾都带一个 SGR 重置
 // \x1b[0m，它会把外层刚设好的底色**一起清掉**。实测：
 //
@@ -102,13 +196,23 @@ func peerRowBgSeq() string {
 // 这条做法依赖一个实测过的事实：渲染层吐出的重置序列只有 \x1b[0m 一种，
 // 其余都是 \x1b[1m / \x1b[3m / \x1b[38;5;Nm 这类「设参数」序列，不会反向
 // 清掉底色。TestChat_PeerRowsAreBandPainted 守着这一点。
-func paintPeerRow(line string) string {
-	seq := peerRowBgSeq()
+//
+// ⚠️ 还有一条：**这里铺的是「一行」，不是「一块」。** 末尾那个 \x1b[49m
+// 一出现，底色就断了 —— 想拿一个序列管住多行的话，只有第一行有底色，
+// 剩下全是裸的。所以侧栏那条贯通的竖带、浮起的输入行，都是自己按行循环
+// 调本函数铺出来的，**没有**「铺一整块」的包装：那个名字会让人以为存在
+// 一个能一次铺完的写法，而实际并不存在。
+func paintRowBg(line, seq string) string {
 	if seq == "" {
 		return line
 	}
 	line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+seq)
 	return seq + line + "\x1b[49m"
+}
+
+// paintPeerRow 给对方消息的整整一行铺上底色（右侧一直铺到版面边沿）。
+func paintPeerRow(line string) string {
+	return paintRowBg(line, peerRowBgSeq())
 }
 
 // hyperlink 把文本包成 OSC 8 终端超链接。

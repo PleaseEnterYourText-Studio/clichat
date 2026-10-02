@@ -101,14 +101,14 @@ func TestGenerateScreenshots(t *testing.T) {
 			width:  104,
 			height: 28,
 			drive: func(t *testing.T, m Model) Model {
-				// 往下挪一格，让「选中行反白」落在一条未读会话上。
+				// 往下挪一格，让「选中行的底色块」落在一条未读会话上。
 				m, _ = update(m, keyMsg("down"))
 				return m
 			},
 		},
 		{
 			name: "03-search",
-			// 刻意用窄终端：宽度低于 80 会降级成单栏，正好一并展示
+			// 刻意用窄终端：宽度低于 96 列会降级成单栏，正好一并展示
 			// 响应式布局 —— 而且单栏下没有那个空着的右半边。
 			width:  74,
 			height: 20,

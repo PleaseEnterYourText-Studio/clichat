@@ -166,7 +166,22 @@ and the process list.
   The conversion is lossy (buttons, tables and font-size headings all get
   re-flowed); the marker is there so "the layout differs from the original mail"
   has an explanation instead of looking like a rendering bug
-- Two-pane layout, collapsing to a single pane under 80 columns
+- **Three panes**: a two-level sidebar on the left (a "Mailboxes" group plus any
+  extra server folders, each with its unread count), the conversation list in the
+  middle, the conversation on the right. There is no full-width rule anywhere —
+  the panes are separated by background blocks and blank space instead, and the
+  input box floats on the content with a blank line above and below it. Under 96
+  columns it collapses to a single pane; "Sent" / "Trash" are then reached with
+  `Tab` or `Ctrl+G`
+- **The list is grouped** into unread / read, chronologically inside each group.
+  The selected row gets a background block rather than reverse video — reverse
+  video is the loudest thing a terminal can do, and one such row blows up the view
+- **Tabs across the top**: once a second conversation has been opened, the line
+  above the conversation lists the recently opened ones (most recent first, the
+  current one highlighted). Click one, or press `Ctrl+↑` / `Ctrl+↓`
+- **The mouse works**: click the sidebar to switch folders, click the list to open
+  a conversation, click a tab to switch, click the rightmost column of the
+  conversation to jump. The wheel scrolls whatever pane the pointer is over
 
 **Acting**
 
@@ -349,7 +364,9 @@ most common keys.
 | `R` | Open, replying to sender only |
 | `n` | New conversation |
 | `/` | Search |
-| `Tab` | Switch folder |
+| `Tab` | Switch folder (opens a picker) |
+| `Ctrl+G` | Cycle through the sidebar's folders |
+| `Esc` | Unwind one filter layer: folder first, then the search term |
 | `r` | Sync now |
 | `u` | Mark unread |
 | `*` | Star / unstar |
@@ -381,6 +398,16 @@ message — every action uses a `Ctrl` combination instead.
 | `Ctrl+D` | Delete |
 | `F1` | Help |
 | `Ctrl+C` | Quit |
+
+**Mouse**
+
+| Action | Effect |
+|---|---|
+| Wheel | Scrolls whatever the pointer is over: the sidebar switches folders, the list moves the cursor, the conversation scrolls |
+| Click sidebar | Switch folder |
+| Click list | Open that conversation |
+| Click a tab | Switch to that conversation (tabs sit on the line above the conversation) |
+| Click the rightmost column | That column is the scroll bar — click to jump |
 
 A scroll bar appears on the right edge of the conversation once it is longer
 than one screen — which is also the answer to "is this thing scrollable at

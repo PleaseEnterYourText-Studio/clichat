@@ -133,27 +133,42 @@ func TestChat_PeerBandReachesPaneEdge(t *testing.T) {
 // 用真实模型走一遍：聊天视图里既要有灰底的行（对方），也要有无底色的行
 // （自己）—— 防止哪天上面那几条判据在 renderMessage 上绿着，视图却另
 // 走了一条路。
+//
+// ⚠️ 量的是**会话流那一栏**，不是整幅 View。整幅里每一行的最左边都压着
+// 导航列的底色（侧栏是从上到下贯通的），于是「这一行有没有底色」既可能
+// 来自对方消息的灰底、也可能来自左边那条导航条 —— 判据会从「有没有铺
+// 灰底」退化成一条永远为真的空壳。上一版就是这么红的。
+//
+// 「切掉左边再看」这条路也走不通：实测 ansi.TruncateLeft 会把被切掉的
+// 那些 SGR 以**空序列**的形式留在原处（`\x1b[48;5;235m\x1b[49m`），
+// 底色照样"在"。所以直接问那一栏要它自己渲染出来的东西。
 func TestChat_ViewHasBothBandsAndPlainRows(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
 
-	view := m.View()
-	var banded, plain int
-	for _, line := range strings.Split(view, "\n") {
+	pane := m.renderChat(m.chatPaneWidth(), m.bodyHeight())
+	var banded, plain []string
+	for _, line := range strings.Split(pane, "\n") {
 		if strings.Contains(line, "\x1b[48;") {
-			banded++
+			banded = append(banded, line)
 			continue
 		}
 		if strings.TrimSpace(plainText(line)) != "" {
-			plain++
+			plain = append(plain, line)
 		}
 	}
 
-	if banded == 0 {
+	if len(banded) == 0 {
 		t.Error("聊天视图里没有一条铺了灰底的行（对方的话）")
 	}
-	if plain == 0 {
+	if len(plain) == 0 {
 		t.Error("聊天视图里没有一条无底色的行（自己的话 / 边框）")
+	}
+
+	// 光量那一栏还不够：整幅画面完全可能不用它（以前就是各自画各自的）。
+	// 挑一条铺了底色的行，确认它原样出现在整幅 View 里。
+	if len(banded) > 0 && !strings.Contains(m.View(), banded[0]) {
+		t.Errorf("会话流那一栏的渲染结果没进整幅画面：%q", banded[0])
 	}
 }
 
