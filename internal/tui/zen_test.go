@@ -199,6 +199,24 @@ func TestZen_HomeInputSendsToCurrentThread(t *testing.T) {
 	}
 }
 
+// 字标各行的宽度必须和 lipgloss 那把尺子一致。
+//
+// 字标里全是 █ ╗ ╔ ╚ ═ ║ 这类 East Asian Ambiguous 字符。本仓库的
+// textWidth 把它们钉成 1 列（cellWidth 的注释解释了为什么），而居中用的
+// padRight 走 lipgloss.Width。两把尺子只要有一把把它们算成 2 列，
+// 补白就会多算，整个字标会歪向一边 —— 而且歪得很微妙，容易被当成「设计」。
+func TestZenLogo_WidthMatchesLipgloss(t *testing.T) {
+	for i, l := range zenLogoArt {
+		if got, want := textWidth(l), lipgloss.Width(l); got != want {
+			t.Errorf("字标第 %d 行：textWidth = %d，lipgloss.Width = %d",
+				i, got, want)
+		}
+	}
+	if w := zenLogoWidth(); w <= 0 {
+		t.Errorf("字标整块宽度算出来是 %d", w)
+	}
+}
+
 // 首页那行提示说的是首页能做的事，不是会话屏的。
 func TestZen_HintIsScreenSpecific(t *testing.T) {
 	home := zenHintFor(zenHome)

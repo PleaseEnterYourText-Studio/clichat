@@ -80,6 +80,16 @@ BORDER = "#313244"
 FONT_SIZE = 13
 LINE_HEIGHT = 1.4
 
+# 单独放大的几张。
+#
+# 05-zen-home 是唯一一张把 **ANSI Shadow 字标**当主体的图。那种字形的笔画
+# 是 2 格宽、里面还嵌一条 1 格宽的「阴影线」—— 13px 下这条线正好占掉笔画的
+# 一半，字标看着像空心的。放大一档（笔画和阴影线都跟着变粗变宽，比例不变，
+# 但绝对尺寸翻倍）之后才认得出是字标而不是一堆方框。
+#
+# 只影响截图，产品里字标就是终端字号，用户自己调。
+BIGGER_FONT = {"05-zen-home": 20}
+
 EDGE_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -125,7 +135,7 @@ def svg_size(svg_text):
     return int(float(m.group(1)) + 0.999), int(float(m.group(2)) + 0.999)
 
 
-def render(freeze, edge, ansi_path, svg_path, png_path):
+def render(freeze, edge, ansi_path, svg_path, png_path, font_size=FONT_SIZE):
     with open(ansi_path, "r", encoding="utf-8") as fh:
         ansi = fh.read()
 
@@ -141,7 +151,7 @@ def render(freeze, edge, ansi_path, svg_path, png_path):
         "--padding", "20",
         "--margin", "24",
         "--background", BG,
-        "--font.size", str(FONT_SIZE),
+        "--font.size", str(font_size),
         "--line-height", str(LINE_HEIGHT),
     ]
     r = subprocess.run(cmd, input=ansi, text=True, capture_output=True)
@@ -195,7 +205,7 @@ def main():
             os.path.join(raw, name),
             os.path.join(raw, stem + ".svg"),
             os.path.join(out, stem + ".png"),
-            
+            BIGGER_FONT.get(stem, FONT_SIZE),
         )
         print("%-12s -> %s.png  (%dx%d)" % (stem, stem, w, h))
 

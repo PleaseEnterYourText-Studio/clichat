@@ -84,6 +84,13 @@ const (
 	// 不该变成又一个常驻 footer。
 )
 
+// zenGroupWindow 是同一个人连着说的几句话被并成一组的时间窗。
+//
+// 15 分钟：短于它的连续发言算「一口气说的」，长于它的就该重新标一次时间。
+// 太短会让每条消息都顶一个名字（那还不如不分组），太长会把上午说的和
+// 下午说的并成一组，组头那个时间戳就成了谎话。
+const zenGroupWindow = 15 * time.Minute
+
 // zenHintFor 返回某一屏上那行一次性提示。
 //
 // 分屏写而不是共用一句：三屏能做的事完全不同，一句「Ctrl+↑/↓ 切会话」
@@ -99,73 +106,13 @@ func zenHintFor(s zenScreen) string {
 	}
 }
 
-// zenLogoGlyphs 是字标用的 5×5 点阵字形。
-//
-// 只有 CLICHAT 用得到的六个字母。用 █ 拼：它是 U+2588 FULL BLOCK，
-// 在终端里宽度确定为 1 列（虽然 East Asian Width 把它算作 Ambiguous，
-// 但 cellWidth 会把 Ambiguous 钉成 1，和 lipgloss.Width 同一把尺子）。
-var zenLogoGlyphs = map[rune][5]string{
-	'C': {"█████", "█    ", "█    ", "█    ", "█████"},
-	'L': {"█    ", "█    ", "█    ", "█    ", "█████"},
-	'I': {"█████", "  █  ", "  █  ", "  █  ", "█████"},
-	'H': {"█   █", "█   █", "█████", "█   █", "█   █"},
-	'A': {" ███ ", "█   █", "█████", "█   █", "█   █"},
-	'T': {"█████", "  █  ", "  █  ", "  █  ", "  █  "},
-}
-
-// zenLogoWord 是字标拼的词。
-const zenLogoWord = "CLICHAT"
-
-// zenLogo 把词拼成 5 行点阵；正文列塞不下时退回一行纯文字。
-//
-// 5 行是权衡出来的：再高在小窗口（80x24）上会把输入框挤出屏幕，再矮
-// 就认不出字形了。宽度是 7×5 + 6 个间隔 = 41 列。
-//
-// 退回一行是必需的：40 列的终端上正文列只有 38 列，41 列的字标会横向溢出，
-// 把整个版面撑坏（这正是 TestZen_LinesNeverExceedTerminalWidth 抓到的）。
-// 字标是装饰，装饰不该撑破版面。退回时用「字母 + 空格」拉开的写法，
-// 13 列，窄终端上仍然像一个字标而不是普通文字。
-func zenLogo(contentW int) []string {
-	rows := make([]string, 5)
-	for i, ch := range zenLogoWord {
-		g, ok := zenLogoGlyphs[ch]
-		if !ok {
-			continue
-		}
-		for r := 0; r < 5; r++ {
-			if i > 0 {
-				rows[r] += " "
-			}
-			rows[r] += g[r]
-		}
-	}
-	if textWidth(rows[0]) > contentW {
-		return []string{strings.Join(strings.Split(zenLogoWord, ""), " ")}
-	}
-	return rows
-}
-
-// zenGroupWindow 是同一个人连着说的几句话被并成一组的时间窗。
-//
-// 15 分钟：短于它的连续发言算「一口气说的」，长于它的就该重新标一次时间。
-// 太短会让每条消息都顶一个名字（那还不如不分组），太长会把上午说的和
-// 下午说的并成一组，组头那个时间戳就成了谎话。
-const zenGroupWindow = 15 * time.Minute
-
-// zenChromeHeight 是 Zen 界面里除正文之外固定占掉的行数。
+// zenChromeHeight 是 Zen **会话屏**里除正文之外固定占掉的行数。
 //
 //	头部 1 + 头部后的空行 1 + 正文后的空行 1 + 分隔线 1 + 分隔线后的空行 1 + 输入 1
 //
-// 这六行是 Zen 的全部「界面」。Normal 在这个高度里要塞两栏、标题、
+// 这六行是会话屏的全部「界面」。Normal 在这个高度里要塞两栏、标题、
 // 状态栏 —— 差的就是这些留白。
 const zenChromeHeight = 6
-
-// zenHomeBoxChrome 是首页输入框那圈边框 + 左右内边距占掉的列数。
-//
-// 圆角边框左右各 1 列，Padding(0,1) 左右各 1 列 —— 一共 4 列。
-const zenHomeBoxChrome = 4
-
-// ---- 状态 ----
 
 // zenActive 说当前是不是真的在用 Zen 布局。
 //
@@ -177,13 +124,13 @@ func (m Model) zenActive() bool {
 
 // zenInChat 说当前是不是在 Zen 的**会话屏**上。
 //
-// 滚动相关的几个函数只关心这一屏：首页和列表没有可滚的正文，用会话屏的
+// 滚动相关的几个函数只关心这一屏：首页和列表没有可滚的正文，拿会话屏的
 // 可见行数去算它们的高度只会得出一个没有意义的数。
 func (m Model) zenInChat() bool {
 	return m.layout == layoutZen && m.zenScreen == zenChat
 }
 
-// applyInputStyle 按当前布局和屏幕设置输入框的提示符与占位文字。
+// applyInputStyle 按当前布局设置输入框的提示符与占位文字。
 //
 // 集中在一处：进 Zen、在 Zen 里换屏、从 Zen 里打开一个会话（enterThread 会
 // 把占位文字设回 Normal 那套）—— 三条路都要设对，散着写必然漏一条。
@@ -231,24 +178,67 @@ func (m *Model) goZen(s zenScreen) {
 
 // syncInputWidth 让输入框的宽度跟着当前布局走。
 //
-// Zen 的正文列比终端窄，输入框不跟着收的话，敲到二三十个字就会顶出
-// 正文列的右边界，把居中排版撑歪。Normal 下恢复成 0（不限制），
-// 保持原有行为不变。
+// Zen 的正文列比终端窄，输入框不跟着收的话，敲到二三十个字就会顶出正文列的
+// 右边界，把居中排版撑歪。Normal 下恢复成 0（不限制），保持原有行为不变。
 func (m *Model) syncInputWidth() {
 	if !m.zenActive() {
 		m.input.Width = 0
 		return
 	}
 	avail := zenContentWidth(m.width)
-	if m.zenScreen == zenHome {
-		// 首页的输入框外面套了一圈边框和左右各一格内边距。
-		avail -= zenHomeBoxChrome
-	}
 	w := avail - textWidth(m.input.Prompt)
 	if w < 10 {
 		w = 10
 	}
 	m.input.Width = w
+}
+
+// zenLogoWord 是字标拼的词。
+const zenLogoWord = "CLICHAT"
+
+// zenLogoArt 是首页上那个 CLICHAT 字标。
+//
+// 用的是 figlet 的 ANSI Shadow 那一路框线字：实心块 █ 做主干、╗ ╔ ╝ ╚ ═ ║
+// 做转角。比纯点阵更接近印刷体的观感 —— 转角是「斜切」出来的，不是硬碰硬
+// 的直角，所以大字号下才立得住。
+//
+// 6 行 × 最长 52 列。各行宽度不等（T 的顶横比它的竖笔宽），所以居中要按
+// **最宽的那一行**算，不能逐行居中 —— 逐行居中会让每行的起始列都不一样，
+// 字立刻散开。见 viewZenHome 里那段。
+//
+// 改字形时注意：这些框线字符（U+2550 区）和实心块一样属于 East Asian
+// Ambiguous，本仓库的 cellWidth 把它们钉成 1 列，和 lipgloss.Width 同一把
+// 尺子（styles.go 里 cellWidth 的注释记着这条）。
+var zenLogoArt = []string{
+	"██████╗██╗     ██╗ ██████╗██╗  ██╗ █████╗ ████████╗",
+	"██╔════╝██║     ██║██╔════╝██║  ██║██╔══██╗╚══██╔══╝",
+	"██║     ██║     ██║██║     ███████║███████║   ██║",
+	"██║     ██║     ██║██║     ██╔══██║██╔══██║   ██║",
+	"╚██████╗███████╗██║╚██████╗██║  ██║██║  ██║   ██║",
+	"╚═════╝╚══════╝╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝",
+}
+
+// zenLogoWidth 是字标整块的宽度（最宽那一行）。
+func zenLogoWidth() int {
+	w := 0
+	for _, l := range zenLogoArt {
+		if n := textWidth(l); n > w {
+			w = n
+		}
+	}
+	return w
+}
+
+// zenLogo 返回要画的字标；正文列塞不下时退回一行纯文字。
+//
+// 退回是必需的：字标是装饰，装饰不该撑破版面。52 列在 54 列以下的正文列里
+// 放不下（终端宽度约 54 以下），硬画会横向溢出，把整个居中排版撑坏。
+// 退回时用「字母 + 空格」拉开的写法（13 列），窄终端上仍然像一个字标。
+func zenLogo(contentW int) []string {
+	if zenLogoWidth() > contentW {
+		return []string{strings.Join(strings.Split(zenLogoWord, ""), " ")}
+	}
+	return zenLogoArt
 }
 
 // ---- 尺寸 ----
@@ -438,20 +428,23 @@ func (m Model) viewZenHome() string {
 
 	logo := zenLogo(f.contentW)
 
-	// 输入框外面套一圈很淡的圆角边框。这是 Zen 里唯一一处边框，值得说明：
-	// 「不要容器」那条规矩针对的是**消息**（气泡、卡片、灰底），而首页上
-	// 这是一个表单控件 —— 没有边框的话，一片空白里那个 › 提示符看不出
-	// 「这里可以打字」。
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(zenRuleFg).
-		Padding(0, 1).
-		Width(f.contentW - zenHomeBoxChrome)
-	box := strings.Split(boxStyle.Render(m.input.View()), "\n")
+	// 输入框 + 它**下面**那条横线。
+	//
+	// 不用边框圈起来。原先套了一圈圆角框，理由是「表单控件需要可见的边界」——
+	// 但那是网页表单的解法，放在这里有两个问题：一是 Zen 通篇不要容器，
+	// 唯独首页破例一次反而显得突兀；二是那个框把输入框压成「一个要填的
+	// 表单字段」，而首页想要的是「一个可以开始写字的地方」。
+	//
+	// 一条下划线就够了 —— 它标出「写到哪儿为止」，又不把这块地方关起来。
+	// 和会话屏的输入区同构，只是那边线在上（正文在上）、这边线在下（空处在下）。
+	input := []string{
+		m.input.View(),
+		zenRule.Render(strings.Repeat("─", f.contentW)),
+	}
 
 	// 字标 + 空行 + 输入框算作一块，整块垂直居中。
 	const gap = 2
-	blockH := len(logo) + gap + len(box)
+	blockH := len(logo) + gap + len(input)
 	top := (m.height - blockH) / 2
 	if top < 1 {
 		top = 1
@@ -461,14 +454,23 @@ func (m Model) viewZenHome() string {
 	for i := 0; i < top; i++ {
 		lines = append(lines, "")
 	}
+	// 字标按**整块**居中：先取最宽那一行的宽度算一次补白，所有行共用。
+	//
+	// 不能逐行 center()：这个字标的各行宽度不一样（T 的顶横比竖笔宽，
+	// 上下两端那两行的转角又比中间宽），逐行居中会让每行的起始列都不同，
+	// 字立刻散开 —— 看上去像三四个互不相干的词。
+	logoPad := (f.contentW - zenLogoWidth()) / 2
+	if logoPad < 0 {
+		logoPad = 0
+	}
 	for _, l := range logo {
-		lines = append(lines, f.indent(f.center(zenText.Render(l))))
+		lines = append(lines, f.indent(strings.Repeat(" ", logoPad)+zenText.Render(l)))
 	}
 	for i := 0; i < gap; i++ {
 		lines = append(lines, "")
 	}
-	for _, l := range box {
-		lines = append(lines, f.indent(f.center(l)))
+	for _, l := range input {
+		lines = append(lines, f.indent(l))
 	}
 
 	// 提示单独钉在底部，不参与上面那块居中 —— 否则它一出现整块就会往上跳。
