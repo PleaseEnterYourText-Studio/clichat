@@ -311,6 +311,22 @@ func (m Model) viewZen() string {
 	for len(lines) < m.height {
 		lines = append(lines, "")
 	}
+
+	// ⚠️ 每行都要补齐到**终端全宽**，不能只画到正文列右沿就收手。
+	//
+	// 不补的话，最长的那行（分隔线）只有「左留白 + 正文列」那么宽，
+	// 右半边是**不存在**的空白 —— 于是：
+	//
+	//   - 真实终端里靠终端背景兜着，看着还行；
+	//   - 但任何按「最长行」开窗的渲染器（截图链路里的 freeze 就是）
+	//     会把窗口开成「左留白 + 正文列」宽，正文列立刻贴到右边去，
+	//     整个居中排版全废。README 里那几张截图就是这么歪的。
+	//
+	// Normal 布局没这个问题：它的两栏加起来正好铺满，天然就是全宽。
+	// Zen 主动留白，所以必须自己把这层留白**写出来**。
+	for i, ln := range lines {
+		lines[i] = padRight(ln, m.width)
+	}
 	return strings.Join(lines, "\n")
 }
 
