@@ -83,12 +83,84 @@ func TestProviders_Complete(t *testing.T) {
 	}
 }
 
-func TestProviders_OutlookAbsent(t *testing.T) {
-	// Outlook 个人版已停用基本认证，v1 不做 OAuth2，因此它不该出现在预设里。
+// OAuth2 服务商不许假装能连。
+//
+// 这条判据的前身是 TestProviders_OutlookAbsent，它当时断言「预设里不许
+// 有 outlook」。那条规矩的前提变了 —— 用户要的正是**引导**：「列表里找不到
+// 我的服务商」和「找到了、并明确告诉我为什么用不了、接下来怎么办」，
+// 后者的体验完全不同。所以现在允许这条预设存在。
+//
+// 但它守的那件事一点没变，而且要求更细：**不许留下"填个密码就能连上"的
+// 假象**。两条一起才算数：
+//   - Outlook 系必须标 AuthOAuth2 —— 标了向导才拦得住；
+//   - 标了 AuthOAuth2 的必须有 OAuthURL 和 Guide —— 否则"拦住"只是把人
+//     堵在原地，那还不如让他去试（至少试完知道自己错在哪）。
+func TestProviders_OAuthEntriesAreMarkedAndExplained(t *testing.T) {
+	seen := 0
 	for _, p := range Providers {
-		if p.ID == "outlook" || p.ID == "hotmail" {
-			t.Errorf("Outlook 个人版不支持密码认证，不应有预设: %q", p.ID)
+		switch p.ID {
+		case "outlook", "hotmail", "office365", "live":
+			seen++
+			if p.Auth != AuthOAuth2 {
+				t.Errorf("预设 %q 必须标成 AuthOAuth2，否则向导会放用户去填密码白跑一趟", p.ID)
+			}
 		}
+
+		if p.Auth != AuthOAuth2 {
+			continue
+		}
+		if p.OAuthURL == "" {
+			t.Errorf("预设 %q 标了 OAuth2 却没给 OAuthURL —— 只拦住不解释等于把人丢在原地", p.ID)
+		}
+		if len(p.Guide) == 0 {
+			t.Errorf("预设 %q 标了 OAuth2 却没给 Guide", p.ID)
+		}
+	}
+	if seen == 0 {
+		t.Error("预设里没有任何 OAuth2 条目 —— 带着 Outlook 账号来的人会找不到自己那一条")
+	}
+}
+
+// 预设里的收/发两半要各自对得上**官方文档**。
+//
+// 表里写死的是文档里的值，不是代码里算出来的值 —— 这一条的分辨力全在这里：
+// 直接拿 TLSOrDefault(p.SMTPTLS) 当期望值的话，"有人把 SMTPTLS 照着 IMAPTLS
+// 抄了一遍"这种错永远不会红。
+//
+// iCloud 和 Outlook 是表里仅有的两个**两半不对称**的服务商（收 993 隐式、
+// 发 587 STARTTLS）。它们也是当初"两边共用一个隐式 TLS"那个 bug 唯一能
+// 暴露出来的地方 —— 所以这两行不许被简化掉。
+func TestProviders_MatchOfficialSettings(t *testing.T) {
+	want := map[string]struct{ imap, smtp Endpoint }{
+		"qq":      {Endpoint{"imap.qq.com", 993, TLSImplicit}, Endpoint{"smtp.qq.com", 465, TLSImplicit}},
+		"163":     {Endpoint{"imap.163.com", 993, TLSImplicit}, Endpoint{"smtp.163.com", 465, TLSImplicit}},
+		"126":     {Endpoint{"imap.126.com", 993, TLSImplicit}, Endpoint{"smtp.126.com", 465, TLSImplicit}},
+		"gmail":   {Endpoint{"imap.gmail.com", 993, TLSImplicit}, Endpoint{"smtp.gmail.com", 465, TLSImplicit}},
+		"icloud":  {Endpoint{"imap.mail.me.com", 993, TLSImplicit}, Endpoint{"smtp.mail.me.com", 587, TLSStartTLS}},
+		"outlook": {Endpoint{"outlook.office365.com", 993, TLSImplicit}, Endpoint{"smtp-mail.outlook.com", 587, TLSStartTLS}},
+	}
+
+	for id, w := range want {
+		p := FindProvider(id)
+		if p == nil {
+			t.Errorf("预设 %q 不见了", id)
+			continue
+		}
+		cfg := Default()
+		ApplyProvider(cfg, p)
+
+		if cfg.IMAP != w.imap {
+			t.Errorf("%s：收信端点 = %+v，官方文档是 %+v", id, cfg.IMAP, w.imap)
+		}
+		if cfg.SMTP != w.smtp {
+			t.Errorf("%s：发信端点 = %+v，官方文档是 %+v", id, cfg.SMTP, w.smtp)
+		}
+	}
+
+	// 新加了预设却忘了进上表时，这条会提醒 —— 否则新预设的地址没人守。
+	if got, wantN := len(Providers)-1, len(want); got != wantN {
+		t.Errorf("预设数量对不上：列表里 %d 个（去掉自定义），上表里 %d 个 —— "+
+			"新增的预设要加进 want 表，它才有判据守着", got, wantN)
 	}
 }
 

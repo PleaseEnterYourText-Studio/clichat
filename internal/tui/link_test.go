@@ -71,18 +71,31 @@ func TestStyleLink_MustNotCarryAttributes(t *testing.T) {
 }
 
 // 每个内置服务商都应该有直达链接和官方说明 —— 这是「免配置」承诺的一部分。
+//
+// ⚠️ OAuth2 服务商走的是另一条路：它**没有**一个"去哪拿凭据"的页面
+// （不存在能填进密码栏的东西），要给的是一篇"为什么必须走 OAuth2"的说明。
+// 所以判据问的是「有没有把人指到一个真页面去」，而不是「有没有 OpenURL
+// 这个字段」—— 后者会把 outlook 那条引导判成红的，而它是刻意没有 OpenURL 的。
 func TestProviders_AllHaveLinks(t *testing.T) {
 	for _, p := range config.Providers {
 		if p.ID == config.CustomProviderID {
 			continue // 自定义服务商没有官方页面可指
 		}
-		if p.OpenURL == "" {
-			t.Errorf("预设 %q 缺少直达链接", p.ID)
+
+		var links map[string]string
+		if p.Auth == config.AuthOAuth2 {
+			links = map[string]string{"OAuthURL": p.OAuthURL, "HelpURL": p.HelpURL}
+		} else {
+			links = map[string]string{"OpenURL": p.OpenURL, "HelpURL": p.HelpURL}
 		}
-		if p.HelpURL == "" {
-			t.Errorf("预设 %q 缺少官方说明链接", p.ID)
+		if len(p.Guide) == 0 {
+			t.Errorf("预设 %q 没有分步说明 —— 链接会失效，步骤不会", p.ID)
 		}
-		for name, u := range map[string]string{"OpenURL": p.OpenURL, "HelpURL": p.HelpURL} {
+		for name, u := range links {
+			if u == "" {
+				t.Errorf("预设 %q 缺少 %s", p.ID, name)
+				continue
+			}
 			if !strings.HasPrefix(u, "https://") {
 				t.Errorf("预设 %q 的 %s 不是 https：%q", p.ID, name, u)
 			}
