@@ -89,9 +89,6 @@ func (a *App) Sync() (bool, error) {
 		// 的叫法本来就不同（见 mail/folders.go 的别名表）。把它当错误
 		// 报上去，界面会整个标成"离线"，反而掩盖了真正同步成功的那些。
 		if err != nil {
-			// 服务端上没有这个文件夹不算故障，跳过就好 —— 各家对「已发送」
-			// 的叫法本来就不同（见 mail/folders.go 的别名表）。把它当错误
-			// 报上去，界面会整个标成"离线"，反而掩盖了真正同步成功的那些。
 			if errors.Is(err, mail.ErrNoSuchFolder) {
 				log.Printf("同步 %s: 服务端没有这个文件夹，跳过", folder)
 			} else {

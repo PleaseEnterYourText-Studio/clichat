@@ -65,7 +65,13 @@ var Providers = []Provider{
 		IMAPHost: "imap.163.com", IMAPPort: 993,
 		SMTPHost: "smtp.163.com", SMTPPort: 465,
 		PasswordLabel: "授权码",
-		// 163 没找到可用的设置页深链接，只给首页和帮助中心。
+		// 163（和下面的 126）没有可用的设置页深链接，只给首页和帮助中心。
+		//
+		// 为什么给不了（实测，不是没试）：设置页是 SPA 内部的 hash 路由
+		// （mail.163.com/js6/main.jsp#module=settings...）。而 /js6/main.jsp
+		// 未登录时 302 到 https://mail.163.com/ —— 重定向把**路径整个丢掉了**，
+		// 不像 QQ 会在 origin_url 里原样保留。路径都保不住，hash 更传不过去。
+		// 基线法：伪造路径 404，/js6/main.jsp 302。
 		OpenURL: "https://mail.163.com/",
 		HelpURL: "https://help.mail.163.com/",
 		Guide: []string{
@@ -79,7 +85,7 @@ var Providers = []Provider{
 		IMAPHost: "imap.126.com", IMAPPort: 993,
 		SMTPHost: "smtp.126.com", SMTPPort: 465,
 		PasswordLabel: "授权码",
-		// 126 同 163，没有可用的设置页深链接。
+		// 126 同 163，没有可用的设置页深链接（原因见上面 163 那段）。
 		OpenURL: "https://mail.126.com/",
 		HelpURL: "https://help.mail.126.com/",
 		Guide: []string{
