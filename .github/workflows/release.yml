@@ -1,0 +1,149 @@
+name: Release
+
+# 推一个 v 开头的 tag 就发版：
+#   git tag v1.0.0 && git push origin v1.0.0
+# 产物是六个平台的裸二进制 + SHA256SUMS.txt。
+on:
+  push:
+    tags:
+      - 'v*'
+
+# gh release create 需要写权限。GITHUB_TOKEN 由 runner 自动注入，
+# 不需要在仓库里配任何 secret。
+permissions:
+  contents: write
+
+env:
+  # 交叉编译不需要 cgo：关掉之后产物不依赖目标平台的 C 运行时，
+  # 一个 Linux runner 就能编出全部平台。这也是设计文档里定的方式。
+  CGO_ENABLED: '0'
+
+jobs:
+  # 打 tag 不等于代码是好的。发版前把和 CI 一样的检查再跑一遍，
+  # 免得一个手滑的 tag 直接变成 Release。
+  verify:
+    name: 发版前检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go vet ./...
+
+      # 注意：这一步要 cgo，所以得把上面的 CGO_ENABLED=0 覆盖回来。
+      - name: 单元测试
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
+
+  build:
+    name: 编译 ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      # 一个平台挂了别把其它平台也取消掉 —— 全量失败信息一次看全，
+      # 比一次只暴露一个错误省好几轮。
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+          - goos: windows
+            goarch: arm64
+            ext: '.exe'
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -eu
+          name="clichat-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          mkdir -p dist
+          # -trimpath 去掉构建机上的绝对路径，产物可复现。
+          # -s -w 去掉符号表和 DWARF：发布产物不需要，能小一圈。
+          # main.version 会被 IMAP 的 ID 命令一并用上（见 mail.SetClientIDVersion），
+          # 所以服务端看到的版本和 -version 打印的一致。
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o "dist/${name}" .
+          ls -l "dist/${name}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: clichat-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发 Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 六个平台的产物汇到一个目录。各 job 的 artifact 名不同，
+      # merge-multiple 会把它们解到同一层，不会互相覆盖（文件名带平台后缀）。
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        working-directory: dist
+        run: |
+          set -eu
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # 用 runner 自带的 gh 而不是第三方 release action：
+      # 少一个要信任的依赖，权限也只用 GITHUB_TOKEN。
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+
+          # 重跑同一个 tag 时 release 可能已经在了，
+          # 这种情况改成覆盖上传资产，而不是让整个 job 红掉。
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，覆盖上传资产"
+            gh release upload "$tag" ./dist/* --clobber
+          else
+            gh release create "$tag" ./dist/* \
+              --title "$tag" \
+              --generate-notes \
+              --verify-tag
+          fi

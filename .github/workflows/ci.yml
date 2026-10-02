@@ -1,0 +1,46 @@
+name: CI
+
+# 日常门禁：每次推到 main、每个 PR 都跑一遍 vet + 测试 + 编译。
+# 发版走 release.yml，那边会再跑一次同样的检查，别让坏代码进 Release。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet + test + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Go 版本直接读 go.mod 的 go 指令，不在这里另写一份 ——
+      # 两处都写迟早会漂移，而漂移的表现是本地能编、CI 编不过。
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 静态检查
+        run: go vet ./...
+
+      # 带 -race：mail 包里有并发的 FETCH goroutine，
+      # 而且 imap 层是长连接复用的，竞态在这里最值得抓。
+      # ubuntu runner 自带 gcc，race 检测器要的 cgo 能满足。
+      - name: 单元测试
+        run: go test -race ./...
+
+      - name: 编译
+        run: go build ./...
+
+# 注：这里刻意没有加 gofmt 门禁。
+# 本仓库是 Windows 上 core.autocrlf=true 开发的，工作区里的 .go 全是 CRLF，
+# gofmt 在本地会把每一个文件都判成"未格式化"。在 Linux runner 上它反而会过
+# —— 同一条命令两边结论相反，只会制造困惑。要加的话先补 .gitattributes
+# 统一行尾，让两边看到同样的字节。
