@@ -213,8 +213,8 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		headers = a.withinInitialWindow(headers)
 	}
 
-	added := a.index.Merge(headers)
-	if added > 0 {
+	added, updated := a.index.Merge(headers)
+	if added > 0 || updated > 0 {
 		changed = true
 	}
 
@@ -238,12 +238,15 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		log.Printf("同步 %s: 新增 %d 条，游标推进到 %d", folder, added, last)
 	}
 
-	// 服务端说有信，我们却一封都没拿到 —— 这是「界面空着但看不出原因」
+	// 服务端说有信，我们却一封都没**进**索引 —— 这是「界面空着但看不出原因」
 	// 的那类故障，必须留一条线索。真发生过两次：
 	//   ① 服务端不给 UIDNEXT 时被误判成空文件夹（见 mail.fetchRange）；
 	//   ② 收件箱里只有 90 天以前的信，被首次同步的时间窗口整批裁掉。
 	// 两种都表现为「配好了却一封信都看不到」，而日志里一个字都没有。
-	if added == 0 && f.Messages > 0 {
+	//
+	// updated > 0 时不算：那时邮件本来就在索引里（自己刚发出去、
+	// 服务端副本回来补 UID），报「一条都没进索引」会让人以为丢了信。
+	if added == 0 && updated == 0 && f.Messages > 0 {
 		log.Printf("同步 %s: 服务端上有 %d 封，本次一条都没进索引（拉取区间 %d 起，"+
 			"首次同步=%v，非全量模式时会按 %d 天裁剪）—— 若是历史邮件，"+
 			"用「接收全部邮件」重新拉",

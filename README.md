@@ -40,9 +40,9 @@ clichat just looks at it differently: **treat mail as messages.**
 
 ## Screenshots
 
-**Conversation view** — the other side's rows sit on a grey bubble while yours
-are right-aligned; in group threads every sender is coloured. The `HTML` marker
-in a message head means that body was converted from an HTML mail:
+**Conversation view** — the other side's rows are marked with a vertical bar
+while yours are right-aligned; in group threads every sender is coloured. The
+`HTML` marker in a message head means that body was converted from an HTML mail:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
@@ -94,8 +94,9 @@ right-aligned and everything falls back to a single column:
 [![Zen mode, narrow terminal](docs/images/10-zen-narrow.png)](docs/images/10-zen-narrow.png)
 
 Inside Zen: `Tab` goes home → list, `Enter` opens the selected conversation,
-`Esc` goes back one level, and `F2` returns to the home screen — press it again
-there to leave Zen.
+and `Esc` goes back one level. Every Zen screen carries that "one level back" in
+its bottom-right corner as a clickable button, so the mouse is never left with no
+way out. `F2` returns to the home screen — press it again there to leave Zen.
 
 ## Download
 
@@ -184,9 +185,11 @@ and the process list.
   for a group) and puts what you are actually talking about on the second line —
   that is the subject of the newest message. A conversation spans many subjects,
   so those are two different questions
-- **The other side's rows sit on a grey bubble that hugs the text**, while yours
-  are right-aligned with no background — after a few exchanges you no longer have
-  to read names to tell who is talking. The grey adapts to the terminal's lightness
+- **The other side's rows are marked with a vertical bar** down their left edge,
+  while yours are right-aligned with no marker at all — after a few exchanges you
+  no longer have to read names to tell who is talking. The bar is one column wide
+  and sits next to the text, so it never becomes a slab of colour that outweighs
+  the words inside it
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
@@ -204,27 +207,39 @@ and the process list.
   The conversion is lossy (buttons, tables and font-size headings all get
   re-flowed); the marker is there so "the layout differs from the original mail"
   has an explanation instead of looking like a rendering bug
-- **Three panes**: a two-level sidebar on the left (a "Mailboxes" group plus any
-  extra server folders, each with its unread count), the conversation list in the
-  middle, the conversation on the right. There is no full-width rule anywhere —
-  the panes are separated by background blocks and blank space instead, and the
-  input box floats on the content with a blank line above and below it. Under 96
-  columns it collapses to a single pane; "Sent" / "Trash" are then reached with
-  `Tab` or `Ctrl+G`
-- **Depth comes from background, not from lines**: the three panes sit on a
-  ladder of greys (list < sidebar < bubble < raised), and the two side panes run
-  all the way to the bottom of the screen so the columns never look cut off
-- **A reply's block hugs its text** rather than spanning the whole pane, so a
-  one-line message looks like a one-line message
+- **Two panes, one ladder**: the conversation list on the left, the conversation
+  on the right. Folders are not a third column — they cost a whole pane of width
+  to show four names and an unread count, so they are summoned when you want them
+  (`Tab` or `Ctrl+G`) instead of standing there. There is no full-width rule
+  anywhere: the panes are separated by one **vertical line** and blank space, and
+  the input box floats on the content with a blank line above and below it. Under
+  96 columns it collapses to a single pane
+- **Background means exactly one thing: "this is a thing you can act on right
+  now."** The selected list row, the input card, the current tab. Nothing else
+  gets a background — the panes used to sit on a ladder of three greys, and at
+  that distance the screen read as three cut-apart slabs rather than one window
+- **The other side's reply is marked with a vertical bar**, not a background
+  block. One bar per message, next to the text, so a one-line message still looks
+  like a one-line message. A block of colour around someone else's words is loud
+  enough to outweigh the words themselves
 - **The list is grouped** into unread / read, chronologically inside each group.
   The selected row gets a background block rather than reverse video — reverse
   video is the loudest thing a terminal can do, and one such row blows up the view
 - **Tabs across the top**: once a second conversation has been opened, the line
-  above the conversation lists the recently opened ones (most recent first, the
-  current one highlighted). Click one, or press `Ctrl+↑` / `Ctrl+↓`
-- **The mouse works**: click the sidebar to switch folders, click the list to open
-  a conversation, click a tab to switch, click the rightmost column of the
-  conversation to jump. The wheel scrolls whatever pane the pointer is over
+  above the conversation lists the open ones. **The order is fixed** — the order
+  you opened them in, oldest first. Browsers do not move a tab to the front when
+  you click it, and neither does this: a row that reshuffles itself under the
+  pointer means the tab you are aiming at is never where it was a second ago.
+  Click one, or press `Ctrl+↑` / `Ctrl+↓`
+- **Every screen that only Esc could leave now has a clickable way out.** Help,
+  the folder picker, search, the confirm box, forward, compose, a conversation,
+  and all three Zen screens each grow a bracketed button in the bottom-right
+  corner of the last row. Clicking it runs the *same code* as the key it stands
+  for, so the two can never drift. The row is right-aligned and drops from the
+  left when it runs out of width, so the last thing to go is always the exit
+- **The mouse works**: click the list to open a conversation, click a tab to
+  switch, click the rightmost column of the conversation to jump, click any
+  footer button. The wheel scrolls whatever pane the pointer is over
 
 **Acting**
 
@@ -408,7 +423,7 @@ most common keys.
 | `n` | New conversation |
 | `/` | Search |
 | `Tab` | Switch folder (opens a picker) |
-| `Ctrl+G` | Cycle through the sidebar's folders |
+| `Ctrl+G` | Cycle through the folders |
 | `Esc` | Unwind one filter layer: folder first, then the search term |
 | `r` | Sync now |
 | `u` | Mark unread |
@@ -447,11 +462,32 @@ message — every action uses a `Ctrl` combination instead.
 
 | Action | Effect |
 |---|---|
-| Wheel | Scrolls whatever the pointer is over: the sidebar switches folders, the list moves the cursor, the conversation scrolls |
-| Click sidebar | Switch folder |
+| Wheel | Scrolls whatever the pointer is over: the list moves the cursor, the conversation scrolls |
 | Click list | Open that conversation |
 | Click a tab | Switch to that conversation (tabs sit on the line above the conversation) |
 | Click the rightmost column | That column is the scroll bar — click to jump |
+| Click a footer button | The same thing as the key it stands for (see below) |
+
+**Footer buttons**
+
+The bottom-right corner of the last row carries the ways out of whatever screen
+you are on. It is there because Esc was, in too many places, the only exit — and
+a mouse user has no Esc. Each button runs the same code as its key:
+
+| Screen | Button | Same as |
+|---|---|---|
+| Conversation | `[ 会话列表 ]` | `Esc` |
+| Help | `[ 关闭 ]` | `Esc` |
+| Folder picker | `[ 取消 ]` | `Esc` |
+| Search | `[ 保留过滤 ]` / `[ 清空 ]` | `Enter` / `Esc` |
+| Confirm box | `[ 确认 ]` / `[ 取消 ]` | `y` / `n` |
+| Compose, forward | `[ 取消 ]` | `Esc` |
+| Zen (home) | `[ 退出 Zen ]` | `Esc` |
+| Zen (list) | `[ 回首页 ]` | `Esc` |
+| Zen (conversation) | `[ 会话列表 ]` | `Esc` |
+
+The list itself has no buttons, and does not need any — `q` quits and every other
+key is a one-letter action, so nothing there is reachable only by Esc.
 
 A scroll bar appears on the right edge of the conversation once it is longer
 than one screen — which is also the answer to "is this thing scrollable at

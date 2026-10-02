@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +24,8 @@ import (
 
 // openTwoPane 造一个双栏、已经开着会话、并且开过两个以上会话的模型。
 //
-// 顶部标签页只在「最近开过两个会话」之后才出现，所以要真的走一遍切换，
-// 不能直接改 recent —— 那样测的是夹具，不是功能。
+// 顶部标签页只在「打开过两个会话」之后才出现，所以要真的走一遍切换，
+// 不能直接改 openTabs —— 那样测的是夹具，不是功能。
 func openTwoPane(t *testing.T) Model {
 	t.Helper()
 	m, _ := newFeatureModel(t)
@@ -36,7 +38,7 @@ func openTwoPane(t *testing.T) Model {
 		t.Fatalf("前提不成立：宽度 %d 降级成了单栏", m.width)
 	}
 	if l.tabsRow < 0 {
-		t.Fatalf("前提不成立：标签页没出现（recent=%d 条）", len(m.recent))
+		t.Fatalf("前提不成立：标签页没出现（openTabs=%d 条）", len(m.openTabs))
 	}
 	return m
 }
@@ -81,25 +83,24 @@ func TestLayout_RegionsTileTheScreen(t *testing.T) {
 					w, h, l.bodyH, l.inputRows)
 			}
 
-			// 横向同理：导航 + 列表 + 会话流 = 整幅宽，**中间不留缝**。
+			// 横向同理：列表 + 分隔竖线 + 正文 = 整幅宽，**中间不留缝**。
 			if l.twoPane {
-				if l.navW != navWidth {
-					t.Errorf("%dx%d：侧栏宽 %d，want %d", w, h, l.navW, navWidth)
+				if l.listX != 0 {
+					t.Errorf("%dx%d：列表栏没从第 0 列起步（listX=%d）", w, h, l.listX)
+				}
+				// 那条竖线是**实打实的一列**，夹在两栏之间。
+				if l.ruleX != l.listX+l.listW {
+					t.Errorf("%dx%d：竖线在第 %d 列，该紧跟列表右沿 %d",
+						w, h, l.ruleX, l.listX+l.listW)
+				}
+				if l.chatX != l.ruleX+1 {
+					t.Errorf("%dx%d：正文栏没紧接竖线（chatX=%d ruleX=%d）", w, h, l.chatX, l.ruleX)
 				}
 				if l.chatX+l.chatW != w {
 					t.Errorf("%dx%d：会话流右边缘在 %d 列，屏幕 %d 列", w, h, l.chatX+l.chatW, w)
 				}
-				// 三栏首尾相接：列表紧接侧栏，会话流紧接列表。上一版这里
-				// 是 `+1`（那根竖线占的列），现在那一列回到了会话流里。
-				if l.chatX != l.listX+l.listW {
-					t.Errorf("%dx%d：会话流没紧接列表（chatX=%d，列表右沿 %d）",
-						w, h, l.chatX, l.listX+l.listW)
-				}
-				if l.listX != l.navW {
-					t.Errorf("%dx%d：列表没紧接侧栏（listX=%d navW=%d）", w, h, l.listX, l.navW)
-				}
-			} else if l.navW != 0 || l.listX != 0 {
-				t.Errorf("%dx%d：单栏模式下不该有导航栏（navW=%d listX=%d）", w, h, l.navW, l.listX)
+			} else if l.ruleX != -1 || l.listX != 0 {
+				t.Errorf("%dx%d：单栏模式下不该有分隔竖线（ruleX=%d listX=%d）", w, h, l.ruleX, l.listX)
 			}
 
 			// 画出来的行数必须等于屏幕高度 —— 上面那些都是算出来的，
@@ -152,16 +153,29 @@ func TestView_NoLineOverflowsTheTerminal(t *testing.T) {
 	}
 }
 
-// 单栏（窄终端）不许出现侧栏，也不许把内容顶出去。
-func TestLayout_NarrowTerminalDropsTheSidebar(t *testing.T) {
+// 单栏（窄终端）只剩一栏：没有分隔竖线，也不许把内容顶出去。
+//
+// 上一版这里守的是「不许出现侧栏」，断言 `View()` 里不含「邮箱」。侧栏
+// 删掉之后（文件夹不占一栏，改成按需弹出）这条变成了**永真**：界面上已经
+// 没有的东西，怎么改都不会再出现。一条永绿的判据和没有判据是一回事，
+// 它还会让「单栏下多画了一栏」这类真错从旁边溜过去。
+//
+// 换成守那条现在真的可能出错的规矩：单栏不该有分隔竖线那一列。
+//
+// ⚠️ 量的是几何（ruleX），**不是**扫屏幕上的 │ 字符。滚动条用的也是同一个
+// 字符（view.go 里 styleScrollBar 渲染的 track）—— 扫字符的话，哪天正文
+// 的滚动条挪进单栏，这条就会为一个跟分隔线无关的原因变红。
+func TestLayout_NarrowTerminalHasNoRail(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	m, _ = update(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
-	if l := m.measureLayout(); l.twoPane {
+	l := m.measureLayout()
+	if l.twoPane {
 		t.Fatalf("80 列不该是双栏")
 	}
-	if strings.Contains(m.View(), "邮箱") {
-		t.Error("单栏模式里画出了侧栏的内容")
+	if l.ruleX >= 0 {
+		t.Errorf("单栏下 ruleX = %d，应该是 -1：那一列分隔竖线是两栏才有的结构",
+			l.ruleX)
 	}
 	for i, line := range viewLines(m) {
 		if w := lipgloss.Width(line); w > m.width {
@@ -187,9 +201,22 @@ func TestInputBlock_FloatsWithBlankLinesAround(t *testing.T) {
 	}
 	lines := viewLines(m)
 
+	// ⚠️ 量的是「**除竖线那一列之外**」是不是空白。
+	//
+	// 竖线按设计要贯到底（见 viewTwoPane 里 withRail 那段说明），留白行
+	// 也不例外，所以这些行上本来就有且只有那一列是可见字符。整行
+	// TrimSpace 一把梭的话，判据会把「设计如此」当成故障 —— 而它要守的
+	// 其实是另一件事：那两行**没有别的任何内容**，输入框才浮得起来。
 	for _, off := range []int{0, 2} {
-		if got := strings.TrimSpace(plainText(lines[l.inputTop+off])); got != "" {
-			t.Errorf("输入框上/下那行不是空白：%q", got)
+		row := lines[l.inputTop+off]
+		left := plainText(ansiSlice(row, 0, l.ruleX))
+		right := plainText(ansiSlice(row, l.ruleX+1, m.width))
+		if got := strings.TrimSpace(left + right); got != "" {
+			t.Errorf("输入框上/下那行除了竖线还有内容：%q", got)
+		}
+		if got := plainText(ansiSlice(row, l.ruleX, l.ruleX+1)); got != ruleMark {
+			t.Errorf("输入框上/下那行的第 %d 列是 %q，want %q —— 竖线在这里断了",
+				l.ruleX, got, ruleMark)
 		}
 	}
 
@@ -202,9 +229,10 @@ func TestInputBlock_FloatsWithBlankLinesAround(t *testing.T) {
 	if w := lipgloss.Width(row); w >= m.width {
 		t.Errorf("输入那一行铺到了第 %d 列（终端 %d 列），右边没留出边距", w, m.width)
 	}
-	// 左边也不许压到侧栏上。
-	if !strings.Contains(row, navBgSeq()) {
-		t.Error("侧栏没有贯到输入区这一行，看着像导航栏只有一半高")
+	// 分隔竖线要贯到这一行 —— 断在输入区上面的话，看着像一条画了一半的线。
+	if got := plainText(ansiSlice(row, l.ruleX, l.ruleX+1)); got != ruleMark {
+		t.Errorf("第 %d 列（分隔竖线）是 %q，want %q —— 竖线在输入区这一行断了",
+			l.ruleX, got, ruleMark)
 	}
 }
 
@@ -269,35 +297,69 @@ func TestInputLine_FillsItsWidth(t *testing.T) {
 // renderThreadList，得由 withPaneStrip 一格格补上底色。漏了的话列表栏
 // 那层 235 在输入区凭空消失，看着像列表栏被输入框截掉了一截 —— 而这种
 // 事在截图里只会觉得「下面有点怪」，说不出怪在哪。
-func TestPanes_ReachTheBottomOfTheScreen(t *testing.T) {
+// 分隔竖线要从顶贯到底 —— 包括底部那三行（输入区 / 状态栏）。
+//
+// 上一版这条判据量的是「侧栏和列表栏的底色带有没有铺到屏幕底部」。两块
+// 面板底色都被撤掉之后，同一件事改由那条线承担：一条只画了上半截的
+// 分界线，读起来是"画错了"，不是"到底了"。
+//
+// 它挡的是一类很隐蔽的漏项：标签页 / 输入区 / 状态栏这三行**不走**
+// renderThreadList，而是各自被拼出来的，很容易忘了补左边那一截。
+// 症状是线在主体区底部忽然断掉，而只看主体区的判据全绿。
+func TestRail_ReachesTheBottomOfTheScreen(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.measureLayout()
 	rows := viewLines(m)
 
-	// 口径要对齐：bgAtFirstCell 给的是**裸参数**（"48;5;237"），而
-	// navBgSeq 给的是**整条 SGR 序列**（"\x1b[48;5;237m"）。少了这层剥壳，
-	// 判据会把「底色其实铺对了」判成红 —— 尺子错了，不是产品错了。
-	navWant := bgParamOf(navBgSeq())
-	listWant := bgParamOf(listBgSeq())
-	for _, w := range []struct{ name, v string }{{"侧栏", navWant}, {"列表栏", listWant}} {
-		if w.v == "" {
-			t.Fatalf("拿不到%s底色的序列 —— 这个用例大概忘了 forceColor", w.name)
+	// 从标签页那一行（如果有）一直到状态栏，一列都不能断。
+	from := l.bodyTop
+	if l.tabsRow >= 0 {
+		from = l.tabsRow
+	}
+	for y := from; y <= l.statusRow; y++ {
+		got := plainText(ansiSlice(rows[y], l.ruleX, l.ruleX+1))
+		if got != ruleMark {
+			t.Errorf("第 %d 行的第 %d 列（分隔竖线）是 %q，want %q —— 竖线在这里断了",
+				y, l.ruleX, got, ruleMark)
 		}
 	}
-	// 列表栏取它中间那一列：左右各有一格是接缝（侧栏右沿、列表栏右沿），
-	// 量接缝等于在量两个面板的交界，说明不了「这条带子还在不在」。
-	x := l.listX + l.listW/2
+}
 
-	for _, y := range []int{l.inputTop, l.inputTop + 1, l.statusRow} {
-		row := rows[y]
-		if got := bgAtFirstCell(ansiSlice(row, 0, 1)); got != navWant {
-			t.Errorf("第 %d 行第 0 列（侧栏）的底色是 %q，want %q —— 侧栏没铺到底",
-				y, got, navWant)
+// 列表栏和正文栏**都不铺底色**：整屏只剩终端背景这一个"面"。
+//
+// 这是这一轮把两块面板底色撤掉之后要守住的那件事。上一版列表栏铺 235、
+// 文件夹栏铺 237，一屏里同时坐着三块亮度不同的灰板，用户的原话是
+// 「割裂」。撤掉之后分区只由那条竖线表达。
+//
+// ⚠️ 判据绑的是「**不出现**任何整栏底色」，不是具体色号：以后想加回来
+// 一个别的灰，这条也会红 —— 那正是它该拦的（这一轮的决定是"面板不分层"，
+// 不是"不要 235 这个灰"）。
+func TestPanes_AreNotPainted(t *testing.T) {
+	forceColor(t)
+	m := openTwoPane(t)
+	l := m.measureLayout()
+
+	// 列表栏取它中间那一列，量一条整栏贯通的带子。避开选中行 ——
+	// 那一行**本来就有**底色（它是"选中"的信号，不是分区）。
+	rows := viewLines(m)
+	x := l.listX + l.listW/2
+	for y := l.bodyTop; y < l.bodyTop+l.bodyH; y++ {
+		line := rows[y]
+		if idx, ok := m.listRowAt(l.listW, l.bodyH, y-l.bodyTop); ok && idx == m.cursor {
+			continue
 		}
-		if got := bgAtFirstCell(ansiSlice(row, x, x+1)); got != listWant {
-			t.Errorf("第 %d 行第 %d 列（列表栏）的底色是 %q，want %q —— 列表栏没铺到底",
-				y, x, got, listWant)
+		if got := bgAtFirstCell(ansiSlice(line, x, x+1)); got != "" {
+			t.Errorf("第 %d 行第 %d 列（列表栏）铺了底色 %q —— 面板底色这一轮撤掉了",
+				y, x, got)
+		}
+	}
+	// 正文栏这一侧只量**一定是空白的**那几行：输入卡上下那两行留白和
+	// 状态栏。输入卡自己那一行本来就有底色（它是"这里能打字"的信号），
+	// 混进来量就成了一条永远红的判据。
+	for _, y := range []int{l.inputTop, l.inputTop + l.inputRows - 1, l.statusRow} {
+		if got := bgAtFirstCell(ansiSlice(rows[y], l.paneX, l.paneX+1)); got != "" {
+			t.Errorf("第 %d 行第 %d 列（正文栏，该是空白）铺了底色 %q", y, l.paneX, got)
 		}
 	}
 }
@@ -323,7 +385,7 @@ func TestInputCapsule_LivesInsideTheChatPane(t *testing.T) {
 		x    int
 		name string
 	}{
-		{0, "侧栏"},
+		{0, "列表栏左沿"},
 		{l.listX + l.listW/2, "列表栏"},
 		{l.paneX - paneInset, "输入卡左沿那一格留白"},
 	} {
@@ -334,7 +396,7 @@ func TestInputCapsule_LivesInsideTheChatPane(t *testing.T) {
 	}
 
 	if got := bgAtFirstCell(ansiSlice(row, l.paneX, l.paneX+1)); got != capBg {
-		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 输入卡没和气泡对齐",
+		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 输入卡没和正文左边缘对齐",
 			l.paneX, got, capBg)
 	}
 }
@@ -395,68 +457,70 @@ func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
 	}
 }
 
-// 侧栏是一条**从上到下贯通的**竖带：每一行都铺着底色（选中那一项压着
-// 一块更亮的，其余是同一条带子）。
+// 文件夹选择器要真的分两级：组标题 + 组里的项。
 //
-// 这不是审美问题：底色只在有内容的那几行上，侧栏就变成几块飘着的色斑，
-// 和列表栏之间那道竖向的分界也就断了。而这件事最容易坏的方式是
-// 「用 styleNav.Render(整块) 一次铺完」—— 那样只有第一行有底色
-// （原因见 paintRowBg 的注释），画面看着还行，用户只会觉得
-// 「那条带子下面淡了」，没人会报 bug。
-func TestNav_IsOneContinuousBand(t *testing.T) {
-	forceColor(t)
-	m, _ := newFeatureModel(t)
-	navBg := bgParamOf(bgSeqOf(styleNav))
-	if navBg == "" {
-		t.Fatal("拿不到侧栏底色的序列 —— 这个用例大概忘了 forceColor")
-	}
-
-	rows := strings.Split(m.renderNav(m.measureLayout()), "\n")
-	if len(rows) < 5 {
-		t.Fatalf("侧栏只有 %d 行，前提不成立", len(rows))
-	}
-	active := selectedBg(t)
-	for i, r := range rows {
-		switch got := bgAtFirstCell(r); got {
-		case "":
-			t.Errorf("侧栏第 %d 行没铺底色 —— 一条贯通的带子断在这里", i)
-		case navBg, active:
-			// 正常：要么是那条带子，要么是压在带子上的选中块。
-		default:
-			t.Errorf("侧栏第 %d 行的底色是 %q，want %q（选中的那项是 %q）", i, got, navBg, active)
-		}
-	}
-}
-
-// 侧栏要真的分两级：组标题 + 组里的项。
+// 这一段原来守着**左侧那条常驻导航列**。那一列被删掉了（四五个入口每天
+// 占掉 12 列列表宽度），但它承载的两件事必须跟着搬过来，不能跟着一起丢 ——
+// 两级层次，和「哪一项是当前所在」。这就是下面这几条判据的来历。
 func TestNav_HasTwoLevels(t *testing.T) {
 	m, _ := newFeatureModel(t)
-	rows := m.navRows()
+	m, cmd := update(m, keyMsg("tab"))
+	m = runCmd(t, m, cmd)
 
-	if len(rows) == 0 {
-		t.Fatal("侧栏一行都没有")
+	// ⚠️ 这份文件夹名单必须在**打开选择器之后**才写。
+	//
+	// 打开那一步自己会去 LIST 一遍（foldersCmd(true)），并把结果盖回
+	// m.folders（见 foldersResultMsg）。先写的话，那一次 LIST 会把手写的
+	// 名单冲掉，第二组「文件夹」连同「垃圾邮件」一起凭空消失 ——
+	// 而判据只会报「选择器里没有 垃圾邮件」，看着像分组逻辑坏了。
+	m.folders = []string{"INBOX", "Sent", "Trash", "垃圾邮件"}
+
+	rows := m.folderPickRows()
+	if len(rows) < 5 {
+		t.Fatalf("选择器只有 %d 行，前提不成立", len(rows))
 	}
-	// 第一行是组标题，第二行起才是项。
-	if !strings.Contains(plainText(rows[0]), "邮箱") {
-		t.Errorf("侧栏第一行应该是「邮箱」这个组标题，实际 %q", plainText(rows[0]))
+	// 行结构**从组标题起步**：标题行和空行由渲染层自己加（见 viewFolderPicker
+	// 的 "换个文件夹" + 空行），folderPickRows 只负责内容。
+	//
+	// 这里原来写的是 rows[2:]，因为上一版把标题和空行也算进了行结构里 ——
+	// 于是把索引绑到了一个纯粹属于版式的偏移上，版式一改判据就开始指着
+	// 一个不存在的项说"这该是组标题"。
+	if rows[0].group == "" {
+		t.Fatalf("第 1 行该是组标题，实际 %+v", rows[0])
 	}
+	// 组标题后面紧跟着组里的项 —— 这就是「两级」在数据层的样子。
+	if rows[1].item == nil {
+		t.Fatalf("第 2 行该是组里的第一项，实际 %+v", rows[1])
+	}
+	body := rows
+
 	// 组里的项要缩进，和组标题错开 —— 这是「两级」在画面上唯一的表达。
 	//
 	// ⚠️ 差必须 **≥2 格**，不能只比大小。差 1 格隔着一层文字根本看不出来，
-	// 而 navWidth 之所以从 12 加到 14，就是为了让这个差能给到 2 格（见
-	// styles.go 里 navWidth 那段）。只写「项 > 标题」的话，缩进退回 1 格
-	// 照样绿 —— 变异验证确认过（navItemIndent 3→1 时那种写法不变红），
-	// 而「缩进只差一格、看不出层级」正是这一版要修掉的那个毛病。
+	// 只写「项 > 标题」的话缩进退回 1 格照样绿 —— 变异验证确认过，而
+	// 「缩进只差一格、看不出层级」正是当初要修掉的那个毛病。
 	const minGap = 2
-	title, item := plainText(rows[0]), plainText(rows[1])
-	if gap := labelIndentOf(item) - labelIndentOf(title); gap < minGap {
+	view := plainText(m.View())
+	titleLine, itemLine := "", ""
+	for _, l := range strings.Split(view, "\n") {
+		switch {
+		case titleLine == "" && strings.Contains(l, body[0].group):
+			titleLine = l
+		case itemLine == "" && titleLine != "" && strings.Contains(l, "全部"):
+			itemLine = l
+		}
+	}
+	if titleLine == "" || itemLine == "" {
+		t.Fatalf("画出来的选择器里找不到组标题或第一项：\n%s", view)
+	}
+	if gap := labelIndentOf(itemLine) - labelIndentOf(titleLine); gap < minGap {
 		t.Errorf("组里的项只比组标题深 %d 格（want ≥%d），看不出层级：标题 %q（第 %d 列）、项 %q（第 %d 列）",
-			gap, minGap, title, labelIndentOf(title), item, labelIndentOf(item))
+			gap, minGap, titleLine, labelIndentOf(titleLine), itemLine, labelIndentOf(itemLine))
 	}
 
-	for _, want := range []string{"全部", "收件箱", "已发送", "已删除"} {
-		if !strings.Contains(strings.Join(plainTexts(rows), "\n"), want) {
-			t.Errorf("侧栏里没有 %q", want)
+	for _, want := range []string{"全部", "收件箱", "已发送", "已删除", "垃圾邮件"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("选择器里没有 %q", want)
 		}
 	}
 }
@@ -489,7 +553,46 @@ func TestNav_ServerFoldersGetTheirOwnGroup(t *testing.T) {
 	}
 }
 
-// 切文件夹的时候，侧栏上的数字不许跟着变。
+// 选择器**不列服务端上不存在的文件夹**。
+//
+// 这一条和 navGroups 的行为**故意相反**，两边都由判据钉着：
+//
+//   - navGroups 里那四项永远在 —— 常驻的时候，项数随服务器状态忽增忽减
+//     比列一个空文件夹更让人困惑（东西会自己跳位置）。
+//   - 选择器里要滤掉 —— 它是用户专门打开的一张"我要去哪儿"的列表，
+//     列出一个点进去必然空空如也的文件夹，就是纯误导。
+//
+// 写这条的时候注意夹具：testConfig 里配的 SENT / TRASH 在 fake 服务端上
+// 并不存在，所以「已删除」应该被滤掉，而 INBOX / Sent 留着。
+func TestFolderPicker_HidesFoldersThatDoNotExist(t *testing.T) {
+	m, _ := newFeatureModel(t)
+	// 夹具里的 fake 只认 INBOX / Sent，所以 TRASH 解析不出来。
+	if got := m.folderName("TRASH"); got == "Trash" {
+		t.Skipf("夹具变了：TRASH 现在能解析成 %q，这条用例的前提没了", got)
+	}
+
+	picked := map[string]bool{}
+	for _, it := range m.folderPickerItems() {
+		picked[it.label] = true
+	}
+	if picked["已删除"] {
+		t.Errorf("选择器里列出了服务端上不存在的「已删除」（TRASH 解析不出来）")
+	}
+	for _, want := range []string{"全部", "收件箱", "已发送"} {
+		if !picked[want] {
+			t.Errorf("选择器里少了本来就存在的 %q：%v", want, picked)
+		}
+	}
+
+	// 拿不到文件夹列表时**不过滤**：那时候本来就判断不了谁存在，
+	// 不该把任何一项判死。
+	m.folders = nil
+	if got := len(m.folderPickerItems()); got != 4 {
+		t.Errorf("拿不到文件夹列表时有 %d 项，want 4（四个固定入口都留着）", got)
+	}
+}
+
+// 切文件夹的时候，各文件夹的未读计数不许跟着变。
 //
 // 变了的话，切到「已发送」之后「收件箱」会显示 0 —— 用户看到的是
 // 「邮件不见了」，而它只是被过滤掉了。
@@ -520,25 +623,37 @@ func TestNav_CountsDoNotFollowTheCurrentFolder(t *testing.T) {
 	}
 }
 
-// 侧栏的选中态直接就是 activeFolder：不许出现「侧栏高亮着已发送、
+// 选择器里的高亮直接就是 activeFolder：不许出现「高亮着已发送、
 // 列表却在显示收件箱」这种对不上号的画面。
-func TestNav_HighlightFollowsTheActiveFolder(t *testing.T) {
+func TestFolderPicker_HighlightFollowsTheActiveFolder(t *testing.T) {
 	forceColor(t)
 	want := selectedBg(t)
 	m, _ := newFeatureModel(t)
 
-	for _, it := range m.navItems() {
+	for _, it := range m.folderPickerItems() {
 		m.setFolder(it.folder)
-		// 量的是**画出来的**侧栏：每一行都由 renderNav 铺过底色，所以
-		// 「第一个格子的底色」就是用户看到的那块色块。
+		m.mode = modeFolder
+		// 打开选择器时会把光标停在当前那一项上，这里照着做一遍。
+		for i, x := range m.folderPickerItems() {
+			if x.folder == m.activeFolder {
+				m.folderCursor = i
+			}
+		}
+
+		// 量的是**画出来的**那一行：只有铺了底色的那一个才算。
+		//
+		// ⚠️ 用 bgColsOf 而不是 bgAtFirstCell：选择器是**居中**的一列窄栏
+		// （见 pickerGeom），选中块前面还有一段缩进。只看第 0 格的底色，
+		// 量到的是那段缩进（终端背景），于是一个高亮都匹配不到 ——
+		// 判据会退化成一红一片的「高亮丢了」，而画面上明明是对的。
 		var highlighted []string
-		for _, r := range strings.Split(m.renderNav(m.measureLayout()), "\n") {
-			if bgAtFirstCell(r) == want {
+		for _, r := range strings.Split(m.View(), "\n") {
+			if bgColsOf(r, want) > 0 {
 				highlighted = append(highlighted, strings.TrimSpace(plainText(r)))
 			}
 		}
 		if len(highlighted) != 1 {
-			t.Fatalf("选中的侧栏项有 %d 个（folder=%q）：%v", len(highlighted), it.folder, highlighted)
+			t.Fatalf("高亮的项有 %d 个（folder=%q）：%v", len(highlighted), it.folder, highlighted)
 		}
 		if !strings.Contains(highlighted[0], it.label) {
 			t.Errorf("folder=%q 时高亮的是 %q，want %q", it.folder, highlighted[0], it.label)
@@ -566,23 +681,42 @@ func TestTabs_AppearOnlyAfterASecondThreadIsOpened(t *testing.T) {
 	}
 }
 
-// 标签页按 MRU 排，当前那一个在最前面并且铺着底色。
-func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
+// 标签页按**打开先后的顺序**排，当前那一个铺着底色。
+//
+// 顺序的语义是这条用例的重点。标签页回答的是「我打开过哪些会话」，那是
+// 一段操作历史；按 MRU 排的话，点一下标签它自己就跳到第一个位置 —— 一排
+// 会自己重排的标签，每点一次都得重新找一遍。浏览器的做法是位置只在
+// 开 / 关标签时才变。
+func TestTabs_OrderFollowsOpenSequenceAndActiveMarked(t *testing.T) {
 	forceColor(t)
 	want := selectedBg(t)
 	m := openTwoPane(t)
 
-	chips := m.tabChips(m.measureLayout())
-	if len(chips) != 2 {
-		t.Fatalf("标签页有 %d 个，want 2", len(chips))
+	// openTwoPane 是「回车开第一条、Ctrl+↓ 换到第二条」，所以当前会话是
+	// 第二个被打开的 ——「当前的在最前面」和「按打开顺序排」在这里会给出
+	// 不同的答案，这条用例才分得开这两件事。
+	if len(m.openTabs) != 2 {
+		t.Fatalf("打开顺序是 %v，want 2 条", m.openTabs)
 	}
-	if chips[0].id != m.activeID {
-		t.Errorf("第一个标签是 %q，当前会话是 %q —— 不是 MRU 序", chips[0].id, m.activeID)
+	if m.openTabs[0] == m.activeID {
+		t.Fatalf("前提不成立：当前会话正好是第一个打开的（openTabs=%v），分不出两种排序", m.openTabs)
+	}
+
+	var opened []string
+	for _, c := range m.tabChips(m.measureLayout()) {
+		if c.marker != "" {
+			t.Fatalf("只有两个标签却出现了溢出指示符 %q", c.marker)
+		}
+		opened = append(opened, c.id)
+	}
+	if !sameStrings(opened, m.openTabs) {
+		t.Errorf("标签顺序是 %v，打开顺序是 %v —— 没按打开先后排", opened, m.openTabs)
 	}
 
 	// 标签的坐标是正文栏里的相对列，画面是屏幕列，所以要加上 paneX
 	// （面板带 + 那 1 格内缩）那一截。
 	l := m.measureLayout()
+	chips := m.tabChips(l)
 	row := viewLines(m)[l.tabsRow]
 	var marked []string
 	for _, c := range chips {
@@ -595,29 +729,48 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 		t.Errorf("铺了底色的标签是 %v，当前会话是 %q", marked, m.activeID)
 	}
 
-	// 第一个标签必须正好压在**正文栏内容的左边缘**上：下面的气泡、输入
+	// 第一个标签必须正好压在**正文栏内容的左边缘**上：下面的引用块、输入
 	// 卡、状态栏全都从这一列起步，标签页偏出十几列的话，一眼就看得出
 	// 没对齐。
-	if got := bgAtFirstCell(ansiSlice(row, l.paneX, l.paneX+1)); got != want {
-		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 第一个标签没和正文栏对齐",
-			l.paneX, got, want)
+	//
+	// 判据取「**正文栏那一段**里第一个可见字符落在第几列」。不拿当前标签
+	// 的底色去比 —— 按打开顺序排之后当前标签不一定是第一个，第一个是灰字、
+	// 不铺底。字符还是有的：位置对了就说明整排没被漏算一段偏移（这正是它
+	// 抓到过的那次错，withNavStrip 那一下被漏掉，整排标签右移了十几列）。
+	//
+	// ⚠️ 只量竖线**右边**那一段。竖线本身也是可见字符，而且它画在第
+	// ruleX 列 —— 整行从头数的话，数到的是那条线，判据会红在一个跟标签
+	// 无关的列号上（见 TestTabs_OrderFollowsOpenSequenceAndActiveMarked
+	// 报过的「在第 25 列」）。
+	if chips[0].x0 != 0 {
+		t.Errorf("第一个标签的起点是第 %d 列，want 0（正文栏内容的左边缘）", chips[0].x0)
+	}
+	seg := plainText(ansiSlice(row, l.ruleX+1, m.width))
+	lead := len(seg) - len(strings.TrimLeft(seg, " "))
+	if got := l.ruleX + 1 + lead; got != l.paneX+1 {
+		t.Errorf("标签行上第一个可见字符在第 %d 列，want %d（左边缘 + 1 格内边距）—— 第一个标签没和正文栏对齐",
+			got, l.paneX+1)
 	}
 }
 
-// 点标签页能切过去，而且切过去之后它自己会排到最前面。
+// 点标签页能切过去，而且**它自己一动不动**：位置、列宽都不变。
 //
 // **在画出来的那一行上去找标签所在的列**，而不是拿 tabChips 声明的坐标去点。
 // 声明错了、而渲染和命中测试都跟着错的时候，只比对内部字段的判据全是绿的
 // —— 这条用例就这么假绿过一次：chips 宣称第一个标签在第 13 列，实际画在
 // 第 26 列（renderTabs 里 withNavStrip 的那一下被漏算了），点自己声明的地方
 // 当然还是「对」的。
-func TestTabs_ClickSwitchesThread(t *testing.T) {
+func TestTabs_ClickSwitchesThreadWithoutReordering(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.measureLayout()
+	before := m.tabChips(l)
 
 	row := plainText(viewLines(m)[l.tabsRow])
-	for _, c := range m.tabChips(l) {
+	for _, c := range before {
+		if c.marker != "" {
+			continue
+		}
 		col := strings.Index(row, c.label)
 		if col < 0 {
 			t.Fatalf("标签 %q 在画出来的那一行里找不到：%q", c.label, row)
@@ -635,10 +788,152 @@ func TestTabs_ClickSwitchesThread(t *testing.T) {
 		if got.mode != modeChat {
 			t.Errorf("点了标签之后 mode=%v，want modeChat", got.mode)
 		}
-		if first := got.tabChips(got.measureLayout())[0].id; first != c.id {
-			t.Errorf("刚点过的 %q 没排到最前面（第一个是 %q）", c.id, first)
+		// 位置连一列都不该挪。比的是整排标签（顺序 + 文字 + 列区间），
+		// 只比 id 顺序的话，「三个标签整体右移一格」这种错照样绿。
+		if after := got.tabChips(got.measureLayout()); !sameChips(before, after) {
+			t.Errorf("点过 %q 之后标签从 %v 变成 %v —— 不该重排",
+				c.id, chipIDs(before), chipIDs(after))
 		}
 	}
+}
+
+// 标签一多就放不下了：那一排的窗口跟着当前标签走，**当前这一个永远在
+// 可见范围里**。
+//
+// 这是浏览器的 scroll-into-view。不这么做的话，开过七八个会话之后切到最后
+// 一个，那排标签里根本没有亮着的那一格 —— 看着就像切换失败了。窗口取「最小
+// 的、能覆盖当前标签的 start」，所以在保证当前可见的前提下还会尽量把左边的
+// 标签也带进来。
+func TestTabs_WindowFollowsActiveThread(t *testing.T) {
+	forceColor(t)
+	want := selectedBg(t)
+
+	const n = 8 // = tabLimit，最挤的情况
+	m := manyThreadsModel(t, n)
+	m, _ = update(m, keyMsg("enter"))
+	for i := 1; i < n; i++ {
+		m, _ = update(m, keyMsg("ctrl+down"))
+	}
+	m = loadBodies(t, m)
+
+	if len(m.openTabs) != n {
+		t.Fatalf("打开了 %d 个标签，want %d：%v", len(m.openTabs), n, m.openTabs)
+	}
+	l := m.measureLayout()
+	if !l.twoPane || l.tabsRow < 0 {
+		t.Fatalf("前提不成立：twoPane=%v tabsRow=%d width=%d", l.twoPane, l.tabsRow, m.width)
+	}
+
+	countReal := func(chips []tabChip) int {
+		k := 0
+		for _, c := range chips {
+			if c.marker == "" {
+				k++
+			}
+		}
+		return k
+	}
+	// 前提：这么多标签在这个宽度下确实放不下。放得下的话，这条用例一行
+	// 断言都没在路上走过，却一直是绿的。
+	if countReal(m.tabChips(l)) >= n {
+		t.Fatalf("前提不成立：%d 个标签在 paneW=%d 下全都放得下，没有溢出", n, l.paneW)
+	}
+
+	for i, id := range m.openTabs {
+		th, ok := m.threadByID(id)
+		if !ok {
+			t.Fatalf("标签 %q 找不到对应会话", id)
+		}
+		cur, _ := m.enterThread(th, false, true)
+		mm := cur.(Model)
+		ml := mm.measureLayout()
+
+		var real []string
+		var left, right bool
+		for _, c := range mm.tabChips(ml) {
+			switch c.marker {
+			case "‹":
+				left = true
+			case "›":
+				right = true
+			default:
+				real = append(real, c.id)
+			}
+		}
+		if len(real) == 0 {
+			t.Errorf("把 %q 切成当前之后一个标签都不剩了", id)
+			continue
+		}
+
+		// 1. 当前这一个必须在可见范围里 —— 这条一红就是「切过去了但看不见」。
+		if !slices.Contains(real, id) {
+			t.Errorf("第 %d 个标签（%s）是当前会话，却不在可见标签 %v 里", i, id, real)
+		}
+		// 2. 指示符只在那一侧**真有**藏起来的标签时才画。只判「指示符出现
+		//    了」的话，两个方向各错一半（该画没画、不该画乱画）都测不出来。
+		if wantLeft := real[0] != m.openTabs[0]; wantLeft != left {
+			t.Errorf("当前是第 %d 个（%s）：左侧藏着标签=%v，但 ‹ 画的是 %v（可见 %v）",
+				i, id, wantLeft, left, real)
+		}
+		if wantRight := real[len(real)-1] != m.openTabs[n-1]; wantRight != right {
+			t.Errorf("当前是第 %d 个（%s）：右侧藏着标签=%v，但 › 画的是 %v（可见 %v）",
+				i, id, wantRight, right, real)
+		}
+		// 3. 亮着的就是当前那一个 —— 窗口滚过去了，但底色要是跟着错位，
+		//    看着还是「切换失败」。
+		row := viewLines(mm)[ml.tabsRow]
+		var marked []string
+		for _, c := range mm.tabChips(ml) {
+			if c.marker != "" {
+				continue
+			}
+			if bgAtFirstCell(ansiSlice(row, ml.paneX+c.x0, ml.paneX+c.x1)) == want {
+				marked = append(marked, c.id)
+			}
+		}
+		if len(marked) != 1 || marked[0] != id {
+			t.Errorf("当前是 %s，铺了底色的却是 %v", id, marked)
+		}
+	}
+}
+
+// sameStrings 说两个字符串切片是不是逐项相等（顺序也算）。
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameChips 说两排标签是不是一模一样：同样的顺序、同样的文字、同样的列区间。
+func sameChips(a, b []tabChip) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// chipIDs 把一排标签写成好读的一串，出错信息里用。
+func chipIDs(chips []tabChip) []string {
+	out := make([]string, 0, len(chips))
+	for _, c := range chips {
+		if c.marker != "" {
+			out = append(out, c.marker)
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s@%d-%d", c.label, c.x0, c.x1))
+	}
+	return out
 }
 
 // ---- 列表分组 ----
@@ -838,31 +1133,59 @@ func threadNamed(list []thread.Thread, text string) (thread.Thread, bool) {
 	return hit, best >= 0
 }
 
-// 点侧栏的一项就是切文件夹。
-func TestMouse_ClickNavSwitchesFolder(t *testing.T) {
+// 点列表栏的**标题行**就弹出文件夹选择器。
+//
+// 这是那条常驻导航列被删掉之后补上的入口。少了它，鼠标用户就没有任何
+// 办法换文件夹了 —— 而 Tab 和 Ctrl+G 都是键盘那边的路。
+func TestMouse_ClickListHeaderOpensFolderPicker(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
 	l := m.measureLayout()
 
-	// 在**画出来的**侧栏里找「已发送」在第几行。
-	rows := m.navRows()
-	y := -1
-	for i, r := range rows {
-		if strings.Contains(plainText(r), "已发送") {
-			y = l.bodyTop + i
-			break
-		}
-	}
-	if y < 0 {
-		t.Fatal("侧栏里没有「已发送」")
+	if m.activeFolder != "" {
+		t.Fatalf("前提不成立：一开始应该在「全部」，实际 %q", m.activeFolder)
 	}
 
+	// 整行都能点，不只标题那几个字 —— 取最左边那一格，它离文字很远。
+	m, cmd := update(m, tea.MouseMsg{
+		X: 0, Y: l.bodyTop, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+	})
+	if cmd == nil {
+		t.Fatal("点标题行之后没有去要文件夹列表 —— 选择器打不开")
+	}
+	m = runCmd(t, m, cmd)
+
+	if m.mode != modeFolder {
+		t.Fatalf("点了列表标题之后 mode=%v，want modeFolder", m.mode)
+	}
+	// 光标要停在当前那一项上，而不是从头开始。
+	if it := m.folderPickerItems()[m.folderCursor]; it.folder != m.activeFolder {
+		t.Errorf("光标停在 %q 上，当前文件夹是 %q", it.label, m.activeFolder)
+	}
+
+	// 换一个文件夹 —— 走真实的点击，不是直接改字段。
+	target := -1
+	for i, it := range m.folderPickerItems() {
+		if it.folder == m.folderName("SENT") {
+			target = i
+		}
+	}
+	if target < 0 {
+		t.Fatal("前提不成立：选择器里找不到「已发送」")
+	}
+	x, y, ok := m.pickerItemPos(target)
+	if !ok {
+		t.Fatal("「已发送」不在可见窗口里")
+	}
 	m, _ = update(m, tea.MouseMsg{
-		X: 1, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		X: x, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
 	})
 
 	if want := m.folderName("SENT"); m.activeFolder != want {
 		t.Fatalf("点了「已发送」之后 activeFolder = %q，want %q", m.activeFolder, want)
+	}
+	if m.mode != modeList {
+		t.Errorf("选完该回列表，mode=%v", m.mode)
 	}
 	// 列表必须跟着只剩那一条，否则点了等于没点。
 	if len(m.visible) == 0 {
@@ -875,16 +1198,82 @@ func TestMouse_ClickNavSwitchesFolder(t *testing.T) {
 	}
 }
 
-// 三栏紧挨着，**没有一格"缝"**：每一列都属于某一栏，边界那一列归右边那一栏。
+// 点选择器里的**别处**（留白、组标题、页脚）等于取消。
 //
-// 上一版这里是「点空隙不该有反应」—— 那时侧栏右边留了一格不属于任何栏的
-// 空白，归左边会误切文件夹、归右边会误开一封邮件。这一版把那格删掉了
-// （分界改由两块底色表达，见 styles.go 里 navGutter 那条注释），判据也就
-// 没了对象，于是换成它本来想守的那件事。
+// Esc 是键盘那边唯一的出路，鼠标必须有一条等价的 —— 否则一个用鼠标打开
+// 选择器的人会卡在一个只能靠键盘离开的界面里。这条判据守的就是它。
+func TestMouse_ClickOutsidePickerCancels(t *testing.T) {
+	forceColor(t)
+	m, _ := newFeatureModel(t)
+	m, cmd := update(m, keyMsg("tab"))
+	m = runCmd(t, m, cmd)
+	if m.mode != modeFolder {
+		t.Fatalf("前提不成立：mode=%v", m.mode)
+	}
+	before := m.activeFolder
+
+	g := m.pickerGeom()
+	for _, probe := range []struct {
+		name string
+		x, y int
+	}{
+		{"最底下的页脚那一行", g.left + 2, m.height - 1},
+		{"标题那一行", g.left + 2, 0},
+		{"那一列左边的留白", 0, 4},
+	} {
+		got, _ := update(m, tea.MouseMsg{
+			X: probe.x, Y: probe.y,
+			Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		})
+		if got.mode != modeList {
+			t.Errorf("点%s（%d,%d）之后 mode=%v，want modeList（该取消）",
+				probe.name, probe.x, probe.y, got.mode)
+		}
+		// 取消**不该顺手改掉文件夹**：那是"点错地方就换了文件夹"的无妄之灾。
+		if got.activeFolder != before {
+			t.Errorf("点%s之后 activeFolder 从 %q 变成了 %q —— 取消不该改文件夹",
+				probe.name, before, got.activeFolder)
+		}
+	}
+}
+
+// 列表栏的标题行要写明**当前所在**，而且它是那个入口的名字。
 //
-// 它挡的是这类漂移：navWidth 改了、而 layout 或 hitTest 里某处还留着老
-// 数字，于是屏幕上看着分得好好的、点下去却错一栏 —— 而且只在边界那一列
-// 上错，最难看出来。
+// 文件夹那一列被删掉之后，这一行是用户唯一能确认「我在哪儿」的地方。
+// 上一版它写「会话 · 收件箱（3 个未读）」——「会话」那 3 个字是从
+// "有个标题总比没有好"里来的，而"这一栏是会话列表"整个界面都在说。
+func TestListHeader_ShowsTheCurrentFolder(t *testing.T) {
+	m, _ := newFeatureModel(t)
+
+	if got := m.listHeader(); !strings.Contains(got, "全部") {
+		t.Errorf("没过滤时标题是 %q，该写明「全部」", got)
+	}
+
+	m.setFolder(m.folderName("INBOX"))
+	l := m.listHeader()
+	if !strings.Contains(l, "收件箱") {
+		t.Errorf("切到收件箱之后标题是 %q", l)
+	}
+	// 绑的是**标签**（收件箱）不是服务端真名（INBOX）：机器名对用户没有
+	// 意义，而且服务端上它可能叫 "Inbox" 或「收件箱」。
+	if strings.Contains(l, "INBOX") {
+		t.Errorf("标题里露出了服务端真名：%q", l)
+	}
+	// 列表里还有未读时要把数字带上 —— 换了文件夹之后这是最想知道的事。
+	if !strings.Contains(l, "未读") {
+		t.Errorf("标题 %q 里没有未读数", l)
+	}
+}
+
+// 两栏 + 一条竖线首尾相接，**没有一格"缝"**：每一列都属于某一块。
+//
+// 它挡的是这类漂移：列表栏宽度改了、而 layout 或 hitTest 里某处还留着
+// 老数字，于是屏幕上看着分得好好的、点下去却错一块 —— 而且只在边界那一
+// 两列上错，最难看出来。
+//
+// ⚠️ 那条竖线**归正文栏**（hitChat），不归列表也不单设一个区域。理由：
+// 它是"两栏之间"的一列，用户不会觉得点那里"不该有反应"。单设一个死区
+// 的话，在正文里点空白处就会有概率撞上它、什么也不发生 —— 一个安静的坑。
 func TestMouse_EveryBodyColumnBelongsToAPane(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
@@ -892,16 +1281,18 @@ func TestMouse_EveryBodyColumnBelongsToAPane(t *testing.T) {
 	row := l.bodyTop + 2
 
 	names := map[hitRegion]string{
-		hitNone: "谁都不属于", hitNav: "侧栏", hitList: "列表", hitChat: "会话流",
+		hitNone: "谁都不属于", hitListHeader: "列表标题行",
+		hitList: "列表", hitChat: "正文",
 	}
 	for _, c := range []struct {
 		x    int
 		want hitRegion
 	}{
-		{l.navX + l.navW - 1, hitNav}, // 侧栏最后一列
-		{l.navX + l.navW, hitList},    // 列表第一列 —— 中间不许有缝
-		{l.chatX - 1, hitList},        // 列表最后一列
-		{l.chatX, hitChat},            // 会话流第一列
+		{0, hitList},                     // 列表第一列
+		{l.ruleX - 1, hitList},           // 列表最后一列 —— 中间不许有缝
+		{l.ruleX, hitChat},               // 分隔竖线那一列，归正文
+		{l.ruleX + 1, hitChat},           // 正文第一列
+		{l.chatX + l.chatW - 1, hitChat}, // 正文最后一列
 	} {
 		if got, _ := m.hitTest(c.x, row); got != c.want {
 			t.Errorf("第 %d 列命中的是「%s」，want「%s」", c.x, names[got], names[c.want])
@@ -969,28 +1360,20 @@ func TestMouse_ClickScrollBarJumps(t *testing.T) {
 }
 
 // 松开左键不该被当成一次点击 —— 否则一次点击会执行两遍。
+//
+// 用一个**会留下痕迹**的目标来测：列表标题行的那一下如果算数，会去要
+// 文件夹列表并把选择器打开。改成量别的（比如光标位置）就没有这个痕迹，
+// 判据会变成"松开左键没做事"的永真式。
 func TestMouse_LeftReleaseIsIgnored(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
 	l := m.measureLayout()
 
-	rows := m.navRows()
-	y := -1
-	for i, r := range rows {
-		if strings.Contains(plainText(r), "已发送") {
-			y = l.bodyTop + i
-			break
-		}
-	}
-	if y < 0 {
-		t.Fatal("侧栏里没有「已发送」")
-	}
-
-	m, _ = update(m, tea.MouseMsg{
-		X: 1, Y: y, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft,
+	m, cmd := update(m, tea.MouseMsg{
+		X: 0, Y: l.bodyTop, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft,
 	})
-	if m.activeFolder != "" {
-		t.Errorf("松开左键也触发了点击：activeFolder = %q", m.activeFolder)
+	if cmd != nil || m.mode == modeFolder {
+		t.Errorf("松开左键也触发了点击（cmd=%v mode=%v）", cmd != nil, m.mode)
 	}
 }
 
@@ -1141,35 +1524,65 @@ func TestCtrlG_CyclesThroughNavItems(t *testing.T) {
 	}
 }
 
-// 侧栏和 Tab 那个文件夹选择器操作的是同一件事，不许各说各话。
-func TestNavAndFolderPickerAgreeOnTheFolder(t *testing.T) {
+// 换文件夹的三个入口必须落在**同一个地方**，不许各说各话。
+//
+// 三个入口是：Tab（弹出选择器）、Ctrl+G（循环）、点列表标题行（也是弹选择器）。
+// 上一版它们各自算过一份自己的选项列表（选择器用 folderChoices、循环用
+// navItems），两份在"列不列服务端上不存在的文件夹"这条上已经开始有别 ——
+// 这正是"同一件事有两个出处"的典型症状，趁删列的时候一起收掉了。
+//
+// 判据绑的是**能到达的文件夹集合**，不是顺序：顺序本来就该不一样（循环
+// 得绕圈、选择器要分组），而"哪些地方能去"必须一致。
+func TestFolderEntrancesAgreeOnTheDestinations(t *testing.T) {
 	forceColor(t)
-	want := selectedBg(t)
 	m, _ := newFeatureModel(t)
-	m.folders = []string{"INBOX", "Sent", "Trash"}
+	m.folders = []string{"INBOX", "Sent", "Trash", "垃圾邮件"}
 
+	// 入口一：Ctrl+G 循环，把能到的全走一遍。
+	cycle := map[string]bool{}
+	for i := 0; i < len(m.navItems())+1; i++ {
+		m, _ = update(m, keyMsg("ctrl+g"))
+		cycle[m.activeFolder] = true
+	}
+
+	// 入口二：选择器里列出来的那些。
+	cycle[""] = true // 循环的第一项是「全部」，和下面那句话一起兜住边界
+	pick := map[string]bool{}
+	for _, it := range m.folderPickerItems() {
+		pick[it.folder] = true
+	}
+
+	for f := range pick {
+		if !cycle[f] {
+			t.Errorf("选择器能去 %q，而 Ctrl+G 循环到不了", f)
+		}
+	}
+	for f := range cycle {
+		if !pick[f] {
+			t.Errorf("Ctrl+G 能到 %q，而选择器里没列它", f)
+		}
+	}
+
+	// 高亮跟着 activeFolder 走 —— 三个入口改的都是同一个字段，所以
+	// 这里只需要确认「改完之后画面上的高亮没跑偏」。
+	want := selectedBg(t)
 	m.setFolder(m.folderName("SENT"))
 	m.mode = modeFolder
-	m.folderCursor = 0
-	for i, name := range m.folderChoices() {
-		if name == m.activeFolder {
+	for i, it := range m.folderPickerItems() {
+		if it.folder == m.activeFolder {
 			m.folderCursor = i
 		}
 	}
-	m, _ = update(m, keyMsg("enter"))
-
-	if m.activeFolder != m.folderName("SENT") {
-		t.Errorf("从选择器里确认之后 activeFolder = %q", m.activeFolder)
-	}
-	// 侧栏上高亮的还应该是「已发送」那一项。
 	var marked []string
-	for _, r := range strings.Split(m.renderNav(m.measureLayout()), "\n") {
-		if bgAtFirstCell(r) == want {
+	for _, r := range strings.Split(m.View(), "\n") {
+		// 同 TestFolderPicker_HighlightFollowsTheActiveFolder：选择器是居中
+		// 的窄栏，底色块不在第 0 格上，得按可见格数数。
+		if bgColsOf(r, want) > 0 {
 			marked = append(marked, strings.TrimSpace(plainText(r)))
 		}
 	}
 	if len(marked) != 1 || !strings.Contains(marked[0], "已发送") {
-		t.Errorf("侧栏高亮 = %v，want 「已发送」", marked)
+		t.Errorf("选择器里高亮的 = %v，want 「已发送」", marked)
 	}
 }
 

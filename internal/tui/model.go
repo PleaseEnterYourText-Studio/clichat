@@ -110,12 +110,18 @@ type Model struct {
 	// activeFolder 为空串表示不按文件夹过滤。
 	activeFolder string
 
-	// recent 是最近打开过的会话 ID，最近的在最前。
+	// openTabs 是打开着的会话 ID，**按打开先后的顺序**（先开的在前）。
 	//
 	// 顶部那几个标签页从这里来。用「打开过的」而不是「列表里最上面的」：
-	// 标签页回答的是「我刚才在跟谁说话」，那是操作历史；按时间排是左边
-	// 列表已经在做的事，在顶上再抄一遍等于没有信息量。
-	recent []string
+	// 标签页回答的是「我在跟谁说话」，那是操作历史；按时间排是左边列表
+	// 已经在做的事，在顶上再抄一遍等于没有信息量。
+	//
+	// ⚠️ 它是**追加**进去的，不在切换时重排 —— 就是浏览器标签页的规矩。
+	// 早先这里叫 recent、是 MRU 序（切到哪个哪个就挪到最前），结果是
+	// 「点一下标签，它自己跑到第一个位置」，标签的位置记不住。
+	// 位置稳定比「最近用过的在最前」重要得多：一排会自己重排的标签页，
+	// 每次点都得重新找一遍。
+	openTabs []string
 
 	// helpScroll 是帮助页的滚动位置（从顶部算起的行数）。
 	helpScroll int
@@ -507,7 +513,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 新会话在发出去之前不存在于列表里，发完才出现 —— 把视图切过去。
 		if msg.id != "" {
 			m.activeID = msg.id
-			m.noteRecent(msg.id)
+			m.openTab(msg.id)
 		}
 		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
 
@@ -570,8 +576,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		// 打开选择器时把光标停在当前选中的那一项上，而不是从头开始。
 		m.folderCursor = 0
-		for i, name := range m.folderChoices() {
-			if name == m.activeFolder {
+		for i, it := range m.folderPickerItems() {
+			if it.folder == m.activeFolder {
 				m.folderCursor = i
 				break
 			}
@@ -788,8 +794,11 @@ func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleFolderKey 处理文件夹选择器。方向键选，回车确定。
+//
+// Esc 和 Tab 都能退出去。留着 Tab 是因为**它就是打开选择器的那一步**：
+// 按 Tab 进来、按 Tab 出去，同一个键在原位切换，不需要记第二个键。
 func (m Model) handleFolderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	choices := m.folderChoices()
+	n := len(m.folderPickerItems())
 
 	switch msg.String() {
 	case "ctrl+c":
@@ -802,22 +811,59 @@ func (m Model) handleFolderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.folderCursor--
 		}
 	case "down", "j":
-		if m.folderCursor < len(choices)-1 {
+		if m.folderCursor < n-1 {
 			m.folderCursor++
 		}
 	case "home", "g":
 		m.folderCursor = 0
 	case "end", "G":
-		m.folderCursor = len(choices) - 1
+		m.folderCursor = n - 1
 	case "enter":
-		if m.folderCursor >= 0 && m.folderCursor < len(choices) {
-			m.activeFolder = choices[m.folderCursor]
-		}
-		m.refreshVisible()
-		m.cursor = 0
+		return m.applyFolderPick(m.folderCursor)
+	}
+	return m, nil
+}
+
+// clampFolderCursor 把选择器光标收进合法范围。
+func (m *Model) clampFolderCursor() {
+	if n := len(m.folderPickerItems()); m.folderCursor >= n {
+		m.folderCursor = n - 1
+	}
+	if m.folderCursor < 0 {
+		m.folderCursor = 0
+	}
+}
+
+// clickFolderPicker 处理文件夹选择器里的一次左键点击。
+//
+// 点在某一项上：**直接切过去**，不是"选中它、再回车"。鼠标用户点一下
+// 就是要那个结果，让他再去找回车是把键盘的操作模型硬套上去。
+// 点在其他任何地方（组标题、空行、留白、页脚）：取消。
+//
+// 「取消」这一条是刻意的：Esc 是键盘那边唯一的出路，而鼠标必须有一条
+// 等价的 —— 否则一个用鼠标打开选择器的人，会卡在一个只能靠键盘离开的
+// 界面里。
+func (m Model) clickFolderPicker(x, y int) (tea.Model, tea.Cmd) {
+	idx, ok := m.pickerItemAt(x, y)
+	if !ok {
 		m.mode = modeList
 		return m, nil
 	}
+	return m.applyFolderPick(idx)
+}
+
+// applyFolderPick 采纳选择器里第 i 项，并退回列表。
+//
+// 走 setFolder 而不是直接写 activeFolder：那一步要重新算 visible、把光标
+// 收回列表顶部、再做一次越界收敛。少了其中任何一步，症状都是"切过去之后
+// 光标停在一条和刚才毫无关系的会话上"。
+func (m Model) applyFolderPick(i int) (tea.Model, tea.Cmd) {
+	items := m.folderPickerItems()
+	if i < 0 || i >= len(items) {
+		return m, nil
+	}
+	m.setFolder(items[i].folder)
+	m.mode = modeList
 	return m, nil
 }
 
@@ -947,7 +993,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "R":
 		return m.openActive(true)
 
-	// Ctrl+G 循环切换左侧导航（文件夹）。用「循环」而不是给每一项配键：
+	// Ctrl+G 循环切换文件夹。用「循环」而不是给每一项配键：
 	// 见 cycleNav 的说明。
 	case "ctrl+g":
 		m.cycleNav()
@@ -1112,8 +1158,9 @@ func (m Model) enterThread(th thread.Thread, solo, keepDraft bool) (tea.Model, t
 		m.input.SetValue("")
 	}
 	m.input.Focus()
-	// 记进「最近打开」，顶部标签页按这个顺序排。
-	m.noteRecent(th.ID)
+	// 记进「打开着的标签页」。顺序就是打开先后的顺序，切到别处再回来
+	// 不会把它挪到前面 —— 一排会自己重排的标签页，每次点都得重新找一遍。
+	m.openTab(th.ID)
 
 	return m, tea.Batch(
 		textinput.Blink,
@@ -1377,16 +1424,16 @@ func (m Model) currentThread() (thread.Thread, bool) {
 	return m.visible[m.cursor], true
 }
 
-// folderChoices 返回文件夹选择器的选项，第一项固定是「全部」。
+// 注：这里原本有个 folderChoices()，把选择器的选项拼成 []string（空串
+// 打头代表「全部」，后面跟服务端上那一串真名）。它被删掉了：
 //
-// 用空串表示「全部」，界面上渲染成「（全部文件夹）」。这样选项值可以
-// 直接赋给 activeFolder，不需要额外的哨兵常量，也不会和真实文件夹名撞车
-// —— 真实文件夹名不会是空串。
-func (m Model) folderChoices() []string {
-	out := make([]string, 0, len(m.folders)+1)
-	out = append(out, "")
-	return append(out, m.folders...)
-}
+//   - 那份列表和 navGroups 里的固定入口**两套并存**（一个用空串+真名，
+//     一个用解析过的规范名+人读的标签），也就是同一件事有两个出处；
+//   - 选项里没有未读计数 —— 而"这个文件夹里还有几封没读"恰恰是选文件夹
+//     时唯一想知道的数字。
+//
+// 现在统一走 folderPickerItems()（见 nav.go）：带标签、带计数、带两级
+// 分组，且和 Ctrl+G 循环用的是同一批项。
 
 func (m *Model) clampCursor() {
 	if m.cursor >= len(m.visible) {
@@ -1469,11 +1516,14 @@ func (m Model) maxChatScroll() int {
 // 注释里记着同一个坑）。
 func (m Model) chatViewport() int {
 	if m.zenInChat() {
-		statusH := 0
-		if m.renderZenStatus(zenContentWidth(m.width)) != "" {
-			statusH = 1
-		}
-		if h := m.height - zenChromeHeight - statusH; h > 1 {
+		// 页脚那一行现在是**恒在**的：动作栏恒住在屏幕最后一行，所以
+		// zenChromeHeight 之外永远再占掉 1 行。
+		//
+		// 上一版这里是「有状态文字才扣 1 行」—— 那是页脚只装状态时的算法。
+		// 现在页脚同时装着出路，它不可能再"没有"了，再按状态文字判就会少
+		// 扣一行：正文多算一行，滚到底会差半行，而现象只在「刚进 Zen、
+		// 还没有任何状态」的时候出现。
+		if h := m.height - zenChromeHeight - 1; h > 1 {
 			return h
 		}
 		return 1
@@ -1521,13 +1571,15 @@ func (m *Model) moveCursor(dir int) {
 // hitRegion 是屏幕上一块可交互的区域。
 type hitRegion int
 
-// 注：这里原本还有个 hitDivider —— 列表栏和会话流之间那根竖线所在的列。
-// 竖线去掉之后那一列归了会话流（就是它的第 0 列），这个区域没有存在的
-// 理由了。留着它的话，那一列会变成"点了没反应"的死区 —— 而它明明在
-// 会话流里面。
+// 注：这里原本还有个 hitNav（那 14 列常驻导航栏）和一个 hitDivider（栏与
+// 栏之间那根线所在的列）。两个都没有存在的理由了：导航栏整个删掉（改成
+// 按需唤出的选择器），而那条线现在是**列表栏和正文栏之间实打实的一列**，
+// 归正文栏 —— 留着死区的话，那一列会变成"点了没反应"，而它明明在两栏
+// 中间，用户不会觉得那里不该有反应。
 const (
 	hitNone hitRegion = iota
-	hitNav
+	// hitListHeader 是列表栏**标题行**（当前文件夹那一行）。点它换文件夹。
+	hitListHeader
 	hitTabs
 	hitList
 	hitChat
@@ -1548,11 +1600,11 @@ func (m Model) hitTest(x, y int) (hitRegion, layout) {
 
 	switch {
 	case l.tabsRow >= 0 && y == l.tabsRow:
-		// 标签页占的是内容区那一行；左边那一截还是导航。
-		// 内容区从侧栏右沿开始（l.contentX == navWidth），所以这里只
-		// 需要一条判断 —— 上一版要两条，是因为两个数之间还夹着一格空隙。
+		// 标签页占的是正文栏那一行；左边那一截是列表栏的**留白**
+		// （列表栏的第 0 行要等 bodyTop 才出现，见 renderThreadList），
+		// 点它什么也不该发生。
 		if x < l.contentX {
-			return hitNav, l
+			return hitNone, l
 		}
 		return hitTabs, l
 
@@ -1562,15 +1614,26 @@ func (m Model) hitTest(x, y int) (hitRegion, layout) {
 	case y == l.statusRow:
 		return hitStatus, l
 
+	// 列表栏的标题行：**整行**（左起第一列到那条竖线之前）都可以点，
+	// 不是只有标题文字那几个字。空格子也是那个入口的一部分 —— 让"点得到"
+	// 依赖文字的宽度，改个字就会莫名其妙失灵。
+	case l.twoPane && y == l.bodyTop && x < l.ruleX:
+		return hitListHeader, l
+
 	case y >= l.bodyTop && y < l.bodyTop+l.bodyH:
-		switch {
-		case x < l.navX+l.navW:
-			return hitNav, l
-		case x < l.chatX:
+		// ⚠️ 边界是 ruleX，不是 chatX。
+		//
+		// 那条竖线是**两栏之间**的一列：它不属于任何一栏，但必须要有个
+		// 归属。归给列表的话，正文里靠左的一片空白会有一列点下去变成
+		// 「选中列表项」；而用户在那儿点，想的是正文。归给正文则相反 ——
+		// 正文本来就"点哪儿都没反应"，多一列没反应的一格不算退步。
+		//
+		// 这块地方原来写的 `x < l.chatX`，于是竖线那一列落进了列表 ——
+		// 判据 TestMouse_EveryBodyColumnBelongsToAPane 就是照这个抓出来的。
+		if x < l.ruleX {
 			return hitList, l
-		default:
-			return hitChat, l
 		}
+		return hitChat, l
 	}
 	return hitNone, l
 }
@@ -1590,6 +1653,19 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// 动作栏（见 action.go）排在**所有**分支之前。
+	//
+	// 它承载的是「怎么离开这一屏」，是一条压过其它交互的出路，所以先判它
+	// 不会抢走任何东西 —— 它只在屏幕最后一行，和别的可点区域不重叠。
+	// 反过来写（放在各 mode 分支后面）的话，每加一个界面就要记得接一次，
+	// 而漏掉的那一次表现是「这一屏的按钮点了没反应」：一个只会让人觉得
+	// 「鼠标坏了」的 bug。
+	if msg.Button == tea.MouseButtonLeft {
+		if a, ok := m.actionAt(msg.X, msg.Y); ok {
+			return m.runAction(a.kind)
+		}
+	}
+
 	// 帮助页自己占满一屏、有自己的滚动位置，单独处理。
 	// 少了这一条的话，在帮助页上滚滚轮会去动底下那个列表的光标 ——
 	// 屏幕上看不见任何变化，用户只会觉得轮子坏了。
@@ -1603,6 +1679,31 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.clampHelpScroll()
 		}
 		return m, nil
+	}
+
+	// 文件夹选择器同理：它占满一屏、自己的几何也是自己一套，走通用的
+	// hitTest 会拿正文栏那套坐标去判，点哪儿都错。
+	if m.mode == modeFolder {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.folderCursor--
+			m.clampFolderCursor()
+		case tea.MouseButtonWheelDown:
+			m.folderCursor++
+			m.clampFolderCursor()
+		case tea.MouseButtonLeft:
+			return m.clickFolderPicker(msg.X, msg.Y)
+		}
+		return m, nil
+	}
+
+	// Zen 是另一套版式：没有列表栏、没有状态栏，那一套 hitTest 算的是
+	// Normal 的几何。用错几何的后果不是"点不中"，而是**点中了看不见的
+	// 东西** —— 宽窗口下左四分之一归列表栏，在 Zen 里点那里会挪光标，
+	// 而屏幕上什么都不会变（见 Zen 那一屏的介绍：它是另一个世界）。
+	// 所以 Zen 自己接，只做屏幕上有反应的那几件事。
+	if m.zenActive() {
+		return m.handleZenMouse(msg)
 	}
 
 	switch msg.Button {
@@ -1622,7 +1723,7 @@ func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
 
 	switch m.mode {
 	case modeChat, modeNewChat:
-		if region == hitNav || region == hitList {
+		if region == hitList || region == hitListHeader {
 			m.moveCursor(-up)
 		} else {
 			m.scrollChat(up * wheelStep)
@@ -1630,9 +1731,10 @@ func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
 	case modeList:
 		m.moveCursor(-up)
 	}
-	// 其余模式（搜索、文件夹选择、确认框、配置向导、解锁）不接管滚轮：
-	// 它们要么是弹在最上面的一小条，要么在等一个明确的答复，
-	// 让滚轮去改背后那些状态只会造出「屏幕上没变、底下却变了」的怪事。
+	// 其余模式（搜索、确认框、配置向导、解锁）不接管滚轮：它们要么是弹在
+	// 最上面的一小条，要么在等一个明确的答复，让滚轮去改背后那些状态只会
+	// 造出「屏幕上没变、底下却变了」的怪事。（文件夹选择器在上面那个分支
+	// 里就已经被接走了 —— 它有自己的几何。）
 	return m, nil
 }
 
@@ -1641,28 +1743,62 @@ func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
 // 会话内的点击一律用 keepDraft=true 进新会话：点击比回车「手滑」得多，
 // 打了一半的字不该因为点到别处就没了。草稿跨会话保留本来就是这个界面
 // 已有的行为（Ctrl+↑/↓ 走的就是它）。
+// clickTab 处理「点了顶部标签行里某一列」。
+//
+// 两种情况：点在真标签上 → 切过去；点在溢出指示符（"‹" / "›"）上 →
+// 切到那一侧被藏起来的最近一个。指示符按「一次一格」走，因为开满
+// tabLimit 个会话时一侧可能压着好几个，得能一个个走到。
+//
+// 窗口是跟着当前标签走的（见 tabChips），所以切过去之后它自己就滚进
+// 可见范围 —— 这里不需要维护任何滚动偏移，那种状态存了就会和窗口打架。
+func (m Model) clickTab(x int, l layout) (tea.Model, tea.Cmd) {
+	chip, ok := m.tabChipAt(l, x)
+	if !ok {
+		return m, nil
+	}
+
+	target := chip.id
+	if chip.marker != "" {
+		target = ""
+		tabs := m.tabThreads()
+		for i, th := range tabs {
+			if th.ID != m.activeID {
+				continue
+			}
+			if chip.marker == "‹" && i > 0 {
+				target = tabs[i-1].ID
+			} else if chip.marker == "›" && i+1 < len(tabs) {
+				target = tabs[i+1].ID
+			}
+			break
+		}
+		if target == "" {
+			return m, nil
+		}
+	}
+
+	if target == m.activeID {
+		return m, nil
+	}
+	th, ok := m.threadByID(target)
+	if !ok {
+		return m, nil
+	}
+	return m.enterThread(th, false, true)
+}
+
 func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 	region, l := m.hitTest(x, y)
 
 	switch region {
 	case hitTabs:
-		if c, ok := m.tabChipAt(l, x); ok && c.id != m.activeID {
-			th, ok := m.threadByID(c.id)
-			if !ok {
-				return m, nil
-			}
-			return m.enterThread(th, false, true)
-		}
+		return m.clickTab(x, l)
 
-	case hitNav:
-		// 导航只认「主体区里的那几行」；上下留白和贯通到底的那一条
-		// 都不该有点击效果。
-		if y < l.bodyTop || y >= l.bodyTop+l.bodyH {
-			return m, nil
-		}
-		if it, ok := m.navRowIndexAt(y - l.bodyTop); ok {
-			m.setFolder(it.folder)
-		}
+	case hitListHeader:
+		// 标题行就是「换文件夹」那个入口。它和 Tab 走的是同一条路：
+		// 先把文件夹列表要回来（可能还没拉过），拿到之后由 foldersMsg
+		// 把选择器打开、并把光标停在当前那一项上。
+		return m, m.foldersCmd(true)
 
 	case hitList:
 		if m.mode != modeList {

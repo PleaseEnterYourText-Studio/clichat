@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,6 +77,58 @@ func newFeatureModel(t *testing.T) (Model, *mail.Fake) {
 	return m, fake
 }
 
+// manyThreadsModel 造一个有 n 条会话的模型。
+//
+// 默认夹具只有 3 条，测不出「标签页放不下」那一类情况 —— 那才是标签行
+// 里真正容易错的地方（窗口往哪边滚、当前标签会不会被滚出屏幕）。
+//
+// ⚠️ 对方名字**刻意取得长**（「项目经理 0 号」，13 列）。
+//
+// 不是凑数：标签格子宽 = 名字宽 + 2，而删掉那条常驻导航列之后，最窄的
+// 双栏终端（96 列）也有 69 列的正文栏 —— 名字叫 "Peer0" 的话 8 个标签
+// 才 63 列，**放得下**，「放不下时窗口往哪滚」那段代码一行都走不到，
+// 判据却一直是绿的（正是 TestTabs_WindowFollowsActiveThread 报过的
+// 「前提不成立」）。名字长到接近 tabLabelMax 才是有代表性的情况。
+func manyThreadsModel(t *testing.T, n int) Model {
+	t.Helper()
+
+	cfg := testConfig(t)
+	cfg.Account.Email = "me@example.com"
+	cfg.Account.DisplayName = "我"
+	cfg.IMAP.Host = "imap.example.com"
+	cfg.SMTP.Host = "smtp.example.com"
+	cfg.Sync.InitialDays = 0
+
+	now := time.Now()
+	fake := mail.NewFake()
+	for i := 0; i < n; i++ {
+		// 全部标成 Seen。开着会话会把那条**标成已读**，而已读的会被分区
+		// 到列表后半段 —— 一路 Ctrl+↓ 开下去的话，光标每开一个就被底下的
+		// 重排撞一下，走出来的是一条乱序且会重复的路线。预置成已读，
+		// 列表从头到尾就是一个稳定的组，标签的打开顺序才可预期。
+		fake.AddMessage("INBOX", mail.Header{
+			MessageID: fmt.Sprintf("<many%d@x>", i),
+			From:      fmt.Sprintf("peer%d@example.com", i),
+			FromName:  fmt.Sprintf("项目经理 %d 号", i),
+			To:        []string{"me@example.com"},
+			Subject:   fmt.Sprintf("会话 %d", i),
+			Date:      now.Add(time.Duration(-i) * time.Hour),
+			Seen:      true,
+		}, fmt.Sprintf("第 %d 句", i))
+	}
+
+	idx, err := store.Open(filepath.Join(t.TempDir(), "index.json"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+
+	m := NewWithApp(cfg, app.New(cfg, fake, idx))
+	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = syncOnce(t, m)
+	m = runCmd(t, m, m.foldersCmd(false))
+	return m
+}
+
 // runCmd 执行一个 tea.Cmd 并把结果喂回模型。
 //
 // 测试里必须手工跑命令：tea.Cmd 在真实运行时由 Bubble Tea 的循环调度，
@@ -109,7 +162,11 @@ func TestHelp_DocumentsCoreActions(t *testing.T) {
 		"f1",
 		"上一个", "下一个",
 		// 空间布局那一轮加的东西：不写进帮助页，用户就不知道它们存在。
-		"ctrl+g", "侧栏", "标签页", "滚轮",
+		//
+		// 这里原来要求的是 "侧栏"，而侧栏已经去掉了（文件夹不占一栏，改成
+		// 按需弹出）—— 留着它就成了「帮助页里必须提到一个界面上不存在的
+		// 东西」，而且会在改掉那句过时文案时变成假红。
+		"ctrl+g", "两栏", "标签页", "滚轮",
 	}
 	for _, want := range required {
 		if !strings.Contains(help, strings.ToLower(want)) {
@@ -275,9 +332,10 @@ func TestFolderPicker_FiltersList(t *testing.T) {
 	if m.mode != modeFolder {
 		t.Fatalf("Tab 应该打开文件夹选择器, mode=%v", m.mode)
 	}
-	// 选项是 ["", INBOX, Sent, Trash]，光标从「全部」起步。
-	if got := m.folderChoices(); len(got) != 4 || got[0] != "" {
-		t.Fatalf("选项不对: %v", got)
+	// 选项就是左栏原来那四个固定入口，光标从「全部」起步。
+	items := m.folderPickerItems()
+	if len(items) != 4 || items[0].folder != "" || items[0].label != "全部" {
+		t.Fatalf("选项不对: %+v", items)
 	}
 
 	m, _ = update(m, keyMsg("down"))
@@ -293,8 +351,56 @@ func TestFolderPicker_FiltersList(t *testing.T) {
 		t.Errorf("INBOX 里应该有 2 个会话, 实际 %d（总共 %d）", len(m.visible), all)
 	}
 	// 标题上必须写明当前在哪个文件夹，否则用户会以为邮件丢了。
-	if !strings.Contains(m.View(), "INBOX") {
+	//
+	// 绑的是**标签**（「收件箱」）而不是服务端真名 INBOX：文件夹那一列被
+	// 删掉之后，这一行是用户唯一能确认「我在哪儿」的地方，而 INBOX 这种
+	// 机器名对他没有意义。
+	if !strings.Contains(m.View(), "收件箱") {
 		t.Error("列表标题没显示当前文件夹")
+	}
+}
+
+// 选择器里的每一项都要带未读计数。
+//
+// 这是它接替左栏导航之后唯一会丢的东西（那一列上每项右边都有一个数字）。
+// 选文件夹时想知道的就是「那边还有几封没读」，丢了的话选择器就退化成
+// 一串光秃秃的名字。
+func TestFolderPicker_ShowsUnreadCounts(t *testing.T) {
+	m, _ := newFeatureModel(t)
+
+	// 夹具里 INBOX 有一个未读；先确认这一点，否则下面的判据是空转的。
+	byFolder := map[string]int{}
+	for _, it := range m.folderPickerItems() {
+		byFolder[it.folder] = it.unread
+	}
+	if byFolder["INBOX"] == 0 {
+		t.Fatalf("前提不成立：夹具里 INBOX 该有一个未读，实际 %v", byFolder)
+	}
+
+	m, cmd := update(m, keyMsg("tab"))
+	m = runCmd(t, m, cmd)
+
+	// 量**画出来的那几行**，不是结构体里的字段 —— 数字在字段里而没画出来
+	// 正是这条判据要挡的东西。
+	view := plainText(m.View())
+	for _, it := range m.folderPickerItems() {
+		if it.unread == 0 {
+			continue
+		}
+		line := ""
+		for _, l := range strings.Split(view, "\n") {
+			if strings.Contains(l, it.label) {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("选择器里找不到 %q 那一行", it.label)
+			continue
+		}
+		if !strings.Contains(line, fmt.Sprint(it.unread)) {
+			t.Errorf("%q 那一行没画未读数 %d：%q", it.label, it.unread, line)
+		}
 	}
 }
 

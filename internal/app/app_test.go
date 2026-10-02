@@ -27,10 +27,21 @@ func newTestApp(t *testing.T, fake *mail.Fake) *App {
 // 存在的理由是注入 Fake 造不出来的行为 —— 比如"服务端上没有这个文件夹"。
 func newTestAppWithClient(t *testing.T, client mail.Client) *App {
 	t.Helper()
+	return newTestAppAt(t, client, t.TempDir())
+}
+
+// newTestAppAt 和 newTestAppWithClient 一样，但状态（配置 + 索引）落在
+// 指定的目录里。
+//
+// 「重启之后还看不看得见」这类判据需要一个**能再打开一次**的目录：
+// 用两次 t.TempDir() 造出来的两个 App 各写各的索引，那种测试量的其实是
+// 另起一炉，跟真实重启（同一份索引读回来）不是一回事。
+func newTestAppAt(t *testing.T, client mail.Client, dir string) *App {
+	t.Helper()
 
 	// 绑到临时目录：App 上有会把配置落盘的操作（比如「接收全部邮件」），
 	// 不绑路径 Save 会直接报错，绑默认路径会写进用户真实的 config.json。
-	cfg, err := config.LoadFrom(filepath.Join(t.TempDir(), "config.json"))
+	cfg, err := config.LoadFrom(filepath.Join(dir, "config.json"))
 	if err != nil {
 		t.Fatalf("config.LoadFrom: %v", err)
 	}
@@ -41,7 +52,7 @@ func newTestAppWithClient(t *testing.T, client mail.Client) *App {
 	// 测试里用固定日期，所以关掉时间窗口裁剪，否则会被当成过期邮件丢掉。
 	cfg.Sync.InitialDays = 0
 
-	ix, err := store.Open(filepath.Join(t.TempDir(), "index.json"))
+	ix, err := store.Open(filepath.Join(dir, "index.json"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -148,6 +159,75 @@ func TestApp_SendAppearsImmediatelyAndDeduplicates(t *testing.T) {
 	if got := len(threads[0].Messages); got != 1 {
 		t.Errorf("Sent 副本造成了重复: %d 条消息", got)
 	}
+}
+
+// 自己发出去的信，在服务端那份同步回来之后必须**离开「待同步」状态**，
+// 而且这个状态要能挺过一次重启。
+//
+// 这是用户报的那个问题：「每次重开 CLI 都会出现（本地待同步）」。
+// 界面按 UID == 0 判这个标记（见 tui.renderMessage），而本地乐观插入的
+// 那条记录正是 UID == 0 —— 服务端 Sent 里的真副本回来时，Merge 早先只合并
+// 已读标志、不补 UID，于是那个 0 永远留在索引里，还被写进磁盘。
+//
+// 判据量的是**用户看得见的两件事**：
+//   - 重启之后那条消息的 UID 不是 0（标记不会出现）；
+//   - Bodies 拉得到正文（而不是退化成一句「（本地待同步）」）。
+func TestApp_SentMessageLeavesPendingStateAndStaysGone(t *testing.T) {
+	fake := mail.NewFake()
+	dir := t.TempDir()
+	a := newTestAppAt(t, fake, dir)
+
+	if _, err := a.Start([]string{"bob@x.com"}, "已经发出去的话"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if uid := onlyMessageUID(t, a); uid != 0 {
+		t.Fatalf("前提不成立：刚发出、服务端副本还没回来的消息本该 UID=0，得到 %d", uid)
+	}
+
+	// 服务端 Sent 里那份回来了。
+	changed, err := a.Sync()
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !changed {
+		t.Error("Sent 副本带回了 UID，索引内容变了，Sync 该报 changed —— " +
+			"否则界面会一直拿着那份 UID=0 的旧快照")
+	}
+	if uid := onlyMessageUID(t, a); uid == 0 {
+		t.Fatal("同步之后 UID 还是 0 —— 界面会一直标「本地待同步」")
+	}
+
+	// 重启：存下索引、再从那**同一份文件**打开一个新的 App。
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	restarted := newTestAppAt(t, fake, dir)
+	if uid := onlyMessageUID(t, restarted); uid == 0 {
+		t.Error("重启之后 UID 又变回 0 了 —— 那个标记每次开 CLI 都会回来")
+	}
+	// 正文也得拉得到：UID 为 0 时 app.Bodies 会直接跳过它，界面上那一封
+	// 就永远只剩一句「（本地待同步）」，而不是用户自己写的话。
+	th := restarted.Threads()[0]
+	bodies, err := restarted.Bodies(th)
+	if err != nil {
+		t.Fatalf("Bodies: %v", err)
+	}
+	if got := bodies[th.Messages[0].MessageID].Text; !strings.Contains(got, "已经发出去的话") {
+		t.Errorf("重启后正文拉不到（拿到 %q）—— 用户会在自己发的那条上看到「本地待同步」", got)
+	}
+}
+
+// onlyMessageUID 取出「唯一的那个会话里唯一那条消息」的 UID。
+func onlyMessageUID(t *testing.T, a *App) uint32 {
+	t.Helper()
+	threads := a.Threads()
+	if len(threads) != 1 {
+		t.Fatalf("会话数 = %d, want 1", len(threads))
+	}
+	if len(threads[0].Messages) != 1 {
+		t.Fatalf("消息数 = %d, want 1", len(threads[0].Messages))
+	}
+	return threads[0].Messages[0].UID
 }
 
 func TestApp_ReplyBuildsHeaders(t *testing.T) {

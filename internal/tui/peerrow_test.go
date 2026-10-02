@@ -10,20 +10,24 @@ import (
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
-// 这一组守着「对方的话被圈在一个气泡里」这件事。
+// 这一组守着「对方说的话在版面上靠什么和别的东西分开」。
 //
-// 背景（用户提的第 1 条）：这一版把邮件做成了按层级的 IM 聊天，双方的话
-// 混在一条时间轴上，光靠「左对齐 / 右对齐」在余光里不够用 —— 来回几轮
-// 之后就得去读名字。给对方的正文套一个气泡，谁在说一眼就分得开。
+// 三轮下来这块版面上只剩一条规矩：**对方的正文左边有一条竖条，自己的没有。**
+// 前面两版守的是别的东西，都推翻了，值得记下来为什么：
 //
-// 底色的铺法是这个功能里唯一有技术含量的部分：行里已经套着各种前景色
-// 样式，它们自己的 SGR 重置会把外层的底色一起清掉，所以「在每个重置之后
-// 重新压上底色」这件事必须有判据守着 —— 否则哪天渲染层多出一种样式，
-// 底色就会在那一行里断成几截，而且只在有那种样式的行上才看得出来。
+//  1. 第一版头和正文同铺一条灰带 —— 「谁在说」也被圈进去了。头是**标注**，
+//     不是内容，它该在外面。
+//  2. 第二版把正文围进一个贴合内容的底色块（气泡）。宽度那套账很难算对
+//     （四分之三上限、最小宽度、按显示宽度而不是字节量……），但真正的问题
+//     不在实现：**一条消息一块底色，一屏里就有十几块亮度不同的矩形在互相
+//     切割**，而长消息的块宽、短消息的块窄，右边缘参差得像一屏打乱的表格。
+//     用户的原话是「不要用背景色块来区分聊天，割裂感太强！可以用 sideline
+//     这种」。
 //
-// ⚠️ 这里的判据在重做视觉那一轮**全部重写过一遍**。上一版守的是「对方的
-// 每一行都铺满整栏宽」（通栏灰带，像表格的行）。那个契约已经废了：现在
-// 气泡**贴合内容宽度**，于是「铺满整栏」从"必须"变成了"必须不是"。
+// 换成竖条之后判据的落点整体变了：宽度**不再需要"算"**（引用块就是「一条
+// 竖条 + 它右边的字」，字多长块就多长），于是上一版那几条「气泡贴合内容」
+// 「同一气泡内各行等宽」「最小气泡宽度」全部作废 —— 反过来，「右边不补白」
+// 和「每一行都带那条竖条」成了新的契约。下面每一条都注明了它替代了什么。
 
 // peerAndOwnRows 挑出「对方发的」和「自己发的」消息各自的渲染结果。
 func peerAndOwnRows(t *testing.T, m Model, width int) (peer, own [][]string) {
@@ -43,23 +47,43 @@ func peerAndOwnRows(t *testing.T, m Model, width int) (peer, own [][]string) {
 	return peer, own
 }
 
-// bubbleBody 从一条消息的那些行里挑出**气泡正文**（铺了底色的行）。
+// firstPeerHeader 取出当前会话里第一条**对方发来的**消息。
+func firstPeerHeader(t *testing.T, m Model) thread.Header {
+	t.Helper()
+	th, ok := m.activeThread()
+	if !ok {
+		t.Fatal("没有打开的会话")
+	}
+	for _, msg := range th.Messages {
+		if msg.From != m.cfg.Self() {
+			return msg
+		}
+	}
+	t.Fatal("测试数据里没有对方发来的邮件")
+	return thread.Header{}
+}
+
+// peerBody 从一条消息的那些行里挑出**引用正文**（带竖条的行）。
 //
-// 消息头现在在气泡外面，所以不能拿"这一条消息的第 0 行"当正文 —— 那个
-// 假设正是上一版留下的（那时头也在带上）。
-func bubbleBody(rows []string) []string {
+// 上一版这里看的是 `\x1b[48;`（有没有底色）。竖条方案下对方正文一行底色
+// 都没有，那个尺子会把整条消息判成「没有正文」。
+//
+// 之所以不能简单地取 rows[1:]：消息**头**在引用块外面，而末行是 renderMessage
+// 补的那个空行分隔符。两头都得让开，剩下的才是正文。
+func peerBody(rows []string) []string {
 	var out []string
 	for _, r := range rows {
-		if strings.Contains(r, "\x1b[48;") {
+		if strings.Contains(r, sidelineMark) {
 			out = append(out, r)
 		}
 	}
 	return out
 }
 
-// 对方的气泡必须铺着一条**连续**的底色：行内每个 SGR 重置之后底色都要
-// 立刻回来，行尾要恢复默认背景。
-func TestChat_PeerBubblePaintSurvivesResets(t *testing.T) {
+// 引用块的左侧几何：第 0 列留白、第 paneInset 列是那条竖条。
+//
+// 这两条合起来是「引用块浮在版面上」的唯一表达：竖条不贴栏边，右边不铺底。
+func TestChat_SidelineLeavesThePaneEdgeBlank(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
 
@@ -67,39 +91,132 @@ func TestChat_PeerBubblePaintSurvivesResets(t *testing.T) {
 	if len(peer) == 0 {
 		t.Fatal("测试数据里没有对方发来的邮件")
 	}
+	body := peerBody(peer[0])
+	if len(body) == 0 {
+		t.Fatalf("对方这条消息一行引用正文都没有：%q", peer[0])
+	}
 
-	const (
-		bgOn  = "\x1b[48;" // 任何底色序列都以它开头
-		reset = "\x1b[0m"  // 渲染层用的唯一一种重置序列
-		bgOff = "\x1b[49m" // 恢复终端默认背景
-	)
+	// 竖条画在 paneInset 那一列 —— 和列表栏的选中块两侧内缩同一个道理：
+	// 贴在栏边上的竖条读起来是"这里有条边界"，内缩一格才是"这一段话"。
+	if got := plainText(ansiSlice(body[0], paneInset, paneInset+1)); got != sidelineMark {
+		t.Errorf("第 %d 列该是那条引用竖条 %q，实际是 %q：%q",
+			paneInset, sidelineMark, got, body[0])
+	}
+	// 竖条左边那一格必须留给终端背景。
+	if got := plainText(ansiSlice(body[0], 0, paneInset)); strings.TrimSpace(got) != "" {
+		t.Errorf("竖条左边那 %d 列不是空白（%q）—— 引用块贴上栏边就不「浮」了: %q",
+			paneInset, got, body[0])
+	}
+}
 
-	for _, rows := range peer {
-		body := bubbleBody(rows)
-		if len(body) == 0 {
-			t.Errorf("对方这条消息一行气泡都没有：%q", rows)
+// 消息头**在引用块外面**。
+//
+// 头是**标注**（谁、什么时候），不是**内容**（这个人说了什么）。头也被划进
+// 竖条里的话，「谁在说」和「说了什么」就混成一段，而引用块的意义正是把
+// "这个人说的那一段话"圈出来。
+func TestChat_PeerHeadSitsOutsideTheQuote(t *testing.T) {
+	forceColor(t)
+	m, _ := openChat(t)
+
+	peer, _ := peerAndOwnRows(t, m, 80)
+	if len(peer) == 0 {
+		t.Fatal("测试数据里没有对方发来的邮件")
+	}
+	rows := peer[0]
+	if len(rows) < 3 {
+		t.Fatalf("这条消息只有 %d 行，看不出头和正文的分界：%q", len(rows), rows)
+	}
+
+	if strings.Contains(rows[0], sidelineMark) {
+		t.Errorf("对方的消息头带着那条竖条 —— 它该在引用块外面: %q", rows[0])
+	}
+	if !strings.Contains(rows[1], sidelineMark) {
+		t.Errorf("消息头下面那一行不是引用正文：%q", rows)
+	}
+}
+
+// 引用正文**不补白**。
+//
+// 上一版必须补：底色块要方，每行不补到同宽就成了参差不齐的色带。现在没有
+// 块了，补白只会给每一行攒下几十个看不见的尾随空格（复制、选中都会带上），
+// 而画面上没有任何东西因此变化。
+//
+// 判据把每一行的**尾随空格去掉再量一遍**：两个宽度相等，就说明这一行
+// 一个多余的列都没有。它替代的是上一版的 TestChat_PeerBubbleHugsItsContent
+// （那条守的是「气泡比整栏窄」）—— 对竖条方案来说"比整栏窄"太弱了：补白
+// 到整栏和补白到半栏一样错，而两者都能满足"比整栏窄"。
+//
+// ⚠️ 第一版这条判据是**空转**的（变异验证抓到的）：它拿
+// `quoteIndent + 可见文字宽度` 去比整行宽，而"可见文字"里连补出来的空格
+// 一起算了进去，于是任何补白都成立。量补白就必须先把补白摘掉。
+func TestChat_PeerBodyIsNotPaddedToFullWidth(t *testing.T) {
+	forceColor(t)
+	m, _ := openChat(t)
+
+	peer, _ := peerAndOwnRows(t, m, 80)
+	body := peerBody(peer[0])
+	if len(body) == 0 {
+		t.Fatalf("对方这条消息一行引用正文都没有：%q", peer[0])
+	}
+
+	const quoteIndent = paneInset + 1 + quoteGap // 留白 + 竖条 + 一格间隔
+	checked := 0
+	for _, row := range body {
+		vis := plainText(row)
+		trimmed := strings.TrimRight(vis, " ")
+		// 段落之间那个空行整行只有「留白 + 竖条 + 间隔」，末尾那一格是
+		// 间隔不是补白 —— 这一行量不了，跳过（但下面要确认不是全跳过了）。
+		if len([]rune(trimmed)) <= quoteIndent {
 			continue
 		}
-		for _, row := range body {
-			// 行内每一个 SGR 重置之后，底色都必须立刻被压回来 ——
-			// 断了的话，那一段之后的文字就掉回终端自己的背景上了。
-			for _, tail := range strings.Split(row, reset)[1:] {
-				if !strings.HasPrefix(tail, bgOn) {
-					t.Errorf("重置之后底色断了（后面跟着 %q）: %q", truncate(tail, 20), row)
-				}
-			}
-			// 收尾恢复默认背景，否则底色会漏到下一行去。
-			if !strings.HasSuffix(row, bgOff) {
-				t.Errorf("这一行的底色没有收尾，会漏到下一行: %q", row)
-			}
+		checked++
+		if got, want := lipgloss.Width(row), lipgloss.Width(trimmed); got != want {
+			t.Errorf("引用正文行宽 %d 列、可见文字只占 %d 列 —— 右边多出 %d 格看不见的补白: %q",
+				got, want, got-want, row)
+		}
+	}
+	if checked == 0 {
+		t.Errorf("没有一行量得了（正文全是空行？）—— 这条判据没测到东西：%q", body)
+	}
+}
+
+// 正文里的**空行**也带竖条。
+//
+// 这一条看着像吹毛求疵，其实守的是"两段话"和"两段引用"的分界：竖条断在
+// 段落之间的话，那两段话在余光里就成了两块各自独立的引用，而它们本来是
+// 同一个人一口气说完的。
+//
+// 它替代的是上一版的 TestChat_BubbleRowsShareOneWidth（那条用"同一气泡内
+// 各行等宽"表达"这是一个框"）。竖条方案下"框"不存在了，但"这一段到哪儿
+// 为止"仍然必须一眼看得出来 —— 换成从正面钉"中间不许断"。
+func TestChat_PeerQuoteHasNoGaps(t *testing.T) {
+	forceColor(t)
+	m, _ := openChat(t)
+	target := firstPeerHeader(t, m)
+
+	// 一段一定要产生空行的正文：段落之间那个空行正是要量的地方。
+	m.bodies = map[string]app.Body{
+		target.MessageID: {Text: "第一段说完了。\n\n第二段接着说。"},
+	}
+
+	rows := m.renderMessage(target, 80)
+	if len(rows) < 4 {
+		t.Fatalf("正文只渲染出 %d 行，中间不可能有空行，量不了："+
+			"（renderMarkdown 是不是不吐段落空行了？）%q", len(rows), rows)
+	}
+	// 首行是消息头、末行是 renderMessage 补的分隔空行，中间全都属于引用块。
+	for i, row := range rows[1 : len(rows)-1] {
+		if !strings.Contains(row, sidelineMark) {
+			t.Errorf("引用块第 %d 行断了竖条 —— 段落之间那一段必须连着: %q", i+1, row)
 		}
 	}
 }
 
-// 自己发的行不能有底色。
+// 自己发的行不能有竖条。
 //
-// 这一条划的是「只对方」的边界：两边都铺，就等于两边都没铺。
-func TestChat_OwnRowsHaveNoBubble(t *testing.T) {
+// 这一条划的是「只对方」的边界：两边都画，就等于两边都没画 —— 那正是上一版
+// 「两边都铺底色」的翻版错误。
+func TestChat_OwnRowsHaveNoSideline(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
 
@@ -110,164 +227,29 @@ func TestChat_OwnRowsHaveNoBubble(t *testing.T) {
 
 	for _, rows := range own {
 		for _, row := range rows {
-			if strings.Contains(row, "\x1b[48;") || strings.Contains(row, "\x1b[49m") {
-				t.Errorf("自己发的行不该有底色: %q", row)
+			if strings.Contains(row, sidelineMark) {
+				t.Errorf("自己发的行不该有竖条: %q", row)
 			}
 		}
 	}
 }
 
-// 气泡**贴合内容**，不通栏。
+// 用真实模型走一遍：聊天视图里既要有**带竖条**的行（对方），也要有不带的
+// 行（自己 / 信息行）—— 防止哪天上面那几条判据在 renderMessage 上绿着，
+// 视图却另有一条路。
 //
-// 这是这一版和上一版最核心的一处分歧，所以判据要写得能真的分辨两者：
-//
-//   - 通栏的版本：每行宽度 == 整栏宽（上一版是 80-2 == 78）。
-//   - 贴合的版本：短消息的气泡比整栏窄，长消息封顶在四分之三栏宽。
-//
-// 断言的是「**至少有气泡严格窄于上限**」而不是某个具体宽度 —— 具体宽度
-// 随文案走，绑死它就是绑死措辞。
-func TestChat_PeerBubbleHugsItsContent(t *testing.T) {
-	forceColor(t)
-	m, _ := openChat(t)
-
-	peer, _ := peerAndOwnRows(t, m, 80)
-	if len(peer) == 0 {
-		t.Fatal("测试数据里没有对方发来的邮件")
-	}
-
-	// 上限：四分之三栏宽，和 renderMessage 里的算法同源。
-	limit := 80 * 3 / 4
-	sawNarrow := false
-	for _, rows := range peer {
-		for _, row := range bubbleBody(rows) {
-			w := lipgloss.Width(row)
-			if w > limit {
-				t.Errorf("气泡宽 %d 列，超过了四分之三栏宽 %d: %q", w, limit, row)
-			}
-			if w < limit {
-				sawNarrow = true
-			}
-		}
-	}
-	if !sawNarrow {
-		t.Errorf("每一条气泡都顶满了上限 %d 列 —— 说明宽度不是按内容算的", limit)
-	}
-}
-
-// 同一个气泡里的每一行**一样宽**。
-//
-// 每行各自贴合（比如给每行单独 padRight 到它自己的长度）看着像一条
-// 参差不齐的色带，而不是一个框。这条判据用同一气泡内宽度的**一致性**
-// 来表达"这是一个框"。
-//
-// 夹具里的正文都是短的单行，所以这条自己造一条多行的对方消息 ——
-// 借「一条正文放不下、会折成两行」这个真实前提。
-func TestChat_BubbleRowsShareOneWidth(t *testing.T) {
-	forceColor(t)
-	m, _ := openChat(t)
-
-	th, ok := m.activeThread()
-	if !ok {
-		t.Fatal("没有打开的会话")
-	}
-	var target thread.Header
-	for _, msg := range th.Messages {
-		if msg.From != m.cfg.Self() {
-			target = msg
-			break
-		}
-	}
-	if target.MessageID == "" {
-		t.Fatal("测试数据里没有对方发来的邮件")
-	}
-
-	// 造一句"一定折行、但折出来的几行长度各不相同"的正文：
-	// 折行宽度是 80*3/4-2 == 58，所以下面这串会折成 3 行，且末行明显更短。
-	m.bodies = map[string]app.Body{
-		target.MessageID: {Text: strings.Repeat("一二三四五六七八九十", 10) + "\n短"},
-	}
-
-	body := bubbleBody(m.renderMessage(target, 80))
-	if len(body) < 2 {
-		t.Fatalf("正文没折成多行（%d 行），量不了这条", len(body))
-	}
-	want := lipgloss.Width(body[0])
-	for i, row := range body {
-		if got := lipgloss.Width(row); got != want {
-			t.Errorf("同一个气泡里第 %d 行宽 %d、第 0 行宽 %d —— 不是一个框: %q",
-				i, got, want, row)
-		}
-	}
-}
-
-// 消息头**在气泡外面**。
-//
-// 上一版头和正文同铺一条灰带，「谁在说」也被圈了进去 —— 而头是**标注**，
-// 不是内容。头留在外面，气泡里就只剩"这个人说的话"，那一段才是完整的
-// 一个引用块。这条判据从反面钉住这件事。
-func TestChat_PeerHeadSitsOutsideTheBubble(t *testing.T) {
-	forceColor(t)
-	m, _ := openChat(t)
-
-	peer, _ := peerAndOwnRows(t, m, 80)
-	if len(peer) == 0 {
-		t.Fatal("测试数据里没有对方发来的邮件")
-	}
-	rows := peer[0]
-	head := rows[0]
-
-	if strings.Contains(head, "\x1b[48;") {
-		t.Errorf("对方的消息头铺了气泡底色 —— 它该在气泡外面: %q", head)
-	}
-	if len(rows) < 2 || !strings.Contains(rows[1], "\x1b[48;") {
-		t.Errorf("消息头下面那一行不是气泡的开头: %q", rows)
-	}
-}
-
-// 气泡左沿留一格不铺色的空隙。
-//
-// 它不是为了好看：会话流的左沿紧挨着列表栏的底色块（235），气泡底色是
-// 238 —— 直接贴上去，两块只差 3 格的面板就挤在一起、看不出边界。留一格
-// 终端背景，气泡才"浮"在会话流里。
-func TestChat_BubbleLeavesAGapOnTheLeft(t *testing.T) {
-	forceColor(t)
-	m, _ := openChat(t)
-
-	peer, _ := peerAndOwnRows(t, m, 80)
-	body := bubbleBody(peer[0])
-	if len(body) == 0 {
-		t.Fatal("对方这条消息没有气泡行")
-	}
-
-	// 第一个可见字符画在什么底色上 —— 那是个空格，底色就是它左边那一格
-	// 的状态。空串表示那一列没有底色，也就是那格留白还在。
-	if got := bgAtFirstCell(body[0]); got != "" {
-		t.Errorf("气泡从第 0 列就开始铺色了（底色 %q）—— 左边那一格空隙没了: %q",
-			got, body[0])
-	}
-}
-
-// 用真实模型走一遍：聊天视图里既要有气泡（对方），也要有无底色的行
-// （自己）—— 防止哪天上面那几条判据在 renderMessage 上绿着，视图却另有
-// 一条路。
-//
-// ⚠️ 量的是**会话流那一栏**，不是整幅 View。整幅里每一行的最左边都压着
-// 导航列的底色、列表栏也是一整块底色，于是「这一行有没有底色」既可能
-// 来自气泡、也可能来自那两块面板 —— 判据会从「有没有气泡」退化成一条
-// 永远为真的空壳。上一版就是这么红的。
-//
-// 「切掉左边再看」这条路也走不通：实测 ansi.TruncateLeft 会把被切掉的
-// 那些 SGR 以**空序列**的形式留在原处（`\x1b[48;5;235m\x1b[49m`），
-// 底色照样"在"。所以直接问那一栏要它自己渲染出来的东西。
-func TestChat_ViewHasBothBubblesAndPlainRows(t *testing.T) {
+// ⚠️ 量的是**会话流那一栏**，不是整幅 View。整幅里每一行的最左边还压着
+// 列表栏和那条分隔竖线，而分隔竖线本身也是个 Box Drawing 区的字符 ——
+// 「这一行有没有竖条」在那里根本分不出来，判据会退化成一条永远为真的空壳。
+func TestChat_ViewHasBothQuotedAndPlainRows(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
 
 	pane := m.renderChat(m.chatPaneWidth(), m.bodyHeight())
-	var bubbled, plain []string
+	var quoted, plain []string
 	for _, line := range strings.Split(pane, "\n") {
-		if strings.Contains(line, "\x1b[48;") {
-			bubbled = append(bubbled, line)
+		if strings.Contains(line, sidelineMark) {
+			quoted = append(quoted, line)
 			continue
 		}
 		if strings.TrimSpace(plainText(line)) != "" {
@@ -275,43 +257,41 @@ func TestChat_ViewHasBothBubblesAndPlainRows(t *testing.T) {
 		}
 	}
 
-	if len(bubbled) == 0 {
-		t.Error("聊天视图里没有一条铺了底色的行（对方的话）")
+	if len(quoted) == 0 {
+		t.Error("聊天视图里没有一条带竖条的行（对方的话）")
 	}
 	if len(plain) == 0 {
-		t.Error("聊天视图里没有一条无底色的行（自己的话 / 信息行）")
+		t.Error("聊天视图里没有一条不带竖条的行（自己的话 / 信息行）")
 	}
 
 	// 光量那一栏还不够：整幅画面完全可能不用它（以前就是各自画各自的）。
-	// 挑一条铺了底色的行，确认它原样出现在整幅 View 里。
-	if len(bubbled) > 0 && !strings.Contains(m.View(), bubbled[0]) {
-		t.Errorf("会话流那一栏的渲染结果没进整幅画面：%q", bubbled[0])
+	if len(quoted) > 0 && !strings.Contains(m.View(), quoted[0]) {
+		t.Errorf("会话流那一栏的渲染结果没进整幅画面：%q", quoted[0])
 	}
 }
 
-// 窄终端下气泡也要收得住 —— 不能因为"四分之三栏宽"算出来比剩下的宽度
+// 窄终端下正文也要收得住 —— 不能因为"四分之三栏宽"算出来比剩下的宽度
 // 还大，就把行撑破。
 //
 // 撑破的表现是终端自己折行，于是下面的行号全错位、鼠标全点错。这类
 // 错误在真实终端里比在测试里难看出得多，所以在这里挡住。
 //
-// ⚠️ 宽度从 **2 列**起量，不是从"看起来还算正常"的 8 列起。8 列时这组
-// 判据全绿过，而更窄的几档当时是错的：
+// ⚠️ 宽度从 **2 列**起量、而且中间不留空档（5/6/7 这几档最容易被漏），不是
+// 从"看起来还算正常"的 8 列起。8 列时这组判据全绿过，而更窄的几档当时是错的：
 //
 //   - 头部按「整栏宽」算预算，对方那一行的前面还垫着一格留白 —— **12 列**
 //     时头部就撑到 13 列。
-//   - 气泡先按理想宽度折行、再被硬上限压窄，正文不跟着变，**8 列**时
-//     气泡里的内容比气泡还宽。
-//   - 气泡的「最小宽度」是留白 + 内边距×2 + **一个最宽的字符**，最后那
-//     一项漏掉时 **4 列**下多出一列（折行的硬断点一次推进一个字符，而
-//     一个汉字占 2 列）。
+//   - 正文先按理想宽度折行、再被硬上限压窄，正文不跟着变，**8 列**时
+//     正文里的内容比留给它的列数还宽。
+//   - 「至少要 N 列才画得出来」的那个 N 漏掉了**一个最宽的字符**（折行的
+//     硬断点一次推进一个字符，而一个汉字占 2 列），**4 列**下多出一列。
 //
 // 三处都只在特定宽度下露出来，所以判据在**所有宽度**上走一遍。
 //
 // ⚠️ 两个夹具都要走：纯文本那一份量不出「按字节算宽度」这类错
-// （见 TestChat_BubbleMeasuresDisplayWidthNotBytes）—— 带超链接和表格的
-// 那份才是它的回归面。
-func TestChat_BubbleNeverOverflowsNarrowPane(t *testing.T) {
+// （见 TestChat_PeerBodyWrapsWithinThreeQuarters）—— 带超链接和表格的那份
+// 才是它的回归面。
+func TestChat_BodyNeverOverflowsNarrowPane(t *testing.T) {
 	forceColor(t)
 
 	plain, _ := openChat(t)
@@ -328,7 +308,7 @@ func TestChat_BubbleNeverOverflowsNarrowPane(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s：没有打开的会话", c.name)
 		}
-		for _, width := range []int{2, 3, 4, 8, 12, 20, 40, 80} {
+		for _, width := range []int{2, 3, 4, 5, 6, 7, 8, 12, 20, 40, 80} {
 			for _, msg := range th.Messages {
 				for i, row := range c.m.renderMessage(msg, width) {
 					if w := lipgloss.Width(row); w > width {
@@ -341,95 +321,100 @@ func TestChat_BubbleNeverOverflowsNarrowPane(t *testing.T) {
 	}
 }
 
-// 气泡宽度按**显示宽度**算，不是按字节算。
+// 栏宽连「留白 + 竖条 + 间隔 + 一个最宽的字符」都放不下时，**不要画竖条**，
+// 退回按栏宽折过的纯正文。
 //
-// 正文里可能有 OSC 8 超链接（`\x1b]8;;url\x1b\\文字\x1b]8;;\x1b\\`），
-// 一段 39 列可见的行，字节数能到 80 出头。用逐 rune 求和的 textWidth 去量
-// 它，量到的是「转义序列有多长」，气泡会跟着涨到整栏都装不下。
+// 硬撑着画的下场是每一行的头三列被竖条吃掉，正文只剩一两个字符 —— 与其
+// 摆一条把内容挤没的装饰，不如不要它。
 //
-// 这条**真的坏过**：带链接的那封 HTML 邮件让气泡撑到 105 列（栏宽才 61），
-// 而当时整套判据都是绿的 —— 因为唯一被量过的夹具里全是纯文本。上一版
-// 是被一句「气泡宽不许超过上限」的钳制盖住的：气泡宽被钳回去了，正文行
-// 还是那么宽。钳制盖住的是症状，"量错了尺子"才是病。
-func TestChat_BubbleMeasuresDisplayWidthNotBytes(t *testing.T) {
+// 它替代的是上一版的 TestChat_ShortBubbleStillLooksLikeABubble（那条守
+// minBubbleW 这个常量，常量已经随气泡一起退休了）。新的契约同样钉在"窄到
+// 某个程度就换形态"，但换的是形态而不是宽度：不画竖条、也不画消息头
+// （4 列宽的名字只剩「Al…」，信息量还不如让给正文）。
+func TestChat_NarrowPaneDropsTheSideline(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
+	target := firstPeerHeader(t, m)
 
-	th, ok := m.activeThread()
-	if !ok {
-		t.Fatal("没有打开的会话")
-	}
-	var target thread.Header
-	for _, msg := range th.Messages {
-		if msg.From != m.cfg.Self() {
-			target = msg
-			break
+	// 门槛是算出来的：quoteIndent（1+1+1）+ maxCellW（一个汉字 2 列）。
+	limit := (paneInset + 1 + quoteGap) + maxCellW
+
+	for _, width := range []int{2, 3, 4} {
+		if width >= limit {
+			t.Fatalf("夹具坏了：宽 %d 不该比门槛 %d 还大", width, limit)
 		}
-	}
-	if target.MessageID == "" {
-		t.Fatal("测试数据里没有对方发来的邮件")
-	}
-
-	const width = 80
-	limit := width * 3 / 4
-	m.bodies = map[string]app.Body{
-		target.MessageID: {Text: "会议链接：[meeting.example.com/abc-def-ghi](https://meeting.example.com/abc-def-ghi)"},
-	}
-
-	body := bubbleBody(m.renderMessage(target, width))
-	if len(body) == 0 {
-		t.Fatal("对方这条消息没有气泡行")
-	}
-	for i, row := range body {
-		if w := lipgloss.Width(row); w > limit {
-			t.Errorf("气泡第 %d 行宽 %d 列，超过四分之三栏宽 %d —— 宽度多半是按字节算的: %q",
-				i, w, limit, plainText(row))
+		var shown string
+		for i, row := range m.renderMessage(target, width) {
+			if strings.Contains(row, sidelineMark) {
+				t.Errorf("宽 %d 时第 %d 行还画着竖条 —— 这一档该退化成纯正文: %q",
+					width, i, row)
+			}
+			if w := lipgloss.Width(row); w > width {
+				t.Errorf("宽 %d 时第 %d 行宽 %d 列，撑破了: %q", width, i, w, row)
+			}
+			shown += plainText(row)
 		}
-	}
-
-	// 反向再钉一下：**贴合内容**和"顶到上限"要分得开。只断言「没超过上限」
-	// 的话，一个把气泡一律撑满上限的实现照样绿 —— 而那种实现把这个 bug
-	// 藏得更好（它看起来"收住了"）。
-	if w := lipgloss.Width(body[0]); w >= limit {
-		t.Errorf("气泡顶满了上限 %d 列，看不出它贴合内容: %q", limit, plainText(body[0]))
+		// 退化不等于把内容丢光 —— 那三条判据（不画竖条 / 不撑破）在
+		// 「什么都不画」的实现上全都是绿的。
+		if !strings.Contains(shown, "第") {
+			t.Errorf("宽 %d 时正文一个字都没画出来: %q", width, shown)
+		}
 	}
 }
 
-// 很短的一条消息也要有个像样的气泡，而不是一格宽的补丁。
+// 正文宽度按**显示宽度**算，不是按字节算。
 //
-// 气泡宽度是「最长那一行 + 内边距」反推的，于是一句「好」会算出一个 4 列
-// 宽的块 —— 那看着像渲染坏了，不像一个引用块。所以有一条最小宽度下限。
+// 正文里可能有 OSC 8 超链接（`\x1b]8;;url\x1b\\文字\x1b]8;;\x1b\\`），
+// 一段 39 列可见的行，字节数能到 80 出头。用逐 rune 求和的 textWidth 去量
+// 它，量到的是「转义序列有多长」，行会跟着涨到整栏都装不下。
 //
-// 绑的是 minBubbleW 这个常量而不是某个列数：改下限是设计决定，判据只拦
-// 「下限被拿掉」这一种改动。
-func TestChat_ShortBubbleStillLooksLikeABubble(t *testing.T) {
+// 这条**真的坏过**：带链接的那封 HTML 邮件让气泡撑到 105 列（栏宽才 61），
+// 而当时整套判据都是绿的 —— 因为唯一被量过的夹具里全是纯文本。
+//
+// 它同时守着上一版的 TestChat_BubbleRowsShareOneWidth 留下的那个洞的残余：
+// 「每行都一样宽」在竖条方案下没有意义了，但「折行宽度必须按显示宽度算」
+// 这条仍然要靠带链接的夹具才量得出来。
+func TestChat_PeerBodyWrapsWithinThreeQuarters(t *testing.T) {
 	forceColor(t)
 	m, _ := openChat(t)
+	target := firstPeerHeader(t, m)
 
-	th, ok := m.activeThread()
-	if !ok {
-		t.Fatal("没有打开的会话")
-	}
-	var target thread.Header
-	for _, msg := range th.Messages {
-		if msg.From != m.cfg.Self() {
-			target = msg
-			break
-		}
-	}
-	if target.MessageID == "" {
-		t.Fatal("测试数据里没有对方发来的邮件")
-	}
-	m.bodies = map[string]app.Body{target.MessageID: {Text: "好"}}
+	const width = 80
+	// 上限：四分之三栏宽，和 renderMessage 里的算法同源。
+	cap := width * 3 / 4
 
-	body := bubbleBody(m.renderMessage(target, 80))
+	// ⚠️ 第二段是**刻意的长**：正文短于上限的话，"没有上限"的实现也会绿，
+	// 这条判据就成了空壳（第一版的夹具正是这样，变异验证抓到的）。
+	long := strings.Repeat("这是一句足够长的正文，", 8) // 72 列，比上限还宽
+	m.bodies = map[string]app.Body{
+		target.MessageID: {Text: "会议链接：[meeting.example.com/abc-def-ghi](https://meeting.example.com/abc-def-ghi)\n\n" + long},
+	}
+
+	rows := m.renderMessage(target, width)
+	body := peerBody(rows)
 	if len(body) == 0 {
-		t.Fatal("对方这条消息没有气泡行")
+		t.Fatalf("对方这条消息没有引用正文：%q", rows)
 	}
-	// 量的是整行（含左沿那一格留白），所以它必定 ≥ 下限 + 留白。
-	if w := lipgloss.Width(body[0]); w < minBubbleW {
-		t.Errorf("单字消息的气泡只有 %d 列（下限 %d）—— 像一块补丁，不像气泡: %q",
-			w, minBubbleW, plainText(body[0]))
+	if len(body) < 3 {
+		t.Fatalf("正文只折成 %d 行，长段落那段没走到 —— 量不出上限还在不在：%q", len(body), rows)
+	}
+
+	// 先确认链接**真的画出来了**：一段被整段截没的正文，下面那条宽度
+	// 断言会在一行空字符串上绿过去。
+	var shown string
+	for _, row := range body {
+		shown += plainText(row)
+	}
+	if !strings.Contains(shown, "meeting.example.com") {
+		t.Fatalf("链接文字没画出来，量不出「按字节还是按显示宽度」: %q", shown)
+	}
+
+	for i, row := range body {
+		if w := lipgloss.Width(row); w > cap {
+			t.Errorf("引用正文第 %d 行宽 %d 列，超过四分之三栏宽 %d —— "+
+				"折行宽度没按上限收住（或者量的是字节而不是显示宽度）: %q",
+				i, w, cap, plainText(row))
+		}
 	}
 }
 
@@ -453,5 +438,59 @@ func TestChat_HeadTimeIsMutedNotSenderColored(t *testing.T) {
 	}
 	if !strings.Contains(head, timeSeq) {
 		t.Errorf("消息头里的时间没套 styleTime（期望序列 %q）：%q", timeSeq, head)
+	}
+}
+
+// 浮起的输入卡那一条底色必须**连续**，不能被行内的 SGR 重置切成几截。
+//
+// 这一条是从上一版的 TestChat_PeerBubblePaintSurvivesResets 继承来的 ——
+// 它原本守着对方消息的底色块，底色块退休之后，**全界面只剩输入卡一块**
+// 是按 paintRowBg 铺出来的（列表选中块里的文字是纯文本，不产生行内重置）。
+//
+// 为什么要有判据：行里套着提示符、占位提示、光标这些自带 `\x1b[0m` 的片段，
+// 每个重置都会把外层刚设好的底色**一起清掉**。断了的地方底色就没了，而
+// 代码怎么读都是对的（样式设了、颜色也给了），只有画面上少了几格色 ——
+// 这种错看代码看不出来，只能量。
+func TestInputCard_PaintSurvivesResets(t *testing.T) {
+	forceColor(t)
+	m := openTwoPane(t)
+	l := m.measureLayout()
+
+	const reset = "\x1b[0m" // 渲染层用的唯一一种重置序列
+	paint := bgSeqOf(styleInputRow)
+	if paint == "" {
+		t.Fatal("拿不到输入卡底色的序列 —— 这个用例大概忘了 forceColor")
+	}
+
+	// 直接问输入区要它渲染出来的那几行：整幅 View 里这一行的左边还压着
+	// 列表栏和分隔竖线，而那两样各自带重置（`│` 也是一个带样式的字符），
+	// 混进来量就会把它们的重置当成"底色断了"。renderInputBlock 出来的一行
+	// 里仍然带着那两条（withRail 是在它内部补的），所以从**底色序列第一次
+	// 出现的地方**切起 —— 那正是 paintRowBg 铺出来的那块的开头。
+	var card string
+	for _, r := range m.renderInputBlock(l) {
+		if i := strings.Index(r, paint); i >= 0 {
+			card = r[i:]
+			break
+		}
+	}
+	if card == "" {
+		t.Fatal("输入区那几行里没有一块铺了输入卡底色的 —— 判据无从量起")
+	}
+
+	// 行内得有重置，否则「重置之后底色还在不在」这件事根本没被量到。
+	// （上一版漏了这一句，用一个纯文本行去量，判据是空转的。）
+	segs := strings.Split(card, reset)
+	if len(segs) < 2 {
+		t.Fatalf("这一行里一个 SGR 重置都没有，量不出「重置之后底色还在不在」: %q", card)
+	}
+	for _, tail := range segs[1:] {
+		if !strings.HasPrefix(tail, paint) {
+			t.Errorf("重置之后底色断了（后面跟着 %q）: %q", truncate(tail, 20), card)
+		}
+	}
+	// 收尾恢复默认背景，否则底色会漏到下一行去。
+	if !strings.HasSuffix(card, "\x1b[49m") {
+		t.Errorf("这一行的底色没有收尾，会漏到下一行: %q", card)
 	}
 }

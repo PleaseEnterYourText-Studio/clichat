@@ -27,10 +27,10 @@ func hdr(id string, uid uint32, seen bool) mail.Header {
 func TestIndex_MergeDedupesByMessageID(t *testing.T) {
 	ix, _ := newIndex(t)
 
-	if got := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 1 {
+	if got, _ := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 1 {
 		t.Errorf("首次 Merge 应新增 1 条, got %d", got)
 	}
-	if got := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 0 {
+	if got, _ := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 0 {
 		t.Errorf("重复 Merge 不该新增, got %d", got)
 	}
 	if got := ix.Len(); got != 1 {
@@ -76,8 +76,66 @@ func TestIndex_PersistsAcrossOpen(t *testing.T) {
 	}
 
 	// 重建的位置表必须能用，否则去重会失效。
-	if got := reopened.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 0 {
+	if got, _ := reopened.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 0 {
 		t.Errorf("重新打开后去重失效, 新增了 %d 条", got)
+	}
+}
+
+// 本地乐观插入的那一份（UID=0）在服务端副本同步回来时必须补上 UID。
+//
+// 这条是用户报的那个问题的根：发出的一封信先以 UID=0 落进索引（见
+// app.send），服务端 Sent 里那份带着真 UID 回来时走的是「已经见过」的
+// 分支 —— 早先那里只合并已读标志就 continue 了，UID 永远留在 0。于是
+// 界面按 UID==0 判「本地待同步」，**每封自己发过的信、每次重启都还挂着
+// 那个标记**，正文也拉不下来（app.Bodies 对 UID==0 直接跳过）。
+func TestIndex_MergeBackfillsUIDOfAnOptimisticCopy(t *testing.T) {
+	ix, _ := newIndex(t)
+
+	// 乐观副本：发送成功时就插进来的那条，没有 UID。
+	optimistic := hdr("<sent@x>", 0, true)
+	optimistic.Folder = "Sent"
+	if added, updated := ix.Merge([]mail.Header{optimistic}); added != 1 || updated != 0 {
+		t.Fatalf("乐观副本应该算新增（added=%d updated=%d）", added, updated)
+	}
+
+	// 服务端 Sent 里的真副本：Message-ID 相同，UID 有了。
+	real := hdr("<sent@x>", 42, true)
+	real.Folder = "Sent"
+	added, updated := ix.Merge([]mail.Header{real})
+	if added != 0 {
+		t.Errorf("同一封邮件不该算新增, got added=%d", added)
+	}
+	if updated != 1 {
+		t.Errorf("补上了 UID 就该报到 updated 里（界面靠它知道索引变了）, got %d", updated)
+	}
+
+	all := ix.All()
+	if len(all) != 1 {
+		t.Fatalf("Sent 副本造成了重复: %d 条", len(all))
+	}
+	if all[0].UID != 42 {
+		t.Errorf("UID 没被补上（还是 %d）—— 界面会一直标「本地待同步」", all[0].UID)
+	}
+
+	// 再同步一遍不该反复报 updated：什么都没变就不算变化。
+	if _, again := ix.Merge([]mail.Header{real}); again != 0 {
+		t.Errorf("UID 已经有了，再合并不该报 updated=%d", again)
+	}
+}
+
+// 已经有 UID 的那一份是权威的，不能被后到的覆盖。
+//
+// 同一封邮件会被反复拉取（每轮同步都要过一遍区间），覆盖成"最后见到的
+// 那个 UID"会让按 UID 定位的操作（标已读 / 星标 / 移动）随机落空。
+func TestIndex_MergeDoesNotClobberAnExistingUID(t *testing.T) {
+	ix, _ := newIndex(t)
+
+	ix.Merge([]mail.Header{hdr("<a@x>", 7, false)})
+	if _, updated := ix.Merge([]mail.Header{hdr("<a@x>", 9, false)}); updated != 0 {
+		t.Errorf("UID 不该被换掉，却报了 updated=%d", updated)
+	}
+	if got := ix.All()[0].UID; got != 7 {
+		t.Errorf("UID 被改成了 %d, want 7", got)
 	}
 }
 
@@ -132,7 +190,7 @@ func TestIndex_Reset(t *testing.T) {
 		t.Error("Reset 后同步游标应被清掉")
 	}
 	// Reset 之后旧的 Message-ID 不该再挡着新数据。
-	if got := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 1 {
+	if got, _ := ix.Merge([]mail.Header{hdr("<a@x>", 1, false)}); got != 1 {
 		t.Errorf("Reset 后重新 Merge 应新增 1 条, got %d", got)
 	}
 }

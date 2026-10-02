@@ -334,11 +334,11 @@ func TestChat_MouseWheelScrollsHoveredPane(t *testing.T) {
 		t.Fatalf("夹具宽度 %d 降级成单栏了，测不了分栏", m.width)
 	}
 
-	// 双栏：最左边一条是导航列，中间是列表，右边才是会话流。
+	// 双栏：左边是列表，中间一条分隔竖线，右边才是正文。
 	// 起点从布局里取，不写死 —— 列宽一调，写死的坐标就会悄悄指到别的栏上，
 	// 判据从此量的是另一件事（这一条上次就是这么红的）。
 	rightX := m.measureLayout().chatX + 5
-	leftX := m.measureLayout().navX + 1
+	leftX := m.measureLayout().listX + 1
 
 	m, _ = update(m, tea.MouseMsg{
 		X: rightX, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp,

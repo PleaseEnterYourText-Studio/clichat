@@ -67,6 +67,9 @@ type layout struct {
 	tabsRow int
 
 	// bodyTop / bodyH 是主体区（各栏）的行范围。
+	//
+	// bodyTop 同时也是**列表栏标题行**所在的行：双栏时它是列表栏的第一
+	// 行（有标签页时那一行在它上面），点它换文件夹。
 	bodyTop int
 	bodyH   int
 
@@ -76,10 +79,19 @@ type layout struct {
 
 	statusRow int
 
-	// 横向：导航列 / 会话列表列 / 会话流。
-	// 单栏模式下只有 list 有效（list 和 chat 都是整幅宽，互斥显示）。
-	navX, navW   int
+	// 横向：会话列表列 / 分隔竖线 / 会话流。
+	//
+	// 单栏模式下只有 list 有效（list 和 chat 都是整幅宽，互斥显示），
+	// ruleX 是 -1（没有竖线）。
 	listX, listW int
+	// ruleX 是那条贯通到底的分隔竖线所在的**唯一一列**（终端坐标）。
+	//
+	// 它是一列实打实占位的字符，不是"画在某一栏的边上"：列表栏和正文栏
+	// 都不占这一列，于是两栏各自的宽度算法里不必再各减一次。
+	// 1 列宽是刻意的 —— 它要能划界，又不能参与亮度竞争（见 styles.go
+	// 里 styleRule 那段：这一轮把两块面板底色换成了这条线）。
+	ruleX int
+	// chatX 是正文栏的左沿（= ruleX + 1）。
 	chatX, chatW int
 
 	// contentX 是内容区左边缘，contentW 是它到最右一列之间的列数（末列
@@ -89,17 +101,16 @@ type layout struct {
 	// 这里起步。各自少缩进一格的话，一眼就能看出左边缘参差不齐，而
 	// 「对齐」这种事没人会专门去提 bug，只会觉得「说不上哪里别扭」。
 	//
-	// 内容区**紧接在侧栏之后**开始（列表栏本身就是内容区的一部分，它和
-	// 侧栏靠两块底色分家）；单栏模式下它是 0，和以前一样。
+	// 双栏时它和 chatX 同一个值（内容区就是正文栏，列表栏不算）；单栏
+	// 模式下它是 0。
 	contentX, contentW int
 
 	// paneX / paneW 是**正文栏里内容的起点与可用宽度**（终端坐标）。
 	//
-	// 和 contentX 差在哪：contentX 是「侧栏右边」，底部那几行原来从那里
-	// 起步，于是输入框横跨了列表栏 —— 一条通栏的横带，既不像浮起，又把
-	// 列表栏从中间截断。paneX 是「正文栏左沿再内缩一格」，底部三样
-	// （标签页 / 输入卡 / 状态栏）都排在这里，于是侧栏和列表栏能一路铺到
-	// 屏幕底，三块面板齐高。
+	// 和 contentX 差在哪：contentX 是「正文栏左沿」，底部那几行原来从
+	// 那里起步，于是输入框紧贴着分隔竖线；paneX 是「左沿再内缩一格」，
+	// 底部三样（标签页 / 输入卡 / 状态栏）都排在这里，和上面的引用块、
+	// 标题左对齐。
 	//
 	// 单栏模式下它就是整屏（paneX=0），和 contentX 等价。
 	paneX, paneW int
@@ -141,23 +152,23 @@ func (m Model) measureLayout() layout {
 	}
 
 	if l.twoPane {
-		// 三栏首尾相接，中间**不留缝也不画线** —— 侧栏 237 和列表 235
-		// 两块底色挨着就是分界（见 styles.go 里的梯子）。
-		l.navX, l.navW = 0, navWidth
-		l.listX = l.navW
+		// 两栏 + 中间一条竖线。列表栏从第 0 列起步（导航列没有了，
+		// 见 styles.go 里 singlePaneWidth 那段说明）。
+		l.listX = 0
 		l.listW = m.listWidth()
-		l.chatX = l.listX + l.listW
+		l.ruleX = l.listX + l.listW
+		l.chatX = l.ruleX + 1
 		l.chatW = m.width - l.chatX
 		if l.chatW < 1 {
 			l.chatW = 1
 		}
 	} else {
-		l.navX, l.navW = 0, 0
 		l.listX, l.listW = 0, m.width
+		l.ruleX = -1
 		l.chatX, l.chatW = 0, m.width
 	}
 
-	l.contentX = l.listX
+	l.contentX = l.chatX
 	l.contentW = m.width - l.contentX - 1
 	if l.contentW < 1 {
 		l.contentW = 1
@@ -193,10 +204,10 @@ func (m Model) inputBlockRows() int {
 
 // listWidth 是左侧会话列表栏的宽度。
 //
-// 它和导航列是分开算的：导航列固定 navWidth，这里只算列表自己。
-// 原来取 width/3（24..36），加上导航列之后会挤掉正文，所以收窄成
-// width/4（22..30）—— 列表只要能放下「Alice, Bob」这样的名字就够，
-// 主题本来就会被截断。
+// 取 width/4（22..30）。这个数原来是「width/3 减去一条 14 列的导航列」
+// 折出来的；导航列删掉之后算式可以放宽回 width/3，但**没有放宽**：
+// 列表只要能放下「Alice, Bob」这样的名字就够，主题本来就会被截断，
+// 而多出来的列给正文 —— 正文是所有东西里唯一会被折行的那一栏。
 func (m Model) listWidth() int {
 	w := m.width / 4
 	if w < 22 {
@@ -215,7 +226,7 @@ func (m Model) bodyHeight() int {
 
 // chatPaneWidth 是会话流那一栏的总宽度（含最右那一列滚动条）。
 //
-// 双栏时它是右栏 —— 左边导航列、列表栏、中间那根竖线之外的全部；
+// 双栏时它是右栏 —— 列表栏和中间那根竖线之外的全部；
 // 单栏时就是整幅。抽出来是因为「正文折成几行」和「正文画多宽」必须是
 // 同一个数，两边各算一遍的话，改了布局里的一处、另一处就开始骗人。
 func (m Model) chatPaneWidth() int {
@@ -248,43 +259,49 @@ func chatViewHeight(bodyH int) int {
 
 // ---- 主布局 ----
 
-// viewTwoPane 拼三栏：导航 / 会话列表 / 会话流。
+// viewTwoPane 拼两栏：会话列表 / 分隔竖线 / 会话流。
 //
-// **一条线都不画。** 三块区域之间的分界全部由底色和一个不铺色的内容区
-// 表达：
+// **没有底色块，只有一条线。** 两块区域的分界是中间那条 1 列宽的 │：
 //
-//	[ 文件夹栏 navBg 237 ][ 会话列表 listBg 235 ][ 会话流：终端自己的背景 ]
+//	[ 会话列表：终端背景 ][│][ 会话流：终端背景 ]
 //
-// 这是这一版最要紧的一处改动。上一版列表栏是**没有底色**的，于是「列表
-// 到哪儿结束」只剩下一根竖线可说 —— 而那条竖线恰恰是"没有设计"的信号：
-// 一个界面需要画线来分区，说明它的底色层次没做出来。
+// ⚠️ 这是**推翻上一版**的结果，值得记下为什么。上一版走的是"用底色代替
+// 线条"：列表铺 235、文件夹栏铺 237，靠深浅分家。它推导得没错（需要画线
+// 来说明分区，确实说明层次没做出来），但落地之后一屏里同时坐着三块亮度
+// 不同的灰板，眼睛进来先读到"三个格子"，而不是"一堆邮件"。用户的原话是
+// 「割裂」—— 指的正是这个。
 //
-// 现在两块面板紧挨着，差 2 格，边界自己就浮出来了；会话流不铺底色，
-// 于是它天然是"最里面那一层"，正文拿到的对比度也最高。这条关系参照的
-// 是 VS Code 的活动栏 / 侧栏 / 编辑器。
+// 现在反过来分工：
 //
-// ⚠️ 侧栏和列表栏是**通到底**的（标签页 / 输入区 / 状态栏那几行也补底色，
-// 见 withPaneStrip），只有正文栏在底部让位给输入卡。这不是为了整齐好看：
-// 面板只铺到一半、下面是空的，读起来就是"这块面板被切了"，而不是"到底了"。
+//   - **底色只表达「这里是一块你现在能动的东西」**（选中的行、输入卡、
+//     当前标签页、对方消息的引用块）。它不再承担分区。
+//   - **分区交给线。** 一条 1 列宽的竖线，从头贯到底，不争亮度。
+//
+// 结果是一屏里只剩终端背景这一个"面"，可操作的东西才浮起来 —— 深色终端
+// 上这正是它该有的样子：安静是默认值，强调是例外。
+//
+// ⚠️ 那条线是**通到底**的（标签页 / 输入区 / 状态栏那几行也画，见 withRail），
+// 只有它在底部让位给输入卡的时候才断。断在半空中的分界线读起来是"画错
+// 了"，不是"到底了"。
 func (m Model) viewTwoPane(l layout) string {
 	panes := lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		m.renderNav(l),
 		m.renderThreadList(l.listW, l.bodyH),
+		m.rail(l.bodyH),
 		m.renderChat(l.chatW, l.bodyH),
 	)
-	// 正文栏的每一行内容都从 paneX 起步（= chatX + 1），所以这里统一
-	// 补那 1 格 —— 补在前面而不是让 renderTabs / renderStatus 各自加，
+	// 正文栏的每一行内容都从 paneX 起步（= chatX + paneInset），所以这里
+	// 统一补那 1 格 —— 补在前面而不是让 renderTabs / renderStatus 各自加，
 	// 是为了让"左对齐"只有一处出处。
 	pad := strings.Repeat(" ", paneInset)
 
 	out := make([]string, 0, m.height)
 	if l.tabsRow >= 0 {
-		out = append(out, m.withPaneStrip(pad+m.renderTabs(l), l))
+		out = append(out, m.withRail(pad+m.renderTabs(l), l))
 	}
 	out = append(out, strings.Split(panes, "\n")...)
 	out = append(out, m.renderInputBlock(l)...)
-	out = append(out, m.withPaneStrip(pad+m.renderStatus(l.paneW), l))
+	out = append(out, m.withRail(pad+m.renderStatus(l.paneW), l))
 	return strings.Join(out, "\n")
 }
 
@@ -302,157 +319,43 @@ func (m Model) viewSinglePane(l layout) string {
 	return strings.Join(out, "\n")
 }
 
-// withPaneStrip 给一行的左边补上「侧栏 + 列表栏」那两条底色。
+// rail 画那条分隔竖线，占满 height 行。
 //
-// 底下的标签页、输入区、状态栏不走 renderNav / renderThreadList，不补这
-// 一下这两块面板就在半空中断掉 —— 原来只补了侧栏，于是列表栏那层 235
-// 在输入区那三行凭空消失，看着像列表栏被输入框截掉了一截。补的是两段
-// 实底空格，不是给整行上色 —— 整行上色会把右边的输入卡也染成面板底色。
-//
-// 两段必须**分别**铺：侧栏是 237、列表栏是 235，一个序列盖不过两种底色。
-func (m Model) withPaneStrip(line string, l layout) string {
-	if l.navW <= 0 {
-		return line
-	}
-	out := paintRowBg(strings.Repeat(" ", l.navW), navBgSeq())
-	if l.listW > 0 {
-		out += paintRowBg(strings.Repeat(" ", l.listW), listBgSeq())
-	}
-	return out + line
-}
-
-// ---- 左侧导航 ----
-
-// renderNav 画左侧导航列（两级：组标题 + 组里的项）。
-//
-// 底色的铺法：先按纯文本把每一行拼到 navWidth 宽，再**逐行**重压底色 ——
-// 不能指望 styleNav.Render(整块)，那样只有第一行有底色（原因见
-// paintRowBg 的注释）。
-func (m Model) renderNav(l layout) string {
-	if l.navW <= 0 {
+// 它单独立成一块、由 JoinHorizontal 拼进去，而不是让某一栏自己在边上多画
+// 一列：两栏各自的宽度算式里因此都不必再减一次那条线，也就不会出现
+// 「减了两遍」或者「一边减一边没减」这种只在某一种窗口宽度下才露头的错。
+func (m Model) rail(height int) string {
+	if height <= 0 {
 		return ""
 	}
-	rows := m.navRows()
-	out := make([]string, 0, l.bodyH)
-	for i := 0; i < l.bodyH; i++ {
-		line := ""
-		if i < len(rows) {
-			line = rows[i]
-		}
-		out = append(out, paintRowBg(padRight(line, navWidth), navBgSeq()))
+	col := make([]string, height)
+	for i := range col {
+		col[i] = styleRule.Render(ruleMark)
 	}
-	return strings.Join(out, "\n")
+	return strings.Join(col, "\n")
 }
 
-// navTitleIndent / navItemIndent 是组标题和组里那一级的缩进。
+// withRail 给一行的左边补上「列表栏 + 分隔竖线」那两段。
 //
-// 差 2 格是**硬要求**，不是审美偏好：差 1 格的时候，一行「邮箱」和它下面
-// 的「全部」在同一段左边缘上，隔着一层文字根本读不出谁属谁 —— 上一版是
-// 1 格对 2 格，于是「两级侧栏」在画面上等于没做（组标题看着像个普通项，
-// 只是字小一点）。
-const (
-	navTitleIndent = 1
-	navItemIndent  = 3
-)
-
-// navCountW 是未读计数占的列宽（含左边格间隔）。
+// 底下的标签页、输入区、状态栏不走 renderThreadList，不补这一下，那条
+// 竖线就会在输入区那几行凭空断掉 —— 一条只画了一半的分界线，看着像画错了。
 //
-// 计数**右对齐**，于是整列数字共用一条右基准线；左对齐的话，个位数和
-// 两位数会各站各的位置，眼睛扫下去会觉得这一列在抖。
-const navCountW = 3
-
-// navRows 返回导航列的每一行（纯渲染内容，不含底色）。
-//
-// 返回的是**画出来的行**，和点鼠标时的命中测试共用同一套换算 ——
-// 见 navRowIndexAt。
-func (m Model) navRows() []string {
-	var out []string
-	for gi, g := range m.navGroups() {
-		if gi > 0 {
-			// 组与组之间空一行。这个空行是「两级」的第二重表达（第一重是
-			// 缩进差）：没有它，两个组的标题会连成一片。
-			out = append(out, "")
-		}
-		out = append(out, styleGroupTitle.Render(
-			padRight(strings.Repeat(" ", navTitleIndent)+truncate(g.title, navWidth-navTitleIndent), navWidth)))
-		for _, it := range g.items {
-			out = append(out, m.navItemRow(it))
-		}
+// 补的是「listW 格空白 + 一格竖线」，正好把 line 推到 chatX + paneInset。
+// 不是给整行上色后再补：整行上色会把右边的输入卡也一起染掉。
+func (m Model) withRail(line string, l layout) string {
+	if l.ruleX < 0 {
+		return line
 	}
-	return out
+	return strings.Repeat(" ", l.listW) + styleRule.Render(ruleMark) + line
 }
 
-// navItemRow 画导航里的一项。
+// ---- 文件夹选择器 ----
+// 注：这里原本是「左侧导航列」的整套渲染（navRows / navItemRow /
+// navRowIndexAt 加上组标题与项的两级缩进）。那一列被删掉了 —— 它只有
+// 四五个固定入口，却常驻占掉 14 列，用户的原话是「单独占一列完全浪费」。
 //
-// 结构（以 navWidth=14 为例）：
-//
-//	▌ 全部        5
-//	 ↑↑           ↑
-//	 │└ 1 格间隔  └ 右对齐的未读计数，3 列
-//	 └ 选中时是强调色标条，否则一格空格
-//
-// 顺序是「先补齐宽度、再上色」：反过来的话底色块只盖住文字那几个字，
-// 看起来像被划了一道而不是一行选中。
-func (m Model) navItemRow(it navItem) string {
-	active := it.folder == m.activeFolder
-
-	// 标条那一格：选中时是一个左半块，否则留白。它**在宽度里**（1 列），
-	// 所以选中与否都不会让标签左右跳。
-	bar := " "
-	if active {
-		bar = blockMark
-	}
-
-	count := ""
-	if it.unread > 0 {
-		count = fmt.Sprint(it.unread)
-	}
-	labelW := navWidth - 1 - navItemIndent - navCountW
-	label := truncate(it.label, labelW)
-
-	// 数字右对齐到 navCountW 列，标签左对齐到 labelW 列 —— 两者加起来正好
-	// 是「标条 1 + 缩进 navItemIndent + labelW + navCountW」= navWidth。
-	body := strings.Repeat(" ", navItemIndent) + padRight(label, labelW) + padLeft(count, navCountW)
-
-	// ⚠️ 选中时标条那一格要**和正文一起**丢给 styleNavActive，不能单独
-	// 渲染再拼上去。单独拼的话那一格只拿到前景色、拿不到底色，于是选中块
-	// 的最左一格露出的是侧栏底色 —— 看着像标条旁边缺了一块。
-	if active {
-		return styleNavActive.Render(bar + body)
-	}
-	return bar + styleNavIdle.Render(body)
-}
-
-// navRowIndexAt 把导航列里的一行（相对主体区顶部的偏移）映射回 navRows 的下标。
-//
-// 返回值 <0 表示这一行不是可点的项（组标题、组之间的空行、超出内容的补白）。
-func (m Model) navRowIndexAt(off int) (navItem, bool) {
-	if off < 0 {
-		return navItem{}, false
-	}
-	// 与 navRows 的排布一一对应地重走一遍：组标题和空行占位、跳过。
-	row := 0
-	for gi, g := range m.navGroups() {
-		if gi > 0 {
-			if row == off {
-				return navItem{}, false
-			}
-			row++
-		}
-		if row == off {
-			return navItem{}, false
-		}
-		row++
-		for _, it := range g.items {
-			if row == off {
-				return it, true
-			}
-			row++
-		}
-	}
-	return navItem{}, false
-}
-
+// 现在同一批数据（navGroups）由**按需唤出的文件夹选择器**呈现：内容一样
+// （含未读计数），只是不再常驻。渲染在 renderFolderPicker 那一段。
 // ---- 顶部标签页 ----
 
 // renderTabs 画顶部那一排会话标签页。
@@ -473,6 +376,13 @@ func (m Model) renderTabs(l layout) string {
 			b.WriteByte(' ')
 			col++
 		}
+		if c.marker != "" {
+			// 溢出指示：那一侧还有标签没显示。用最暗的一档，它是个路标
+			// 而不是内容 —— 亮起来会和真标签抢注意力。
+			b.WriteString(styleMuted.Render(c.marker))
+			col = c.x1
+			continue
+		}
 		text := padRight(" "+c.label+" ", c.x1-c.x0)
 		if c.id == m.activeID {
 			b.WriteString(styleTabActive.Render(text))
@@ -481,17 +391,12 @@ func (m Model) renderTabs(l layout) string {
 		}
 		col = c.x1
 	}
-	// 后面还有没画出来的会话时留个省略号：一个也不说，用户只会以为
-	// 标签页的数量就是全部。
-	if remaining := len(m.tabThreads()) - len(chips); remaining > 0 && col+1 < l.paneW {
-		b.WriteString(styleMuted.Render("…"))
-	}
 	// 不在这里补左边的面板带：调用方（viewTwoPane）补，因为那 1 格内缩
 	// 是正文栏内容共有的，标签页只是其中一个使用者。
 	return b.String()
 }
 
-// tabChipAt 找出落在列 x 上的那个标签页。
+// tabChipAt 找出落在列 x 上的那一格（可能是标签，也可能是溢出指示符）。
 //
 // x 是**屏幕列**（鼠标传来的是什么就是什么）。标签的坐标是正文栏里的
 // 相对列，所以这里减一次 paneX —— 和 viewTwoPane 里 withPaneStrip 补的
@@ -622,21 +527,22 @@ func (m Model) listWindow(rows []listRow, height int) (int, int) {
 
 // renderThreadList 画左侧的会话列表。
 //
-// 整栏铺一块底色（listBg）—— 它是**面板**，而不是"浮在终端背景上的一堆
-// 文字"。上一版列表栏没有底色，于是它和右边会话流之间的分界只剩一根竖线
-// 可说；有了这块底色，侧栏压在上面（237 对 235），会话流空在右边，
-// 三层的深度自己就出来了。
+// **不铺底色。** 整栏直接坐在终端背景上，和右边的正文栏是同一个"面" ——
+// 两栏之间只有一条 1 列宽的竖线（见 viewTwoPane 里那段：上一版的
+// 列表 235 / 侧栏 237 两层灰板一屏同现，读起来像被切成了三块）。
+// 列表行**内部**仍然有底色，但那是「这一条被选中了」的信号，不是分区。
 //
-// 标题行带上当前文件夹和未读总数 —— 过滤生效时如果不显示，用户会
-// 以为邮件丢了。搜索词也一样：搜索是可以回车保留的，不留痕迹的话，
-// 用户会以为「列表里就剩这几封了」。
+// 标题行是**当前文件夹**，而且可以点（点它弹文件夹选择器，和 Tab 等价）。
+// 带上未读总数是因为过滤生效时如果不显示，用户会以为邮件丢了；搜索词
+// 也一样 —— 搜索是可以回车保留的，不留痕迹的话，用户会以为「列表里就剩
+// 这几封了」。
 func (m Model) renderThreadList(width, height int) string {
 	lines := make([]string, 0, height)
 	lines = append(lines, styleTitle.Render(truncate(m.listHeader(), width-2)))
 
 	if len(m.visible) == 0 {
 		lines = append(lines, styleMuted.Render(truncate("  "+m.emptyListHint(), width-2)))
-		return paintPaneBg(fillPane(lines, width, height), listBgSeq())
+		return fillPane(lines, width, height)
 	}
 
 	rows := m.listRows()
@@ -644,7 +550,7 @@ func (m Model) renderThreadList(width, height int) string {
 	for _, r := range rows[start:end] {
 		lines = append(lines, m.renderListRow(r, width))
 	}
-	return paintPaneBg(fillPane(lines, width, height), listBgSeq())
+	return fillPane(lines, width, height)
 }
 
 // listRowInset / listRowPad 是列表行的两道横向余量。
@@ -845,13 +751,18 @@ func (m Model) listRowAt(width, height, off int) (int, bool) {
 }
 
 // listHeader 是会话列表的标题行。
+//
+// ⚠️ 内容是**当前文件夹**，不是"会话"。
+//
+// 上一版它写「会话 · 收件箱（3 个未读）」—— 前半截是从"有个标题总比没有好"
+// 里来的，而"这一栏是会话列表"这件事整个界面都在说。文件夹那一列被删掉
+// 之后（见 styles.go），这个位置是唯一能回答「我现在在哪个文件夹」的
+// 地方，那 3 个字的预算该给它。而且它现在**可以点**（弹出文件夹选择器），
+// 所以标题本身就是那个入口的名字。
 func (m Model) listHeader() string {
-	title := "会话"
-	if m.activeFolder != "" {
-		title += " · " + m.activeFolder
-	}
+	title := m.folderLabel()
 	if m.query != "" {
-		title += " · 「" + m.query + "」"
+		title += "「" + m.query + "」"
 	}
 
 	unread := 0
@@ -872,7 +783,7 @@ func (m Model) emptyListHint() string {
 	case m.query != "":
 		return "没有匹配「" + m.query + "」的会话"
 	case m.activeFolder != "":
-		return m.activeFolder + " 里还没有会话"
+		return m.folderLabel() + " 里还没有会话"
 	default:
 		return "还没有会话，按 n 新建一个"
 	}
@@ -900,8 +811,8 @@ func (m Model) renderChat(width, height int) string {
 	// 灰一点、补上封数，它就和标签页分工了 —— 标签页说"是谁"，这里说
 	// "有多少"。
 	//
-	// 前面那 1 格内缩（paneInset）是必须的：它让标题、气泡、输入卡共享
-	// 同一条左边缘。标题不缩的话它比下面的气泡靠左一格，而这一格的参差
+	// 前面那 1 格内缩（paneInset）是必须的：它让标题、引用块、输入卡共享
+	// 同一条左边缘。标题不缩的话它比下面的正文靠左一格，而这一格的参差
 	// 正是那种"说不上哪里别扭、但就是不像设计过"的来源。
 	titleW := contentW - paneInset
 	if titleW < 1 {
@@ -1033,42 +944,53 @@ func (m Model) chatTitle() string {
 //
 // 版面规则（width 是会话栏里文字可用的列数）：
 //
-//	[对方]  消息头左对齐、**不上底色**；正文围在一个贴合内容宽度的气泡里
+//	[对方]  消息头左对齐、**不上底色**；正文左边跟着一条竖条
 //	[自己]  消息头和正文都右对齐、全程无底色
 //
-// 两条与上一版不同的硬规矩：
+// 三轮下来这块版面上只剩一条规矩：**对方的正文左边有竖条，自己的没有。**
+// 前面两版守的是别的东西，都推翻了，值得记下来为什么：
 //
-//  1. **消息头移出气泡。** 上一版头和正文同铺一条灰带，结果是「谁在说」
-//     也被圈进去了 —— 而头是**标注**，不是内容。头留在外面，气泡里就
-//     只剩"这个人说的话"，那一段才是一个完整的引用块。
+//  1. 第一版头和正文同铺一条灰带 —— 「谁在说」也被圈进去了。头是**标注**，
+//     不是内容，它该在外面。
+//  2. 第二版把正文围进一个贴合内容的底色块（气泡）。宽度那套账很难算对
+//     （四分之三上限、最小宽度、按显示宽度而不是字节量……），但真正的问题
+//     不在实现：**一条消息一块底色，一屏里就有十几块亮度不同的矩形在互相
+//     切割**，而长消息的块宽、短消息的块窄，右边缘参差得像一屏打乱的表格。
+//     用户的原话是「割裂感太强」。
 //
-//  2. **气泡贴合内容，上限约四分之三栏宽。** 上一版气泡通栏铺到右沿，
-//     短消息两侧留下大片空白，看着像表格的行；气泡的作用是**把一段话
-//     圈起来**，圈得贴合内容才看得出是"一段话"。上限是为了不让长消息
-//     也变成通栏 —— 到了上限它仍然是一块，只是比较宽。
+// 换成竖条之后：宽度不再需要"算" —— 引用块就是「一条竖条 + 它右边的字」，
+// 字多长块就多长，右边自然参差反而是对的（那是一段文字，不是一个框）。
+// 而"谁在说"由三件事同时回答：头里的名字、左/右对齐、有没有那条竖条。
 func (m Model) renderMessage(msg thread.Header, width int) []string {
 	mine := msg.From == m.cfg.Self()
 
-	// 气泡的几何（paneInset / bubblePadX / minBubbleW / minNameW）在
-	// styles.go 里，和别的布局数字放在一起 —— 判据要绑那几个常量。
+	// 引用的几何（paneInset / quoteGap / minNameW）在 styles.go 里，
+	// 和别的布局数字放在一起 —— 判据要绑那几个常量。
 
-	// 气泡/正文的最大宽度。
-	maxW := width * 3 / 4
-	if maxW < minBubbleW+2*bubblePadX {
-		maxW = width
+	// quoteIndent 是引用条那一行里、正文之前占掉的列数：
+	// 栏左沿那一格留白 + 竖条 1 格 + 一格间隔。
+	const quoteIndent = paneInset + 1 + quoteGap
+
+	// 引用正文的折行宽度。
+	//
+	// 两条上限：**四分之三栏宽**（一整栏宽的正文每行七十多个字，眼睛回到
+	// 下一行时容易串行），以及「栏宽 - quoteIndent」（撑破一行的代价见下面
+	// 头部那段）。取更紧的那一条。
+	//
+	// ⚠️ 折行宽度必须**在这里定死**：四分之三那个上限是按**理想值**算的，
+	// 而窄窗口下它比实际能给的列数还大 —— 先按它折行、再在外层压回来，
+	// 正文不会跟着变，比引用条还宽的那几行照样撑破，而且只在特定宽度下
+	// 才露出来（这一条踩过）。
+	room := width - quoteIndent
+	if room < 1 {
+		room = 1
 	}
-	// 正文折行的宽度。**折行必须在这里定死**，因为气泡的宽度是从折行
-	// 结果反推出来的（见下）—— 反过来的话，气泡宽度依赖折行、折行又
-	// 依赖气泡宽度，转不出来。
-	textW := maxW - 2*bubblePadX
-	if textW < 8 {
+	textW := width*3/4 - quoteIndent
+	if textW > room {
+		textW = room
+	}
+	if textW < 8 && room >= 8 {
 		textW = 8
-	}
-	// 下面那个「不小于 8 列」的下限在很窄的窗口里会反过来超过栏宽本身，
-	// 那时折出来的正文比栏还宽。撑破一行会让终端自己折行、下面所有行的
-	// 行号错开一格（鼠标的命中测试跟着全错），所以这里再压一道。
-	if textW > width {
-		textW = width
 	}
 
 	body := m.bodies[msg.MessageID]
@@ -1098,20 +1020,15 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 		return padRight(ansi.Truncate(l, w, ""), w)
 	}
 
-	// 栏宽不足以画出一条气泡时，只输出按栏宽折过的正文。
+	// 栏宽不足以画出一条引用条时，只输出按栏宽折过的正文。
 	//
-	// 下限是算出来的，不是拍的：气泡最窄的形态 = 左沿那一格留白 + 左右
-	// 两个内边距 + **一个最宽的字符**（见 styles.go 的 maxCellW）。最后
-	// 那一项不能省，理由同上。
+	// 下限是算出来的，不是拍的：引用条最窄的形态 = 左沿那一格留白 + 竖条
+	// 1 格 + 间隔 1 格 + **一个最宽的字符**（见 styles.go 的 maxCellW）。
+	// 最后那一项不能省，理由同上。
 	//
 	// 这一档里消息头也不画：4 列宽的名字只剩「Al…」，它带来的信息量还不
 	// 如让给正文。
-	//
-	// ⚠️ 这是**唯一**的窄栏兜底。别在下面再写一个「maxBubble 太小就退化」
-	// 的分支 —— `maxBubble = min(maxW, width-留白)`，而窄栏下 maxW 就等于
-	// width，于是那个分支的条件和这里一模一样，永远走不到（写出来就是死
-	// 代码，还会让人以为下面那条路真的能兜住窄栏）。
-	if width < paneInset+2*bubblePadX+maxCellW {
+	if width < quoteIndent+maxCellW {
 		var out []string
 		for _, l := range renderMarkdown(body.Text, width) {
 			out = append(out, fit(l, width))
@@ -1194,54 +1111,26 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 
 	out = append(out, padRight(" "+head, width))
 
-	// 气泡宽度有两个上限：内容那一路是「四分之三栏宽」（不然长消息也会
-	// 糊成通栏），布局那一路是「连左沿那一格留白一起不能超过栏宽」。
-	// 窄栏下后者更紧，而它必须赢 —— 一行撑破的代价见上面头部那段。
-	//
-	// 这里不需要再判一次「太窄就不画气泡」：`maxBubble = min(maxW, width-留白)`，
-	// 而窄栏下 maxW 就等于 width，于是那个条件跟上面那道兜底一模一样、
-	// 永远走不到（写出来就是死代码）。
-	maxBubble := maxW
-	if lim := width - paneInset; lim < maxBubble {
-		maxBubble = lim
-	}
+	// ⚠️ 折行宽度要从**实际上限**反推，不能用上面那个理想值（这里再折
+	// 一次，是因为头那一段算下来可能要更窄 —— 而 textW 已经按 room 钳过，
+	// 所以这一步只是把同一件事写在最靠近用它的地方）。
+	lines = renderMarkdown(body.Text, textW)
 
-	// ⚠️ 折行宽度要从气泡的**实际上限**反推，不能用上面那个理想值。
-	// 先折行、再让上限把气泡压窄的话，正文不跟着变 —— 比气泡还宽的那
-	// 几行照样撑破，而且只在特定窗口宽度下才露出来。
-	lines = renderMarkdown(body.Text, maxBubble-2*bubblePadX)
-
-	// 气泡宽度 = 最长那一行 + 两侧内边距，收进 [下限, maxBubble]。
-	// 下限只在它装得下的时候才抬高：抬不动就不抬，不然又超上限。
+	// 引用块 = 那一格留白 + 竖条 + 一格间隔 + 正文。
 	//
-	// ⚠️ **量的是显示宽度（lipgloss.Width），不是 textWidth。**
-	// renderMarkdown 吐出来的行已经上过色了，里面有 SGR 和 OSC 8 超链接
-	// ——textWidth 是逐 rune 求和的**纯文本**口径（见 styles.go），它会
-	// 把转义序列的每个字节都当成一列。实测一封带链接的 HTML 邮件：可见
-	// 最宽的一行 39 列，被量成 103 列，气泡于是撑到 105 列、把整栏顶破。
+	// **不给右边补白。** 上一版必须补，是因为底色块要方；现在没有块了，
+	// 补白只会让每一行都带上几十个看不见的尾随空格（复制、选中都会带上），
+	// 而画面上没有任何东西因此变化。
 	//
-	// 这个坑原来是被一句 `if bubbleW > maxBubble` 盖住的 —— 气泡宽被钳
-	// 回去了，可正文行还是那么宽，真正该修的是这把尺子。删掉那句钳制、
-	// 换掉这把尺子之后才发现：钳制一直在替它兜底。
-	bubbleW := 0
-	for _, l := range lines {
-		if w := lipgloss.Width(l); w > bubbleW {
-			bubbleW = w
-		}
-	}
-	bubbleW += 2 * bubblePadX
-	if bubbleW < minBubbleW && minBubbleW <= maxBubble {
-		bubbleW = minBubbleW
-	}
-	innerW := bubbleW - 2*bubblePadX
-
+	// 空行（段落之间）也画竖条：那一段竖条断了的话，读者会把「两段话」
+	// 读成「两段引用」—— 而竖条正是"这是同一个人说的"那条连线。
+	//
+	// 正文行只截断、不补齐（fit 那一步的补白只属于窄栏兜底：那里连
+	// 竖条都没有，行宽得自己收住）。
+	bar := styleSideline.Render(sidelineMark)
 	inset := strings.Repeat(" ", paneInset)
 	for _, l := range lines {
-		// 行宽 = 左内边距 1 + 内容补到 innerW + 右内边距 1 = bubbleW。
-		// `fit` 里的截断在正常情况下一次也不会触发（bubbleW 是从最长那
-		// 一行反推的）；它拦的是「前缀 + 宽字符把行撑出给定宽度」那一档，
-		// 见上面 fit 的说明。
-		out = append(out, inset+paintPeerBubble(" "+fit(l, innerW)+" "))
+		out = append(out, inset+bar+strings.Repeat(" ", quoteGap)+ansi.Truncate(l, textW, ""))
 	}
 	return append(out, "")
 }
@@ -1269,7 +1158,15 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 // 正是用户最需要的一条（这条曾经真的发生过）。提示不是输入框，横跨整个
 // 内容区；两者也不会同时出现，左边缘对不齐无从看起。
 func (m Model) renderInputBlock(l layout) []string {
-	full := m.width - l.navW
+	// 列表模式那一行提示横跨整个内容区（含列表栏）：它的宽度是
+	// 「屏幕 - 分隔竖线左边那一段」。**不减 navW** —— 那一列没有了，
+	// 而少减一次会让提示的宽度和它实际能占的列数对不上，末尾那几个键
+	// 被 padRight 静默吃掉（正是下面注释里说的「q 退出从来没显示出来」
+	// 那个老毛病换了个成因）。
+	full := m.width - l.listW - 1
+	if l.ruleX < 0 {
+		full = m.width
+	}
 	if full < 1 {
 		full = 1
 	}
@@ -1279,10 +1176,10 @@ func (m Model) renderInputBlock(l layout) []string {
 		// 列表模式没有输入框，这一行留给常驻快捷键提示。**不套底色块**：
 		// 给一行提示铺上输入框的底色，等于告诉用户那里能打字。
 		if l.inputRows <= 1 {
-			return []string{m.withPaneStrip(m.renderInputLine(full), l)}
+			return []string{m.withRail(m.renderInputLine(full), l)}
 		}
-		blank := m.withPaneStrip(strings.Repeat(" ", full), l)
-		return []string{blank, m.withPaneStrip(m.renderInputLine(full), l), blank}
+		blank := m.withRail(strings.Repeat(" ", full), l)
+		return []string{blank, m.withRail(m.renderInputLine(full), l), blank}
 	}
 
 	plain := l.paneW
@@ -1292,12 +1189,12 @@ func (m Model) renderInputBlock(l layout) []string {
 
 	if l.inputRows <= 1 {
 		// 终端太矮，留白让给了正文。退回单行贴底 —— 和以前一样。
-		return []string{m.withPaneStrip(pad+m.renderInputLine(plain), l)}
+		return []string{m.withRail(pad+m.renderInputLine(plain), l)}
 	}
 
-	blank := m.withPaneStrip(pad+strings.Repeat(" ", plain), l)
+	blank := m.withRail(pad+strings.Repeat(" ", plain), l)
 
-	// 浮起输入框的那一块：占满正文栏（左边和标签页、气泡对齐，右边留
+	// 浮起输入框的那一块：占满正文栏（左边和标签页、引用块对齐，右边留
 	// 一格），块内两端再各留一列空白，所以文字可用的宽度是 blockW-2。
 	blockW := plain
 	if blockW < 8 {
@@ -1315,7 +1212,7 @@ func (m Model) renderInputBlock(l layout) []string {
 	block := paintRowBg(
 		" "+padRight(m.renderInputLine(blockW-2), blockW-2)+" ",
 		bgSeqOf(styleInputRow))
-	return []string{blank, m.withPaneStrip(pad+block, l), blank}
+	return []string{blank, m.withRail(pad+block, l), blank}
 }
 
 // inputFloats 说当前这一行要不要画成浮起的输入框。
@@ -1486,73 +1383,262 @@ func (m Model) viewHelp() string {
 	for len(out) < bodyH {
 		out = append(out, "")
 	}
-	out = append(out, styleMuted.Render(truncate(
-		"↑/↓ 或 PgUp/PgDn 滚动 · ? 或 Esc 关闭", m.width)))
+	out = append(out, m.footerLine(helpFooter, styleMuted, m.width))
 	return strings.Join(out, "\n")
 }
 
-// viewFolderPicker 渲染文件夹选择器。
-func (m Model) viewFolderPicker() string {
-	choices := m.folderChoices()
+// helpFooter 是帮助页页脚左边那句。
+//
+// 说到「Esc 关闭」而不只是让右下角那格按钮去说：键盘用户也该在这一行里
+// 找到答案，而按钮（`[ 关闭 ]`）是同一件事在鼠标那一侧的说法。
+const helpFooter = "↑/↓ 或 PgUp/PgDn 滚动 · ? 或 Esc 关闭"
 
-	bodyH := m.height - 1
-	if bodyH < 1 {
-		bodyH = 1
+// viewFolderPicker 渲染文件夹选择器。
+//
+// 它取代了原来那条常驻的左侧导航列。内容基本一样（固定入口 + 服务端多出来
+// 的文件夹 + 每项未读计数 + 两级分组），差别是**不再常驻** —— 那一列只服务
+// 四五个入口，却每天都在占掉 12 列左右的列表宽度。
+//
+// 版式上它是一列**居中的窄栏**（和禅模式同一个思路，见 zen.go 里那段：
+// 通栏的一行行看着像表格）。48 列刚好放下「垃圾邮件  12」这种最长组合。
+//
+// 鼠标：点某一项直接切过去，**点其它任何地方都取消**（组标题、空行、
+// 上下留白、页脚）。这就是 Esc 在鼠标这一侧的等价物 —— 复选框式的
+// "点确定按钮才能离开"在这个界面里没有位置。
+func (m Model) viewFolderPicker() string {
+	g := m.pickerGeom()
+	rows := m.folderPickRows()
+
+	indent := strings.Repeat(" ", g.left)
+	lines := []string{
+		indent + styleTitle.Render(truncate("换个文件夹", g.colW)),
+		"",
 	}
-	// 首行标题、末行操作提示，中间留给选项。
-	avail := bodyH - 3
+	for i := g.start; i < g.end; i++ {
+		r := rows[i]
+		lead := strings.Repeat(" ", folderItemIndent)
+		switch {
+		case g.itemOf[i] < 0 && r.group != "":
+			lines = append(lines, indent+" "+
+				styleGroupTitle.Render(padRight(truncate(r.group, g.inner), g.inner))+" ")
+		case g.itemOf[i] < 0:
+			lines = append(lines, "")
+		case g.itemOf[i] == m.folderCursor:
+			label, pad, count := folderPickSegs(*r.item, g.inner-folderItemIndent)
+			lines = append(lines, indent+" "+
+				styleRowSelected.Render(lead+label+pad+count)+" ")
+		default:
+			label, pad, count := folderPickSegs(*r.item, g.inner-folderItemIndent)
+			lines = append(lines, indent+" "+
+				padRight(lead+label+pad+styleTime.Render(count), g.inner)+" ")
+		}
+	}
+
+	// 补白到页脚那行上面。这段空白**是取消区**（点别处取消），所以它是
+	// 有功能的空白，不是凑数。
+	//
+	// 补到 g.bodyH 而不是 g.bodyH-1：页脚要落在**屏幕最后一行**（第
+	// height-1 行），而正文区占的是它上面的 height-1 行。差一行的话页脚会
+	// 停在第 height-2 行，最后那一行空着 —— 而 footerSlot 说的是 height-1，
+	// 于是「看到的那一行」和「点得到的那一行」差一格，右边那格按钮点了没
+	// 反应、底下那一格空行反而能取消。这种错只在选择器上出现，因为只有它
+	// 是自成一屏、不走 layout 的。
+	for len(lines) < g.bodyH {
+		lines = append(lines, "")
+	}
+	if len(lines) > g.bodyH {
+		lines = lines[:g.bodyH]
+	}
+	lines = append(lines, m.footerLine(pickerFooter, styleMuted, m.width))
+	return strings.Join(lines, "\n")
+}
+
+// folderPickWidth 是选择器那一列的目标宽度。
+//
+// 48 是「垃圾邮件  12」这类最长组合加两侧内缩之后还留得下余量的宽度；
+// 窄终端上会退到整幅（见 pickerGeom）。
+const folderPickWidth = 48
+
+// folderItemIndent 是组里的项比组标题多缩进的列数。
+//
+// **差 2 格是硬要求，不是审美偏好。** 差 1 格的时候，「邮箱」和它下面的
+// 「全部」几乎压在同一条左边缘上，隔着一层文字根本读不出谁属谁 ——
+// 侧栏时代这个差也是 2（navTitleIndent 1 对 navItemIndent 3）。把缩进
+// 收成 1 格的对齐改动，在画面上等于把「两级」做没了，而画面上没有任何
+// 东西会报错。判据 TestNav_HasTwoLevels 专门盯着这个差，且要求 ≥2。
+//
+// 缩进**做在底色块之内**（项那一整块仍然从栏边起，只是文字往里让两格）：
+// 缩进做在块外面的话，选中项那块底色会比没选中的窄两格，选中的一瞬间
+// 整行会左右跳一下。
+const folderItemIndent = 2
+
+// pickerFooter 是选择器末尾那行操作提示（左边那一半）。
+//
+// 「点别处取消」不再写在这里：右下角那格 `[ 取消 ]` 把同一件事说清楚了，
+// 而且说得更硬 —— 一句提示只是"说了"，一格按钮是"能按"。原来的长句在窄
+// 终端上还会先被截掉尾巴，恰好把"怎么出去"那半句丢掉。
+const pickerFooter = "↑/↓ 选 · 回车确定 · 点一项直接换"
+
+// pickerGeom 是选择器的几何。
+//
+// ⚠️ 渲染和鼠标命中测试**共用这一份**，理由和 layout 那套一样：两处各算
+// 一遍，改了内缩或者行距就会漂，症状是「点第一项切到了第二项」，而且只在
+// 组标题的个数变化时才错。
+type pickerGeom struct {
+	left, colW, inner int
+	// itemOf[i] 是第 i 行对应的可选项下标；组标题和空行是 -1。
+	// 光标只索引可选项，所以"第几行"和"第几项"必须分开。
+	itemOf []int
+	// start / end 是当前可见的行窗口（[start, end)）。窗口跟着光标走。
+	start, end int
+	bodyH      int
+}
+
+func (m Model) pickerGeom() pickerGeom {
+	rows := m.folderPickRows()
+	var g pickerGeom
+
+	g.itemOf = make([]int, len(rows))
+	cursorRow := 0
+	next := 0
+	for i, r := range rows {
+		if r.item == nil {
+			g.itemOf[i] = -1
+			continue
+		}
+		g.itemOf[i] = next
+		if next == m.folderCursor {
+			cursorRow = i
+		}
+		next++
+	}
+
+	g.bodyH = m.height - 1
+	if g.bodyH < 1 {
+		g.bodyH = 1
+	}
+	// 正文区（标题 + 空行 + 条目 + 取消用的空白）要给页脚上面那 bodyH 行
+	// 装下：标题、空行各占一行，余下的给条目和空白。
+	avail := g.bodyH - 4
 	if avail < 1 {
 		avail = 1
 	}
 
-	// 有些服务商的文件夹多到一屏放不下，所以也要开窗口。
-	start := 0
-	if m.folderCursor >= avail {
-		start = m.folderCursor - avail + 1
+	// 窗口跟着光标走。有些服务商的文件夹多到一屏放不下。
+	g.start = 0
+	if cursorRow >= avail {
+		g.start = cursorRow - avail + 1
 	}
-	end := start + avail
-	if end > len(choices) {
-		end = len(choices)
+	if g.start+avail > len(rows) {
+		g.start = len(rows) - avail
 	}
-
-	lines := []string{
-		styleTitle.Render(truncate("选择文件夹", m.width)),
-		"",
+	if g.start < 0 {
+		g.start = 0
 	}
-	for i := start; i < end; i++ {
-		label := choices[i]
-		if label == "" {
-			label = "（全部文件夹）"
-		}
-		label = truncate("  "+label, m.width-2)
-		if i == m.folderCursor {
-			lines = append(lines, styleSelected.Render(padRight(label, m.width-2)))
-		} else {
-			lines = append(lines, label)
-		}
+	g.end = g.start + avail
+	if g.end > len(rows) {
+		g.end = len(rows)
 	}
 
-	for len(lines) < bodyH {
-		lines = append(lines, "")
+	g.colW = folderPickWidth
+	if g.colW > m.width {
+		g.colW = m.width
 	}
-	lines = append(lines, styleMuted.Render(truncate(
-		"↑/↓ 选择 · 回车确定 · Esc 取消", m.width)))
-	return strings.Join(lines, "\n")
+	if g.colW < m.width {
+		g.left = (m.width - g.colW) / 2
+	}
+	g.inner = g.colW - 2 // 左右各内缩一格，底色块不贴栏边
+	if g.inner < 8 {
+		g.inner = 8
+	}
+	return g
+}
+
+// pickerItemPos 是 pickerItemAt 的逆运算：给一个可选项下标，给出它的
+// 屏幕坐标（取那一格的中间）。
+//
+// 放在生产代码里而不是测试辅助里，是因为它是**这份几何的第二个出口** ——
+// 判据要能"点在自己声明的地方"，而声明必须和渲染共用一份（同 tabChip
+// 那条注释里的道理：各算一遍就会漂，漂了还测不出来）。
+//
+// 返回 ok=false 表示那一项此刻不在可见窗口里。
+func (m Model) pickerItemPos(idx int) (x, y int, ok bool) {
+	g := m.pickerGeom()
+	for i, v := range g.itemOf {
+		if v != idx {
+			continue
+		}
+		if i < g.start || i >= g.end {
+			return 0, 0, false
+		}
+		return g.left + 1 + g.inner/2, i - g.start + 2, true
+	}
+	return 0, 0, false
+}
+
+// pickerItemAt 把选择器里的一个坐标映射到一个可选项下标。
+//
+// ok=false 表示**这一下点的是"别处"**：组标题、空行、留白、页脚、
+// 或者那一列左右的空白。调用方据此取消选择器 —— 也就是 Esc 在鼠标
+// 这一侧的等价物。
+func (m Model) pickerItemAt(x, y int) (int, bool) {
+	g := m.pickerGeom()
+
+	// 行号：第 0 行是标题、第 1 行是空行，之后才开始数 rows。
+	row := y - 2 + g.start
+	if y < 2 || row < 0 || row >= g.end || row >= len(g.itemOf) {
+		return 0, false
+	}
+	// 列：只有那一列的内缩区间算数，点左右的留白等于点"别处"。
+	if x < g.left+1 || x >= g.left+g.colW-1 {
+		return 0, false
+	}
+	if idx := g.itemOf[row]; idx >= 0 {
+		return idx, true
+	}
+	return 0, false
+}
+
+// folderPickSegs 把一项拆成「标签 / 补白 / 计数」三段。
+//
+// 两种渲染（选中与未选中）共用它，于是去样式之后两者**逐字相同** ——
+// 选中项铺底色、未选中项给计数上灰色，都只是在同一串文本上换样式，
+// 高亮一移动文字不会左右跳。
+func folderPickSegs(it navItem, inner int) (label, pad, count string) {
+	if it.unread > 0 {
+		count = fmt.Sprint(it.unread)
+	}
+	label = truncate(it.label, inner)
+	if w := inner - textWidth(label) - textWidth(count); w >= 1 {
+		return label, strings.Repeat(" ", w), count
+	}
+	// 太窄：退回连写，别把标签截成一个字。
+	return truncate(it.label+" "+count, inner), "", ""
 }
 
 // renderStatus 画最底下那行状态栏。
 //
-// width 是这一行可用的列数 —— 双栏时它比终端窄 navW 列，因为左边那条
-// 导航底色要一直贯到底。
+// width 是这一行可用的列数 —— 双栏时它比终端窄「列表栏 + 那条竖线」，
+// 因为竖线要贯到底，不能在这一行断掉（见 withRail）。
 //
 // **只有状态那个词是带色的，其余全是灰。** 上一版是整行一个颜色：连上
 // 服务器的时候，账号、上次同步时间、"接收全部邮件"一起变成绿色，一条
 // 底栏比正文还亮。状态栏是**背景信息**，它的职责是在你扫到它的时候
 // 告诉你一切正常 —— 而"一切正常"不该是一句需要读的高亮。
+//
+// 这一行同时也是**动作栏**（见 action.go）的宿主：左边是状态，右边是
+// 「怎么离开这一屏」。两样东西挤一行是有意为之 —— 状态是背景信息、
+// 出路是操作，它们抢的不是同一个注意力。
 func (m Model) renderStatus(width int) string {
 	if width < 1 {
 		width = 1
 	}
+
+	// 动作栏的位子先留出来，左边这些状态文字按剩下的列数排。反过来的话，
+	// 一条长状态（「上次同步 15:04:05 · someone@very-long-domain.example」）
+	// 就能把出路挤出屏幕，而屏幕上看不出少了什么。
+	full := width
+	width = m.actionRoom(width)
 
 	// 状态词 + 它的颜色。
 	//
@@ -1631,7 +1717,7 @@ func (m Model) renderStatus(width int) string {
 			b.WriteString(styleError.Render(st))
 		}
 	}
-	return b.String()
+	return m.withActions(b.String(), full)
 }
 
 // statusSeg 是状态栏里的一段：文字 + 它要用的样式。

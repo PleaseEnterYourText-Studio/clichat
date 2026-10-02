@@ -74,21 +74,47 @@ func (ix *Index) rebuildPos() {
 	}
 }
 
-// Merge 把新拉到的头部并进索引，返回真正新增的条数。
+// Merge 把新拉到的头部并进索引。
+//
+// 返回 added（真正新增的条数）和 updated（命中已有条目、但把它补全了的条数）。
+// 两个数必须分开报：added 会进日志、还被用来判断「服务端说有信却一封都没
+// 进索引」这个诊断（见 app.syncFolder），把补全也算进去会让那条诊断说谎。
+// 而 updated 是「索引内容变了」的信号，界面要靠它决定重不重绘。
 //
 // 去重按 Message-ID。同一封邮件可能同时出现在 INBOX 和 Sent
 // （比如你把自己 CC 了进去），只保留先到的那个。
-func (ix *Index) Merge(headers []mail.Header) int {
+//
+// ⚠️ 命中已有条目时**要把 UID 补上**。本地发出的一封信是先以「乐观副本」
+// 进来的（见 app.send：发送成功就插一条 UID=0 的记录，免得用户盯着空会话
+// 等一轮轮询）。服务端那份同步回来时 Message-ID 相同，于是走到下面这条
+// 「已经见过」的分支 —— 早先这里只合并已读标志就 continue 了，UID 永远是 0。
+// 后果有两个，都是用户看得见的：
+//
+//   - 界面按 UID == 0 判「本地待同步」（见 tui.renderMessage），于是**每一封
+//     自己发过的信，每次重启都还挂着那个标记**，而且正文也拉不下来
+//     （app.Bodies 对 UID==0 直接跳过）。
+//   - 所有按 (文件夹, UID) 定位的操作 —— 标已读 / 星标 / 移动 —— 都找不到它。
+func (ix *Index) Merge(headers []mail.Header) (added, updated int) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
-	added := 0
 	for _, h := range headers {
 		if h.MessageID != "" {
 			if p, ok := ix.pos[h.MessageID]; ok {
 				// 已经见过。把已读标志并进来 —— 任一副本已读即算已读。
-				if h.Seen {
+				if h.Seen && !ix.Headers[p].Seen {
 					ix.Headers[p].Seen = true
+					updated++
+				}
+				// 只补不覆盖：已经有 UID 的那一份才是权威的（同一封邮件被
+				// 重复拉到时不该把 UID 换掉）。文件夹要跟着 UID 一起补 ——
+				// 乐观副本把 Folder 写死成 "Sent"，而服务端把它归在哪儿
+				// 只有它自己知道；两者对不上的话，按 (文件夹, UID) 的定位
+				// 照样会落空。
+				if ix.Headers[p].UID == 0 && h.UID != 0 {
+					ix.Headers[p].UID = h.UID
+					ix.Headers[p].Folder = h.Folder
+					updated++
 				}
 				continue
 			}
@@ -97,7 +123,7 @@ func (ix *Index) Merge(headers []mail.Header) int {
 		ix.Headers = append(ix.Headers, h)
 		added++
 	}
-	return added
+	return added, updated
 }
 
 // All 返回索引里的全部头部（副本）。

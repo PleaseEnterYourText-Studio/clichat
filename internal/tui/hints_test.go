@@ -67,15 +67,23 @@ func TestListHints_AllMailSurvivesTruncation(t *testing.T) {
 // truncate 切掉，等于没显示。
 //
 // 门槛不是拍出来的一个数，而是从布局倒推出来的：终端窄到 singlePaneWidth
-// 就降级成单栏，所以最坏的情况是「刚好还在双栏」的 singlePaneWidth 列
-// 减去侧栏 navWidth。再留 1 列余量，免得以后改一个字就顶破 ——
-// 而顶破的表现是「末尾的键悄悄消失」，很难注意到。
+// 就降级成单栏，所以最坏的情况是「刚好还在双栏」的 singlePaneWidth 列。
+//
+// ⚠️ 这一行在**列表模式**下横跨整个内容区（它是常驻提示，不是输入框），
+// 所以它能用的列数是「屏宽 - 列表栏 - 那条分隔竖线」；再留 1 列余量，免得
+// 以后改一个字就顶破 —— 而顶破的表现是「末尾的键悄悄消失」，很难注意到。
 //
 // 把预算绑到布局常量上，是因为它**真的会被布局改动影响**：侧栏从 12 列
 // 加宽到 14 列之后，这一行少了 2 列，末尾的「q 退出」当场被切掉，而当时
 // 这条判据里写的是个硬编码的 95，一点没红。
 func TestListHints_FitsInOneLine(t *testing.T) {
-	budget := singlePaneWidth - navWidth - 1
+	// 用真实的布局算，不手写算式 —— 列表栏宽是 m.listWidth()（随屏宽
+	// 变化的 22..30），硬编码一个数等于把这条判据和布局脱钩。
+	m, _ := newFeatureModel(t)
+	m, _ = update(m, tea.WindowSizeMsg{Width: singlePaneWidth, Height: 24})
+	l := m.measureLayout()
+
+	budget := m.width - l.listW - 1
 	if w := lipgloss.Width(listHints()); w > budget {
 		t.Errorf("底部提示宽 %d 列，超过最窄双栏终端下的 %d 列，末尾的键会被截掉:\n%s",
 			w, budget, listHints())
@@ -90,14 +98,25 @@ func TestListHints_FitsInOneLine(t *testing.T) {
 // 实测过：这一版之前，100 列的终端下末尾的「q 退出」从来没显示出来
 // （用户看不到怎么退出），而所有只量 listHints() 的判据全是绿的。
 // 判据要量用户看得见的那一行，不是函数返回的那一串。
+//
+// ⚠️ 至少要在**最窄的那档双栏**（singlePaneWidth）上量一次。
+//
+// 只量默认宽度（100 列）是不够的：正文栏宽 = 屏宽 - 列表栏 - 1，100 列和
+// 96 列差着 3 列，正好够让「q 退出」在最窄那档被吃掉、却在这一档活着。
+// 同一行提示在两个宽度下一个看得见一个看不见 —— 只守一个宽度，等于把
+// 判据的结论绑在了「夹具恰好是 100 列」这件事上。
 func TestListHints_LastKeySurvivesOnScreen(t *testing.T) {
-	m, _ := newFeatureModel(t)
 	last := hintKeys[len(hintKeys)-1].key
 
-	row := plainText(viewLines(m)[m.measureLayout().inputTop+1])
-	if !strings.Contains(row, last+" ") {
-		t.Errorf("底部这一行里看不到最后一个键 %q（它被终端宽度截掉了）：\n%q",
-			last, row)
+	for _, width := range []int{singlePaneWidth, 100, 140} {
+		m, _ := newFeatureModel(t)
+		m, _ = update(m, tea.WindowSizeMsg{Width: width, Height: 30})
+
+		row := plainText(viewLines(m)[m.measureLayout().inputTop+1])
+		if !strings.Contains(row, last+" ") {
+			t.Errorf("宽 %d：底部这一行里看不到最后一个键 %q（被终端宽度截掉了）：\n%q",
+				width, last, row)
+		}
 	}
 }
 
