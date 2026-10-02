@@ -62,7 +62,7 @@ var helpSections = []helpSection{
 	{
 		title: "通用",
 		items: []helpItem{
-			{"?  或  F1", "打开 / 关闭本页"},
+			{"?", "打开 / 关闭本页（F1 同）"},
 			{"Esc", "取消当前操作"},
 			{"Ctrl+C", "随时退出"},
 		},
@@ -81,12 +81,77 @@ var helpSections = []helpSection{
 	},
 }
 
+// hintKey 是底部常驻提示里的一项。
+//
+// short 留空时从 helpSections 的描述里派生出短标签；给值时用于
+// 帮助页描述偏长、底部这一行放不下的情况。
+type hintKey struct {
+	key   string
+	short string
+}
+
+// hintKeys 是底部常驻提示要展示的键与顺序。
+//
+// 只列最常用的 —— 这一行要挤进一行终端宽度，塞满反而什么都看不清。
+// 完整清单在帮助页（按 ? 打开）。**这里的键必须都在 helpSections 里**，
+// 否则等于告诉用户一个不存在的功能；TestListHints_EveryHintedKeyExistsInHelp
+// 守着这条，TestListHints_FitsInOneLine 守着宽度上限。
+//
+// **键名和文案都从这里/helpSections 来，界面上不再有第三份。**
+// 以前这里是一整条硬编码字符串，于是加键时只改 helpSections、忘了改它，
+// 底部就一直少一个键 —— 本轮新增的 a（接收全部邮件）就是这么丢的，
+// 而未开启时状态栏也不显示它，用户完全看不到这个功能存在。
+//
+// 调整时**只改这一个切片**，并留意别顶到宽度上限：
+// 100 列是常见终端宽度，留些余量给以后的文案改动。
+var hintKeys = []hintKey{
+	{"?", "帮助"},
+	{"n", "新建"},
+	{"/", ""},
+	{"a", "全部邮件"},
+	{"Tab", "文件夹"},
+	{"回车", "打开"},
+	{"d", ""},
+	{"u", "未读"},
+	{"q", ""},
+}
+
 // listHints 是列表模式底部常驻的快捷键提示。
 //
-// 只放最常用的几个：这一行会被终端宽度截断，塞满反而什么都看不清。
-// 完整清单在 help 页（按 ? 打开）。
+// 文案从 helpSections 派生，不在这里另写一份 —— 两处各写各的，迟早有
+// 一处继续骗人，而且骗的是最该被发现的地方：用户每天看到的那行。
 func listHints() string {
-	return "  ? 帮助 · n 新建 · / 搜索 · Tab 文件夹 · 回车 打开 · d 删除 · q 退出"
+	// 跨全部组构建映射：? 在「通用」里，不在会话列表那组。
+	desc := map[string]string{}
+	for _, s := range helpSections {
+		for _, it := range s.items {
+			if _, ok := desc[it.label]; !ok {
+				desc[it.label] = it.desc
+			}
+		}
+	}
+
+	parts := make([]string, 0, len(hintKeys))
+	for _, h := range hintKeys {
+		label := h.short
+		if label == "" {
+			d, ok := desc[h.key]
+			if !ok {
+				// hintKeys 里写了个 helpSections 中不存在的键。
+				// 不静默跳过：那就是「提示里有个不存在的功能」，
+				// 比少一个键更坑人。测试会拦住这种情况。
+				continue
+			}
+			// 描述可能很长（帮助页那列有宽度可用，这一行没有）：
+			// 在第一个分隔符处取前半句，「接收全部邮件：连历史…」→「接收全部邮件」。
+			if i := strings.IndexAny(d, "：:，,（("); i > 0 {
+				d = d[:i]
+			}
+			label = d
+		}
+		parts = append(parts, h.key+" "+label)
+	}
+	return "  " + strings.Join(parts, " · ")
 }
 
 // helpLines 把帮助内容摊平成待渲染的行。

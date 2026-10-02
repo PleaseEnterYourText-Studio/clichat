@@ -330,3 +330,60 @@ func TestRender_NeverPanics(t *testing.T) {
 		r.Render(&buf) // 只要求不 panic
 	}
 }
+
+// 服务端不给 UIDNEXT 时要在报告里说一声。
+//
+// 这不是错误（客户端有兜底），但它能解释「为什么界面空空」——
+// 126 就是这种情况，不点出来的话用户只能看到 UIDNext=0 然后自己猜。
+func TestRender_NotesMissingUIDNext(t *testing.T) {
+	f := seeded(3, 0)
+	f.SimulateNoUIDNext()
+
+	r := Run(stubClient{Fake: f}, Options{})
+	var buf bytes.Buffer
+	r.Render(&buf)
+	out := buf.String()
+
+	if !strings.Contains(out, "UIDNext=0") {
+		t.Errorf("报告里该显示 UIDNext=0:\n%s", out)
+	}
+	if !strings.Contains(out, "UIDNEXT") {
+		t.Errorf("UIDNEXT 缺失时该有一句说明，否则用户不知道 0 是什么意思:\n%s", out)
+	}
+}
+
+// 有信却一条都抽不到时，必须把可能的原因说出来。
+//
+// 这是用户实际遇到的现象：配好了账号、能登录、界面就是空的。
+// 报告如果只说「拿到 0 条」，用户会去怀疑授权码 —— 那是错的方向。
+func TestRender_ExplainsEmptySampleWhenInboxHasMail(t *testing.T) {
+	f := mail.NewFake()
+	// 塞一封 200 天前的信：在 INBOX 里，但会被首次同步的 90 天窗口裁掉。
+	f.AddMessage("INBOX", mail.Header{
+		MessageID: "<old@x>", From: "a@x.com", Subject: "很久以前",
+		Date: time.Now().AddDate(0, 0, -200),
+	}, "正文")
+
+	// 让 Headers 返回空，模拟「窗口把它裁掉了」造成的效果。
+	sc := stubClient{Fake: f}
+	sc.headersErr = nil
+	r := Run(emptyHeaders{sc}, Options{})
+	var buf bytes.Buffer
+	r.Render(&buf)
+	out := buf.String()
+
+	if !strings.Contains(out, "一条都没抽到") {
+		t.Errorf("该点出「有信但抽不到」这件事:\n%s", out)
+	}
+	if !strings.Contains(out, "接收全部邮件") {
+		t.Errorf("该告诉用户按 a 可以连历史一起拉:\n%s", out)
+	}
+}
+
+// emptyHeaders 让 Headers 返回空切片但不报错 ——
+// 模拟「拉取成功、结果被筛掉了」这条静默路径。
+type emptyHeaders struct{ stubClient }
+
+func (e emptyHeaders) Headers(string, uint32, uint32) ([]mail.Header, error) {
+	return nil, nil
+}

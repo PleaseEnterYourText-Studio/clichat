@@ -32,6 +32,15 @@ import (
 // 第一步产出 docs/images/raw/*.ansi，第二步把它们渲染成 docs/images/*.png
 // （用 charmbracelet/freeze 出 SVG，再用 Edge 无头模式栅格化 —— 为什么
 // 要绕这一圈，见 tools/render-screenshots.py 顶部的说明）。
+//
+// **每次重出，四张 PNG 都会变，即使画面内容没动。** 状态栏那一行的
+// 「上次同步 HH:MM:SS」来自 model.go 里的 time.Now()，它走的是生产代码
+// 路径，而这里驱动的就是生产代码 —— 于是时间戳跟着当下走，四张里每张
+// 都带着它。（消息日期是固定的，见 newSampleModel 里的 base；只有这个
+// 同步时间没固定。）要真正固定得给 Model 注入一个时钟，还没做。
+//
+// 所以提交时别惊讶于 01-chat / 03-search 也进了 diff —— 那是几个数字，
+// 不是版式变了。（渲染本身是可复现的：ANSI 不变，PNG 就不变。）
 func TestGenerateScreenshots(t *testing.T) {
 	if os.Getenv("CLICHAT_SCREENSHOTS") != "1" {
 		t.Skip("需要 CLICHAT_SCREENSHOTS=1 才跑（见本文件顶部注释）")

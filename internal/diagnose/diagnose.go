@@ -224,8 +224,14 @@ func (r *Report) Render(w io.Writer) {
 		fmt.Fprintln(w, "常见原因：授权码填错、服务商没开 IMAP、网络到不了该端口。")
 		return
 	}
-	fmt.Fprintf(w, "   ✓ INBOX 共 %d 封，UIDNext=%d，UIDValidity=%d\n\n",
+	fmt.Fprintf(w, "   ✓ INBOX 共 %d 封，UIDNext=%d，UIDValidity=%d\n",
 		r.Inbox.Messages, r.Inbox.UIDNext, r.Inbox.UIDValidity)
+	if r.Inbox.UIDNext == 0 {
+		// 这不是错误，但值得说一句：客户端拿不到 UIDNEXT 时要走兜底，
+		// 否则会被误判成「文件夹是空的」。网易 126 就是这样。
+		fmt.Fprintln(w, "     · 服务端没返回 UIDNEXT（照常同步，客户端会自己兜底）")
+	}
+	fmt.Fprintln(w)
 
 	// ②
 	fmt.Fprintf(w, "② 拉最近 %d 条头部（只报形状，不报内容）\n", sampleSize)
@@ -240,6 +246,15 @@ func (r *Report) Render(w io.Writer) {
 	if s.Total > 0 {
 		fmt.Fprintf(w, "     有日期 %d/%d · 有 References %d/%d · 主题为空 %d\n",
 			s.WithDate, s.Total, s.WithRefs, s.Total, s.EmptySubject)
+	}
+	// 服务端说有信、却一条都拿不回来 —— 这是「界面空着但看不出原因」
+	// 那类故障的信号。不点出来的话，用户只会看到「拿到 0 条」，
+	// 然后去怀疑自己授权码填错了。
+	if s.Total == 0 && r.Inbox.Messages > 0 {
+		fmt.Fprintf(w, "   ! INBOX 里有 %d 封，却一条都没抽到。可能的原因：\n", r.Inbox.Messages)
+		fmt.Fprintln(w, "     · 邮件都早于首次同步的时间窗口（默认 90 天）——界面里按 a 打开")
+		fmt.Fprintln(w, "       「接收全部邮件」即可连历史一起拉；")
+		fmt.Fprintln(w, "     · 或服务商对这个账号的 FETCH 有限制。")
 	}
 	fmt.Fprintln(w)
 

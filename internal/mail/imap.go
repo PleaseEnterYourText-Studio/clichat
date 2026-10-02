@@ -25,16 +25,35 @@ func (c *liveClient) Folder(name string) (Folder, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_, mbox, err := c.selectLocked(name, true)
+	real, mbox, err := c.selectLocked(name, true)
 	if err != nil {
 		return Folder{}, err
 	}
 	return Folder{
 		Name:        mbox.Name,
 		UIDValidity: mbox.UidValidity,
-		UIDNext:     mbox.UidNext,
+		UIDNext:     c.uidNextLocked(real, mbox.UidNext),
 		Messages:    mbox.Messages,
 	}, nil
+}
+
+// uidNextLocked 拿到文件夹的 UIDNEXT，SELECT 没给时用 STATUS 补查。
+// 调用方必须已持有 c.mu。
+//
+// 拿不到就返回 0，由 fetchRange 退化成 `from:*` 兜底 —— 拉到的邮件可能
+// 多一些，但不会整个文件夹漏掉。
+//
+// 注意 STATUS 用在「已选中的邮箱」上，RFC 3501 并不鼓励，所以失败要容忍：
+// 这只是个优化（能让「只拉最近 N 封」的裁剪算得更准），不是必需品。
+func (c *liveClient) uidNextLocked(mailbox string, fromSelect uint32) uint32 {
+	if fromSelect > 0 {
+		return fromSelect
+	}
+	st, err := c.conn.Status(mailbox, []imap.StatusItem{imap.StatusUidNext})
+	if err != nil || st == nil {
+		return 0
+	}
+	return st.UidNext
 }
 
 // Folders 列出服务端上实际存在的文件夹。
@@ -58,8 +77,7 @@ func (c *liveClient) Folders() ([]string, error) {
 
 // Headers 拉取 UID 落在 [from, to] 区间内的邮件头部。
 //
-// to 传 0 表示「到最新」—— 这时会用 SELECT 返回的 UIDNext-1 兜底，
-// 因为 IMAP 的 "*" 在库里的表达方式容易踩坑，不如自己算准。
+// to 传 0 表示「到最新」。
 func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -69,22 +87,13 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 		return nil, err
 	}
 
-	high := to
-	if high == 0 {
-		if mbox.UidNext == 0 {
-			return nil, nil // 空文件夹
-		}
-		high = mbox.UidNext - 1
-	}
-	if from == 0 {
-		from = 1
-	}
-	if high < from {
+	lo, hi, ok := fetchRange(from, to, mbox.UidNext)
+	if !ok {
 		return nil, nil
 	}
 
 	seqset := new(imap.SeqSet)
-	seqset.AddRange(from, high)
+	seqset.AddRange(lo, hi)
 
 	section := headerSection()
 	items := []imap.FetchItem{
@@ -98,7 +107,12 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	done := make(chan error, 1)
 	go func() { done <- c.conn.UidFetch(seqset, items, fetched) }()
 
-	out := make([]Header, 0, high-from+1)
+	// hi 为 0 表示「到最新」，条数没法预估，给个合理的起始容量。
+	capHint := 16
+	if hi >= lo {
+		capHint = int(hi-lo) + 1
+	}
+	out := make([]Header, 0, capHint)
 	for msg := range fetched {
 		out = append(out, headerFromMessage(msg, folder, section))
 	}
@@ -108,6 +122,43 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 
 	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out, nil
+}
+
+// fetchRange 算出一次头部拉取要用的 UID 区间。
+//
+// to 为 0 表示「到最新」：能拿 SELECT 给的 UIDNEXT 算准上界就算，
+// 算不出来就让 hi 保持 0 —— 上层把它渲染成 `from:*`，也就是
+// 「一直到最大的 UID」。ok 为 false 表示这个区间是空的（没有新邮件）。
+//
+// **这里踩过一个坑，别再踩回去。** 原先的写法是「uidNext == 0 就直接
+// 返回空切片」，也就是把「服务端没告诉我们上界」当成了「文件夹是空的」。
+// 网易 126 的 EXAMINE 响应里恰好没有 UIDNEXT，于是它的收件箱永远同步
+// 不到一封邮件 —— 而它其实有几千封。见 fetchRange 的单元测试。
+//
+// 抽成独立函数是为了让 Fake 和真实客户端共用同一份边界逻辑。各写一份的话，
+// 「服务端没给 UIDNEXT」这种只在真实世界里出现的情况在 Fake 里永远不会
+// 发生，测试也就永远测不出来。
+func fetchRange(from, to, uidNext uint32) (lo, hi uint32, ok bool) {
+	if from == 0 {
+		from = 1
+	}
+
+	hi = to
+	switch {
+	case hi != 0:
+		// 调用方给了明确上界，照用。
+	case uidNext > 0:
+		hi = uidNext - 1
+	default:
+		// 上界未知。交给服务端用 `*` 自己定 —— 宁可多拉一些
+		// （重复的会被 Message-ID 去重挡掉），也不能漏掉整个文件夹。
+		return from, 0, true
+	}
+
+	if hi < from {
+		return from, hi, false
+	}
+	return from, hi, true
 }
 
 // headerFromMessage 把一条 IMAP FETCH 结果转成 Header。

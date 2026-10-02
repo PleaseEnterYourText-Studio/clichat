@@ -167,8 +167,19 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		changed = true
 	}
 
+	// firstSync 判断「这是这个文件夹第一次真正拉东西」。
+	//
+	// 注意条件不是 !known 而是 !known || st.LastUID == 0：文件夹状态存在
+	// 但游标还停在 0，说明上一次同步一条都没拉进来（目录状态是先写下的）。
+	// 那是「还没同步过」，不是「同步过了」。
+	//
+	// 这个判断必须同时管两件事 —— 拉取起点、以及要不要按天数裁 ——
+	// 否则会出现「起点按首次算、裁剪按非首次算」的组合：本该只拉 90 天的
+	// 冷启动变成整份历史拉下来，用户会突然等很久。
+	firstSync := !known || st.LastUID == 0
+
 	var from uint32
-	if !known || st.LastUID == 0 {
+	if firstSync {
 		// 首次同步不拉全部历史：按封数先划一道线。
 		// 「接收全部邮件」模式下这条线不划。
 		from = 1
@@ -183,7 +194,7 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-	if !known && !a.cfg.Sync.AllMail {
+	if firstSync && !a.cfg.Sync.AllMail {
 		headers = a.withinInitialWindow(headers)
 	}
 
@@ -205,11 +216,23 @@ func (a *App) syncFolder(folder string) (bool, error) {
 
 	// 首拉要几十秒（实测 QQ 邮箱约 39ms/条），界面上只会显示「同步中…」。
 	// 用户很容易以为卡死了然后退出 —— 日志里至少能留下「跑到哪一步了」。
-	if !known {
+	if firstSync {
 		log.Printf("同步 %s: 首次同步，拉取 UID %d 起，%d 条，游标推进到 %d",
 			folder, from, added, last)
 	} else if added > 0 {
 		log.Printf("同步 %s: 新增 %d 条，游标推进到 %d", folder, added, last)
+	}
+
+	// 服务端说有信，我们却一封都没拿到 —— 这是「界面空着但看不出原因」
+	// 的那类故障，必须留一条线索。真发生过两次：
+	//   ① 服务端不给 UIDNEXT 时被误判成空文件夹（见 mail.fetchRange）；
+	//   ② 收件箱里只有 90 天以前的信，被首次同步的时间窗口整批裁掉。
+	// 两种都表现为「配好了却一封信都看不到」，而日志里一个字都没有。
+	if added == 0 && f.Messages > 0 {
+		log.Printf("同步 %s: 服务端上有 %d 封，本次一条都没进索引（拉取区间 %d 起，"+
+			"首次同步=%v，非全量模式时会按 %d 天裁剪）—— 若是历史邮件，"+
+			"用「接收全部邮件」重新拉",
+			folder, f.Messages, from, firstSync, a.cfg.Sync.InitialDays)
 	}
 	return changed, nil
 }

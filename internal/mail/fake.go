@@ -20,6 +20,22 @@ type Fake struct {
 	folders map[string]*fakeFolder
 	sent    []Outgoing
 	sendErr error
+
+	// noUIDNext 为真时，Folder 报告 UIDNext=0，模拟「SELECT 响应里
+	// 没有 UIDNEXT」的服务端。
+	//
+	// 网易 126 就是这样：它的 EXAMINE 不给 UIDNEXT，而真实代码曾经
+	// 把这个当成「文件夹是空的」，于是收件箱永远同步不出邮件。
+	// 这个开关存在的唯一意义，就是让那条分支在测试里真的被执行到 ——
+	// 让 Fake 永远算得出 UIDNEXT 的话，那个 bug 谁都测不出来。
+	noUIDNext bool
+}
+
+// SimulateNoUIDNext 让这个 Fake 表现得像不返回 UIDNEXT 的服务端。
+func (f *Fake) SimulateNoUIDNext() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.noUIDNext = true
 }
 
 type fakeFolder struct {
@@ -98,36 +114,59 @@ func (f *Fake) folder(name string) *fakeFolder {
 }
 
 // Folder 选中一个文件夹并返回它的状态。
+// Folder 返回文件夹状态。
+//
+// UIDNext 在 noUIDNext 模式下报 0 —— 真实客户端这时会去 STATUS 补查，
+// 补不到就交给 `from:*` 兜底。Fake 直接把 0 交出去，让上层走同一条兜底路径。
 func (f *Fake) Folder(name string) (Folder, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	fl := f.folder(name)
+	uidNext := fl.nextUID + 1
+	if f.noUIDNext {
+		uidNext = 0
+	}
 	return Folder{
 		Name:        fl.name,
 		UIDValidity: fl.uidValidity,
-		UIDNext:     fl.nextUID + 1,
+		UIDNext:     uidNext,
 		Messages:    uint32(len(fl.messages)),
 	}, nil
 }
 
 // Headers 拉取 UID 落在 [from, to] 区间内的邮件头部。to 为 0 表示到最新。
+//
+// 边界逻辑走的是和真实客户端同一个 fetchRange —— 各写一份的话，
+// 「上界未知」这类只在真实世界里出现的情况在 Fake 里永远不发生。
 func (f *Fake) Headers(folder string, from, to uint32) ([]Header, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	fl := f.folder(folder)
-	high := to
-	if high == 0 {
-		high = fl.nextUID
+
+	uidNext := fl.nextUID + 1
+	if f.noUIDNext {
+		uidNext = 0
 	}
-	if from == 0 {
-		from = 1
+	lo, hi, ok := fetchRange(from, to, uidNext)
+	if !ok {
+		return nil, nil
+	}
+	// 上界未知时按「到最新」处理。
+	if hi == 0 {
+		maxUID := uint32(0)
+		for uid := range fl.messages {
+			if uid > maxUID {
+				maxUID = uid
+			}
+		}
+		hi = maxUID
 	}
 
 	out := make([]Header, 0, len(fl.messages))
 	for uid, m := range fl.messages {
-		if uid >= from && uid <= high {
+		if uid >= lo && uid <= hi {
 			out = append(out, m.header)
 		}
 	}
