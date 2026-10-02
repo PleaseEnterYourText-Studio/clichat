@@ -66,6 +66,7 @@ freeze 认 `48;5;N`（→ `<rect fill=.../>`）和 `48;2;r;g;b`，但**完全不
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -84,6 +85,10 @@ EDGE_CANDIDATES = [
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    # macOS：--headless=new 在 Chrome / Edge 的 mac 版上都能用，
+    # 路径是 .app 里的可执行文件本体，不是 .app 目录。
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ]
 
 
@@ -95,19 +100,20 @@ def find_edge():
 
 
 def find_freeze():
-    """找 freeze 可执行文件。"""
-    for name in ("freeze.exe", "freeze"):
-        # PATH 上
-        for d in os.environ.get("PATH", "").split(os.pathsep):
-            cand = os.path.join(d, name)
-            if os.path.isfile(cand):
-                return cand
+    """找 freeze 可执行文件。
+
+    按「PATH → GOPATH/bin」的顺序找，并且**不加 .exe 后缀去 Windows 上
+    碰运气** —— 用 shutil.which 交给系统判断可执行位，省得在 mac 上把
+    `freeze.exe` 当文件名去找。
+    """
+    if p := shutil.which("freeze"):
+        return p
+
     # GOPATH/bin 兜底（go install 的默认落点）
     gopath = os.environ.get("GOPATH") or os.path.join(os.path.expanduser("~"), "go")
     for sub in ("bin", "bin-freeze-old"):
-        cand = os.path.join(gopath, sub, "freeze.exe")
-        if os.path.isfile(cand):
-            return cand
+        if p := shutil.which("freeze", path=os.path.join(gopath, sub)):
+            return p
     return None
 
 

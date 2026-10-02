@@ -11,3 +11,8 @@
 # Go
 *.test
 *.out
+
+# 截图的中间产物（.ansi 由 TestGenerateScreenshots 产出、.svg 由
+# tools/render-screenshots.py 产出）。真正要提交的是 docs/images/*.png，
+# 这两层随时能重新生成，而且 .svg 每个都有 300 多 KB。
+docs/images/raw/

@@ -16,6 +16,12 @@ func (m Model) View() string {
 		return "正在启动 clichat…"
 	}
 
+	// Zen 是一套**平级**的排版，不是 Normal 的参数化版本。
+	// 判定条件在 zenActive 里：layout 选了 Zen **且**当前在会话里。
+	if m.zenActive() {
+		return m.viewZen()
+	}
+
 	switch m.mode {
 	case modeUnlock:
 		return m.viewUnlock()

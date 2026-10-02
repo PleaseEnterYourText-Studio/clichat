@@ -79,6 +79,8 @@ func TestKeyMsg_ProducesRealKeys(t *testing.T) {
 		{"ctrl+down", tea.KeyCtrlDown},
 		{"ctrl+r", tea.KeyCtrlR},
 		{"ctrl+u", tea.KeyCtrlU},
+		{"f1", tea.KeyF1},
+		{"f2", tea.KeyF2},
 	}
 	for _, c := range cases {
 		got := keyMsg(c.in)

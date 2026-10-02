@@ -185,7 +185,61 @@ func headingTierFor(level int) int {
 //
 // width 是可用显示宽度。折行在这里就定下来，之后才上色，所以颜色不会
 // 污染宽度计算。
+// mdTheme 是 Markdown 渲染用的那组颜色。
+//
+// 抽出来是因为 Zen 需要一套更克制的配色。Normal 用紫 / 蓝 / 琥珀区分标题
+// 层级和代码，那是「信息密度优先」的选择；Zen 的整张脸只有三档灰，正文里
+// 突然冒出一个紫色标题，整个界面就散了。
+//
+// 解析和折行两边完全共用 —— 分家的只有「最后上什么色」这一步。这也是
+// 为什么不开一份独立的 Zen renderMarkdown：折行、表格对齐、OSC 8 那几个
+// 坑踩一次就够了，踩两遍必然只修好一边。
+type mdTheme struct {
+	Code       lipgloss.Color
+	Quote      lipgloss.Color
+	HeadStrong lipgloss.Color
+	HeadMid    lipgloss.Color
+	Link       lipgloss.Color
+	Rule       lipgloss.Color
+}
+
+// defaultMDTheme 是 Normal 模式的配色。数值和主题化之前逐字节一致 ——
+// 抽主题不该顺手改 Normal 的样子。
+var defaultMDTheme = mdTheme{
+	Code:       "180",
+	Quote:      "245",
+	HeadStrong: "141",
+	HeadMid:    "110",
+	Link:       "45",
+	Rule:       "240",
+}
+
+// zenMDTheme 是 Zen 的配色：**去掉色相，只留明度**。
+//
+// 标题不再靠紫 / 蓝区分层级，改用「比正文更亮 + 加粗」—— 层级还在，
+// 颜色没了。代码块压暗一档当成「引文」处理，靠上下留白圈出来。
+// 只有链接保留一点强调色：它是唯一一个「点得动」的东西，值得破例。
+var zenMDTheme = mdTheme{
+	// 代码块压暗到 243。246 试过，和正文几乎分不出来 —— 代码块在终端里
+	// 没有背景块可用（Zen 不要大面积底色），明度是唯一能用的区分手段。
+	Code:       "243",
+	Quote:      "242",
+	HeadStrong: "255",
+	HeadMid:    "252",
+	Link:       "109",
+	Rule:       "237",
+}
+
+// renderMarkdown 是 Normal 模式的入口，签名保持不变。
+//
+// 不改签名是为了不动那七百多行 markdown 测试 —— 它们验的是解析和折行，
+// 和配色无关，不该因为 Zen 要换一套颜色就跟着改一遍。
 func renderMarkdown(src string, width int) []string {
+	return renderMarkdownThemed(src, width, defaultMDTheme)
+}
+
+// renderMarkdownThemed 是带主题的渲染。
+func renderMarkdownThemed(src string, width int, th mdTheme) []string {
 	if width < 1 {
 		width = 1
 	}
@@ -202,7 +256,7 @@ func renderMarkdown(src string, width int) []string {
 			for j < len(lines) && lines[j].kind == blockTableRow {
 				j++
 			}
-			out = append(out, renderTableBlock(lines[i:j], width)...)
+			out = append(out, renderTableBlock(lines[i:j], width, th)...)
 			i = j
 			continue
 		}
@@ -216,7 +270,8 @@ func renderMarkdown(src string, width int) []string {
 			//
 			// width 是调用方给的**可用**宽度（renderMessage 传的是 width-4，
 			// 左右各留了缩进），所以铺满它不会顶破版面。
-			out = append(out, styleMDRule.Render(strings.Repeat("─", width)))
+			out = append(out, lipgloss.NewStyle().Foreground(th.Rule).
+				Render(strings.Repeat("─", width)))
 			i++
 			continue
 		}
@@ -226,7 +281,7 @@ func renderMarkdown(src string, width int) []string {
 			continue
 		}
 		for _, row := range wrapLine(ln, width) {
-			out = append(out, renderRow(row))
+			out = append(out, renderRow(row, th))
 		}
 		i++
 	}
@@ -968,10 +1023,10 @@ func wrapLine(ln mdLine, width int) [][]span {
 }
 
 // renderRow 把一行片段上色。
-func renderRow(spans []span) string {
+func renderRow(spans []span, th mdTheme) string {
 	var b strings.Builder
 	for _, s := range spans {
-		b.WriteString(styleSpan(s))
+		b.WriteString(styleSpan(s, th))
 	}
 	return b.String()
 }
@@ -1065,7 +1120,7 @@ const tableMinCol = 4
 //     最宽的那列逐步收回，短列不会被无谓地截。
 //
 // rows[0] 是表头，其余是数据行。
-func renderTableBlock(rows []mdLine, width int) []string {
+func renderTableBlock(rows []mdLine, width int, th mdTheme) []string {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -1109,7 +1164,7 @@ func renderTableBlock(rows []mdLine, width int) []string {
 	// 「一格一格铺开」，交给普通折行。表格是为「看对齐」而存在的；
 	// 塞不下的时候，对它的要求只剩「一格都别丢」这一条。
 	if sumInts(w) > avail {
-		return wrapTableAsParagraphs(rows, width)
+		return wrapTableAsParagraphs(rows, width, th)
 	}
 
 	var out []string
@@ -1134,7 +1189,7 @@ func renderTableBlock(rows []mdLine, width int) []string {
 			if j < len(cells) {
 				cell = truncateSpans(cells[j], w[j])
 			}
-			b.WriteString(renderRow(cell))
+			b.WriteString(renderRow(cell, th))
 			b.WriteString(strings.Repeat(" ", w[j]-spansWidth(cell)))
 		}
 		out = append(out, strings.TrimRight(b.String(), " "))
@@ -1167,7 +1222,7 @@ func sumInts(xs []int) int {
 //
 // 丢了对齐，但一格内容都不丢，而且**必定**能折进给定宽度 —— 表格渲染
 // 那条路给不了这个保证（列宽最多收到 tableMinCol，再窄就收不动了）。
-func wrapTableAsParagraphs(rows []mdLine, width int) []string {
+func wrapTableAsParagraphs(rows []mdLine, width int, th mdTheme) []string {
 	var out []string
 	for _, r := range rows {
 		var spans []span
@@ -1178,14 +1233,14 @@ func wrapTableAsParagraphs(rows []mdLine, width int) []string {
 			spans = append(spans, c...)
 		}
 		for _, row := range wrapLine(mdLine{spans: spans}, width) {
-			out = append(out, renderRow(row))
+			out = append(out, renderRow(row, th))
 		}
 	}
 	return out
 }
 
 // styleSpan 给一段文本上色。
-func styleSpan(s span) string {
+func styleSpan(s span, th mdTheme) string {
 	// ⚠️ 链接走单独一条路，**忽略其它所有属性**。
 	//
 	// 不给它加粗/下划线不是偷懒：styles.go 里 hyperlink 的注释记着那个坑 ——
@@ -1193,16 +1248,16 @@ func styleSpan(s span) string {
 	// 序列里把它切碎，链接就变成「看着正常但点不动」。规矩取最窄的一条：
 	// 链接只上前景色。
 	if s.attrs&attrLink != 0 {
-		return styleLink.Render(hyperlink(s.url, s.text))
+		return lipgloss.NewStyle().Foreground(th.Link).Render(hyperlink(s.url, s.text))
 	}
 	if s.attrs == 0 {
 		return s.text
 	}
-	return markdownStyle(s.attrs).Render(s.text)
+	return markdownStyle(s.attrs, th).Render(s.text)
 }
 
 // markdownStyle 把样式位翻成 lipgloss 样式。
-func markdownStyle(a attrs) lipgloss.Style {
+func markdownStyle(a attrs, th mdTheme) lipgloss.Style {
 	st := lipgloss.NewStyle()
 	if a&attrBold != 0 {
 		st = st.Bold(true)
@@ -1214,10 +1269,10 @@ func markdownStyle(a attrs) lipgloss.Style {
 		st = st.Strikethrough(true)
 	}
 	if a&attrCode != 0 {
-		st = st.Foreground(lipgloss.Color("180"))
+		st = st.Foreground(th.Code)
 	}
 	if a&attrQuote != 0 {
-		st = st.Foreground(lipgloss.Color("245"))
+		st = st.Foreground(th.Quote)
 	}
 	// 标题分级：越显眼越靠前，后面覆盖前面的颜色。
 	//
@@ -1225,11 +1280,14 @@ func markdownStyle(a attrs) lipgloss.Style {
 	// 样式一旦带上下划线之类的，lipgloss 会给每个字符单独套一串 SGR。
 	// 加粗本来就是每字符一串，标题不裹 OSC 8，所以这里安全；
 	// 但也没必要多叠属性，颜色加粗两项足够表达层级。
+	//
+	// Zen 那套主题里 HeadStrong / HeadMid 都是灰（没有色相），层级只剩
+	// 「亮一档 + 加粗」。这是刻意的：Zen 用明度而不是色相表达层级。
 	switch headingTier(a) {
 	case tierStrong:
-		st = st.Bold(true).Foreground(lipgloss.Color("141"))
+		st = st.Bold(true).Foreground(th.HeadStrong)
 	case tierMid:
-		st = st.Bold(true).Foreground(lipgloss.Color("110"))
+		st = st.Bold(true).Foreground(th.HeadMid)
 	case tierPlain:
 		st = st.Bold(true)
 	}

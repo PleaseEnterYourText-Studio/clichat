@@ -76,6 +76,13 @@ type Model struct {
 
 	mode mode
 
+	// layout 是**视觉**维度，和 mode（交互状态）正交。
+	//
+	// 两者拆开而不是合成一个枚举的理由见 zen.go 顶部。要点：状态是
+	// (mode, layout) 这样的二元组，每条转移规则只动一个轴 ——
+	// Esc 动 mode，F2 动 layout。
+	layout layoutMode
+
 	// threads 是 app 给的全部会话；visible 是当前实际显示的
 	// （按 activeFolder 和 query 过滤之后）。光标索引的是 visible。
 	//
@@ -404,6 +411,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 帮助页同理（帮助内容的行数只取决于宽度），两处一起收。
 		m.clampChatScroll()
 		m.clampHelpScroll()
+		// Zen 的正文列宽度跟着窗口走，输入框的可用宽度也得跟着重算，
+		// 否则从大窗口缩到小窗口之后，敲到一半的字会顶出正文列。
+		m.syncInputWidth()
 		return m, nil
 
 	case pollTickMsg:
@@ -989,7 +999,7 @@ func (m Model) enterThread(th thread.Thread, solo, keepDraft bool) (tea.Model, t
 	// 的那个对象已经不是当前会话了，留着只会把消息重发到错的地方。
 	m.lastSentText = ""
 	m.input.EchoMode = textinput.EchoNormal
-	m.input.Placeholder = "输入消息，回车发送"
+	m.input.Placeholder = chatInputPlaceholder
 	if !keepDraft {
 		m.input.SetValue("")
 	}
@@ -1007,6 +1017,18 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return m, tea.Quit
 
+	// F2 切 Zen / Normal。
+	//
+	// 为什么是 F2 而不是单字母：会话里输入框有焦点，裸字母会被当成正文
+	// 打进去（下面 ctrl+y 那一段注释说的就是这个坑）。F1 已经被帮助页
+	// 占了，F2 是它的邻居，好记。
+	//
+	// 为什么只有会话里有：Zen 是「读和写」的排版，列表 / 搜索 / 确认框
+	// 是「管理」界面，没有 Zen 形态（见 zenActive）。
+	case "f2":
+		m.toggleZen()
+		return m, nil
+
 	// Esc 只退出「会话视图」，**不丢弃**当前会话。
 	//
 	// 这里原先顺手把 activeID 清空、bodies 也清掉，等于「按 Esc = 关掉
@@ -1019,6 +1041,15 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 内容（renderChat 看的是 activeThread()，与 mode 无关），用户扫一眼
 	// 列表再按回车就回来了，不用重新找。
 	case "esc":
+		// Zen 下 Esc 是「退出 Zen」，**不是**「退出会话」。
+		//
+		// 一次只退一层：从 Zen 退回普通会话视图，再按一次才回列表。
+		// 一步退两层的话，用户在 Zen 里按 Esc 想「回到普通视图」，
+		// 结果直接掉到列表，还得重新找刚才那个会话。
+		if m.layout == layoutZen {
+			m.toggleZen()
+			return m, nil
+		}
 		m.mode = modeList
 		m.input.Blur()
 		return m, nil
@@ -1148,6 +1179,13 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+
+	// 新建会话也画在会话那一栏里，所以同样支持 F2。
+	// 「只有 Chat mode 支持 Zen」约束的是**界面形态**（列表 / 搜索没有
+	// Zen 版），不是 mode 枚举值 —— 新建会话这一屏用的就是会话的排版。
+	case "f2":
+		m.toggleZen()
+		return m, nil
 	case "esc":
 		m.mode = modeList
 		m.input.SetValue("")
@@ -1165,7 +1203,7 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeChat
 		m.activeID = "" // 还没建立会话
 		m.bodies = map[string]app.Body{}
-		m.input.Placeholder = "输入消息，回车发送"
+		m.input.Placeholder = chatInputPlaceholder
 		m.input.SetValue("")
 		m.newChatTo = []string{addr}
 		m.lastSentText = ""
@@ -1272,8 +1310,10 @@ const (
 //
 // 留一行重叠是标准做法 —— 两屏完全错开的话，读者要自己找「刚才读到
 // 哪了」。
+//
+// 一屏的高度走 chatViewport()，因为 Zen 和 Normal 的可见行数不同。
 func (m Model) chatPageStep() int {
-	if n := chatViewHeight(m.bodyHeight()) - 1; n > 1 {
+	if n := m.chatViewport() - 1; n > 1 {
 		return n
 	}
 	return 1
@@ -1307,10 +1347,31 @@ func (m *Model) clampChatScroll() {
 // maxChatScroll 是正文往上最多能卷多少行（0 表示一屏就放得下）。
 func (m Model) maxChatScroll() int {
 	n := m.chatBodyLines()
-	if v := chatViewHeight(m.bodyHeight()); n > v {
+	if v := m.chatViewport(); n > v {
 		return n - v
 	}
 	return 0
+}
+
+// chatViewport 是当前布局下正文区能显示的行数。
+//
+// 抽出来是因为滚动相关的三个地方（maxChatScroll / chatPageStep / clamp）
+// 必须用**同一个**可见行数。两种布局的可见行数不同 —— Normal 是
+// bodyHeight 减掉标题那一行，Zen 要扣掉自己的六行固定装饰 —— 各算一遍
+// 迟早会对不上，表现是「滚到底还差半行」，很难查（chatBodyLines 的
+// 注释里记着同一个坑）。
+func (m Model) chatViewport() int {
+	if m.zenActive() {
+		statusH := 0
+		if m.renderZenStatus(zenContentWidth(m.width)) != "" {
+			statusH = 1
+		}
+		if h := m.height - zenChromeHeight - statusH; h > 1 {
+			return h
+		}
+		return 1
+	}
+	return chatViewHeight(m.bodyHeight())
 }
 
 // chatBodyLines 是当前会话的正文渲染出来一共有多少行。
@@ -1326,6 +1387,10 @@ func (m Model) chatBodyLines() int {
 	th, ok := m.activeThread()
 	if !ok {
 		return 0
+	}
+	// Zen 的正文是**分组之后**的行数，和 Normal 那份不一样，不能混用。
+	if m.zenActive() {
+		return len(m.renderZenBody(th))
 	}
 	return len(m.renderChatBody(th, m.chatBodyWidth()))
 }

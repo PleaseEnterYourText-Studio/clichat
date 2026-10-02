@@ -59,6 +59,27 @@ starred:
 
 [![Help](docs/images/04-help.png)](docs/images/04-help.png)
 
+**Zen mode** — press `F2` for a quiet, typography-first reading layout: no
+sidebar, no status bar, no message bubbles. The body sits in a centred column
+that never stretches past 78 columns, and consecutive messages from the same
+person are grouped under a single name and timestamp:
+
+[![Zen mode, one to one](docs/images/05-zen-chat.png)](docs/images/05-zen-chat.png)
+
+**Zen mode, group thread** — grouping when several people take turns:
+
+[![Zen mode, group thread](docs/images/06-zen-group.png)](docs/images/06-zen-group.png)
+
+**Zen mode, long body** — Markdown headings, lists, links, code blocks and
+tables all render inside that narrow column:
+
+[![Zen mode, long body](docs/images/07-zen-long.png)](docs/images/07-zen-long.png)
+
+**Zen mode, narrow terminal** — below 80 columns your own messages stop being
+right-aligned and everything falls back to a single column:
+
+[![Zen mode, narrow terminal](docs/images/08-zen-narrow.png)](docs/images/08-zen-narrow.png)
+
 ## Download
 
 Grab a prebuilt binary from the [Releases](https://github.com/PleaseEnterYourText-Studio/clichat/releases)
@@ -369,12 +390,13 @@ message — every action uses a `Ctrl` combination instead.
 |---|---|
 | `Enter` | Send |
 | `Tab` | Reply-all / reply-to-sender |
+| `F2` | Zen mode: a quiet reading layout. Press again to go back |
 | `Ctrl+R` | Refresh: sync once now, and re-read this conversation's bodies |
 | `↑` / `↓` | Scroll the conversation (when the input box is empty) |
 | `PgUp` / `PgDn` | Scroll a screen |
 | Wheel | Scrolls whatever the pointer is over: the list cursor on the left, the conversation on the right |
 | `Ctrl+↑` / `Ctrl+↓` | Previous / next conversation |
-| `Esc` | Back to list. The conversation stays open — `Enter` returns to it |
+| `Esc` | Leave Zen mode; otherwise back to list. The conversation stays open — `Enter` returns to it |
 | `Ctrl+Y` | Copy last message body |
 | `Ctrl+U` | Mark unread and go back |
 | `Ctrl+T` | Star / unstar |
