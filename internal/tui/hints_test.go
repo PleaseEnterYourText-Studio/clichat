@@ -94,7 +94,7 @@ func TestListHints_LastKeySurvivesOnScreen(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	last := hintKeys[len(hintKeys)-1].key
 
-	row := plainText(viewLines(m)[m.layout().inputTop+1])
+	row := plainText(viewLines(m)[m.measureLayout().inputTop+1])
 	if !strings.Contains(row, last+" ") {
 		t.Errorf("底部这一行里看不到最后一个键 %q（它被终端宽度截掉了）：\n%q",
 			last, row)

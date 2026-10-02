@@ -96,7 +96,9 @@ BG = "#1e1e2e"
 BORDER = "#313244"
 FG_DEFAULT = "#c4c4c4"
 FONT_SIZE = 13
-LINE_HEIGHT = 19.2  # = 13 * 1.477...，和 freeze 那一版对齐
+# 行高是 f(字号)，不是常数：13px 那一档对齐 freeze 那一版（13 * 1.477…）。
+# 单独放大某张图时（见 BIGGER_FONT），行高必须跟着放大，否则字会挤在一起。
+LINE_RATIO = 19.2 / 13
 CELL_W = FONT_SIZE * 0.6  # JetBrains Mono 的 advance width 正好是 0.6em
 PADDING = 20
 MARGIN = 24
@@ -105,6 +107,22 @@ SCALE = 2  # 设备像素比：截图按 2x 出，文字锐利得多
 # 26px 是"看得像标题栏、又不浪费高度"的那个值）。
 TITLEBAR_H = 26
 TITLEBAR_DOT_TOP = 8
+
+# 单独放大的几张图。
+#
+# 05-zen-home 是唯一一张把 **ANSI Shadow 字标**当主体的图。那种字形的笔画是
+# 2 格宽、里面还嵌一条 1 格宽的"阴影线"—— 13px 下那条线正好吃掉笔画的一半，
+# 字标看着像一堆空心方框。放大一档（笔画和阴影线按比例一起变粗）之后才认得出
+# 是字标。
+#
+# 只影响截图：产品里字标就是终端字号，用户自己调。
+BIGGER_FONT = {"05-zen-home": 20}
+
+
+def line_height(size):
+    """字号 -> 行高。渲染的每一处都得走它，别退回写死的常数。"""
+    return size * LINE_RATIO
+
 
 # 实际用的格子宽度由 measure_font 量出来（见那个函数的注释）。这个常量
 # 只是「JetBrains Mono 正常加载时应该是多少」，用来做合理性区间检查 ——
@@ -117,6 +135,10 @@ EDGE_CANDIDATES = [
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    # macOS：--headless=new 在 Chrome / Edge 的 mac 版上都能用。路径是
+    # .app 里的可执行文件本体，不是 .app 目录。
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ]
 
 
@@ -409,31 +431,31 @@ GEOMETRY = {
 GEOMETRY_CHARS = frozenset(chr(cp) for cp in GEOMETRY)
 
 
-def geometry_html(ch, x, y, cell, fg):
+def geometry_html(ch, x, y, cell, line_h, fg):
     """把一个几何符号画成绝对定位的矩形。返回 "" 表示"照常排字形"。"""
     spec = GEOMETRY.get(ord(ch[0])) if ch else None
     if not spec or not fg:
         return ""
     shape, weight = spec
-    top, left = y * LINE_HEIGHT, x * cell
+    top, left = y * line_h, x * cell
     if shape == "vline":
         w = max(1.0, weight * cell / 7.8)  # 线宽按列折：1 列 ≈ 1px @13px
         return ('<i style="left:%.2fpx;top:%.2fpx;width:%.2fpx;height:%.2fpx;'
                 'background:%s"></i>'
-                % (left + (cell - w) / 2, top, w, LINE_HEIGHT, fg))
+                % (left + (cell - w) / 2, top, w, line_h, fg))
     if shape == "hline":
         h = max(1.0, weight * cell / 7.8)
         return ('<i style="left:%.2fpx;top:%.2fpx;width:%.2fpx;height:%.2fpx;'
                 'background:%s"></i>'
-                % (left, top + (LINE_HEIGHT - h) / 2, cell, h, fg))
+                % (left, top + (line_h - h) / 2, cell, h, fg))
     if shape == "half":
         return ('<i style="left:%.2fpx;top:%.2fpx;width:%.2fpx;height:%.2fpx;'
                 'background:%s"></i>'
-                % (left, top, cell / 2, LINE_HEIGHT, fg))
+                % (left, top, cell / 2, line_h, fg))
     return ""
 
 
-def to_html(grid, cols, cell):
+def to_html(grid, cols, cell, line_h):
     """网格 -> 一串**绝对定位**的元素：底色矩形 + 文字 run。
 
     为什么不用 `<pre>` 顺排（前几版是那么写的）：
@@ -453,7 +475,7 @@ def to_html(grid, cols, cell):
     blocks = []  # 底色矩形，位置和宽度都由列数算出，与字体无关
     texts = []   # 文字 run，从自己的格子坐标起步
     for y, row in enumerate(grid):
-        top = y * LINE_HEIGHT
+        top = y * line_h
         x = 0
         while x < cols:
             # ---- 同底色的连续段 ----
@@ -466,7 +488,7 @@ def to_html(grid, cols, cell):
                     blocks.append(
                         '<i style="left:%.2fpx;top:%.2fpx;width:%.2fpx;height:%.2fpx;'
                         'background:%s"></i>'
-                        % (x * cell, top, (j - x) * cell, LINE_HEIGHT, color))
+                        % (x * cell, top, (j - x) * cell, line_h, color))
             # ---- 段内的文字 run ----
             k = x
             while k < j:
@@ -478,7 +500,7 @@ def to_html(grid, cols, cell):
                     continue
                 # 几何符号（滚动条、分隔线、未读标记）画成 CSS 矩形，
                 # 不排字形 —— 字体画不满整格，会碎成一段一段的。
-                shape = geometry_html(row[k].ch, k, y, cell, css(row[k].fg))
+                shape = geometry_html(row[k].ch, k, y, cell, line_h, css(row[k].fg))
                 if shape:
                     texts.append(shape)
                     k += 1
@@ -529,9 +551,9 @@ def to_html(grid, cols, cell):
     return "".join(blocks) + "".join(texts)
 
 
-def build_html(inner, cols, rows, font_uri, font_family, font_fmt, cell):
+def build_html(inner, cols, rows, font_uri, font_family, font_fmt, cell, size, line_h):
     width = cols * cell
-    height = rows * LINE_HEIGHT
+    height = rows * line_h
     face = ("@font-face { font-family: 'ChatShot'; src: url(%s) format('%s'); "
             "font-display: block; }" % (font_uri, font_fmt)) if font_uri else ""
     return """<!DOCTYPE html>
@@ -586,7 +608,7 @@ html, body {{ margin: 0; padding: 0; background: transparent; }}
 <div class="grid">{inner}</div>
 </div></div></body></html>
 """.format(face=face, font_uri=font_uri, font_family=font_family, margin=MARGIN,
-           padding=PADDING, bg=BG, border=BORDER, size=FONT_SIZE, lh=LINE_HEIGHT,
+           padding=PADDING, bg=BG, border=BORDER, size=size, lh=line_h,
            fg=FG_DEFAULT, w=round(width, 2), h=round(height, 2),
            barh=TITLEBAR_H, bardot=TITLEBAR_DOT_TOP, inner=inner)
 
@@ -687,7 +709,7 @@ def ensure_font(root):
 
 # ---------------------------------------------------------------- 量字体
 
-def measure_font(edge, tmp_dir, font_uri, font_family, font_fmt):
+def measure_font(edge, tmp_dir, font_uri, font_family, font_fmt, size):
     """在浏览器里**量**这套字体的 ASCII 步进，返回 cell。量不准就直接停。
 
     为什么不直接用 `FONT_SIZE * 0.6`：
@@ -726,7 +748,7 @@ function go(){
 if (document.fonts && document.fonts.ready) {
   document.fonts.ready.then(go); setTimeout(go, 400);
 } else { go(); }
-</script></body></html>""" % (face, FONT_SIZE, font_family, "0" * 40, "\u7b49" * 10, FONT_SIZE)
+</script></body></html>""" % (face, size, font_family, "0" * 40, "\u7b49" * 10, size)
     with open(probe, "w", encoding="utf-8") as fh:
         fh.write(page)
 
@@ -747,9 +769,9 @@ if (document.fonts && document.fonts.ready) {
             "字体没加载上 —— @font-face 被浏览器丢弃了（多半是 format() 和字节头对不上）。\n"
             "量出来的 ASCII 步进是 %.4fpx（%g em），这不是等宽字体的数，"
             "所有底色的右沿都会偏。\n宁可停在这里，也不要出一批字形悄悄变了的图。"
-            % (cell, cell / FONT_SIZE))
+            % (cell, cell / size))
 
-    ratio = cell / FONT_SIZE
+    ratio = cell / size
     if not (CELL_W_MIN_RATIO <= ratio <= CELL_W_MAX_RATIO):
         raise SystemExit("量出来的 ASCII 步进是 %.4fpx（%.3f em），不像等宽字体。\n"
                          "按这个数渲染，每一块底色的右沿都会偏。先查字体。"
@@ -760,7 +782,7 @@ if (document.fonts && document.fonts.ready) {
 
 # ---------------------------------------------------------------- 渲染
 
-def render(edge, html_path, png_path, cols, rows, cell):
+def render(edge, html_path, png_path, cols, rows, cell, line_h):
     """HTML -> PNG。
 
     视口刻意给大再按 alpha 裁：窗口的实际尺寸受字体加载、阴影、亚像素
@@ -768,7 +790,7 @@ def render(edge, html_path, png_path, cols, rows, cell):
     让浏览器自己排，排完按像素裁。
     """
     w = int(cols * cell) + 2 * (MARGIN + PADDING) + 200
-    h = int(rows * LINE_HEIGHT) + 2 * (MARGIN + PADDING) + TITLEBAR_H + 200
+    h = int(rows * line_h) + 2 * (MARGIN + PADDING) + TITLEBAR_H + 200
 
     r = subprocess.run([
         edge, "--headless=new", "--disable-gpu", "--no-sandbox",
@@ -849,17 +871,23 @@ def main():
 
     font_uri, font_family, font_fmt = "", "", None
     cell = CELL_W
+    # 每个用到的字号各量一次步进。尺寸只有寥寥几种（BIGGER_FONT 里那几档），
+    # 但**不能**按 13px 量完再等比缩放：步进未必线性（字体可能开 hinting），
+    # 而底色矩形的宽度完全由步进决定 —— 差一点就是每一块底色都偏。
+    metrics = {FONT_SIZE: (CELL_W, CELL_W * 2)}
     if not mode_dump:
         edge = find_edge()
         if not edge:
             sys.exit("找不到 Edge / Chrome，没法栅格化")
         font_uri, font_family, font_fmt = ensure_font(root)
-        cell, cjk = measure_font(edge, raw, font_uri, font_family, font_fmt)
         print("浏览器: %s" % edge)
-        print("步进: ASCII %.4fpx（%g em）" % (cell, cell / FONT_SIZE))
-        if cjk > 2 * cell + 0.5:
-            print("提示: CJK 步进 %.2fpx 超过了它占的两格（%.2fpx），"
-                  "汉字之间可能会挤在一起。" % (cjk, 2 * cell))
+        for size in sorted({FONT_SIZE} | set(BIGGER_FONT.values())):
+            cell, cjk = measure_font(edge, raw, font_uri, font_family, font_fmt, size)
+            metrics[size] = (cell, cjk)
+            print("步进: %2dpx -> ASCII %.4fpx（%g em）· CJK %.4fpx（两格 %.4fpx）"
+                  % (size, cell, cell / size, cjk, 2 * cell))
+            if cjk > 2 * cell + 0.5:
+                print("      提示: CJK 比它占的两格宽，汉字之间可能会挤在一起。")
         print()
 
     tmp = os.path.join(raw, "_tmp.html")
@@ -875,18 +903,25 @@ def main():
             dump(grid, cols, stem)
             continue
 
-        inner = to_html(grid, cols, cell)
+        size = BIGGER_FONT.get(stem, FONT_SIZE)
+        cell, _ = metrics[size]
+        lh = line_height(size)
+
+        inner = to_html(grid, cols, cell, lh)
         with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(build_html(inner, cols, len(grid), font_uri, font_family, font_fmt, cell))
+            fh.write(build_html(inner, cols, len(grid), font_uri, font_family,
+                                font_fmt, cell, size, lh))
 
         png = os.path.join(out, stem + ".png")
-        render(edge, tmp, png, cols, len(grid), cell)
+        render(edge, tmp, png, cols, len(grid), cell, lh)
+        tag = "" if size == FONT_SIZE else "  @%dpx" % size
         try:
             from PIL import Image
             with Image.open(png) as im:
-                print("%-12s -> %s.png  (%dx%d)" % (stem, stem, im.size[0], im.size[1]))
+                print("%-12s -> %s.png  (%dx%d)%s"
+                      % (stem, stem, im.size[0], im.size[1], tag))
         except ImportError:
-            print("%-12s -> %s.png" % (stem, stem))
+            print("%-12s -> %s.png%s" % (stem, stem, tag))
 
     if not mode_dump and os.path.isfile(tmp):
         os.remove(tmp)

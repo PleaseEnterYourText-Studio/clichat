@@ -18,6 +18,15 @@ func (m Model) View() string {
 		return "正在启动 clichat…"
 	}
 
+	// Zen 是一套**平级**的排版，不是 Normal 的参数化版本。
+	// 判定条件在 zenActive 里：layout 选了 Zen **且**当前在会话里。
+	//
+	// 它排在 mode 分派**之前**：进了 Zen 之后这一屏就是 Zen 自己的空间，
+	// 由 zen.go 里的 zenScreen 管层次，不再借用 Normal 的页面排版。
+	if m.zenActive() {
+		return m.viewZen()
+	}
+
 	switch m.mode {
 	case modeUnlock:
 		return m.viewUnlock()
@@ -29,7 +38,7 @@ func (m Model) View() string {
 		return m.viewFolderPicker()
 	}
 
-	l := m.layout()
+	l := m.measureLayout()
 	if !l.twoPane {
 		return m.viewSinglePane(l)
 	}
@@ -96,8 +105,14 @@ type layout struct {
 	paneX, paneW int
 }
 
-// layout 算一遍界面几何。
-func (m Model) layout() layout {
+// measureLayout 算一遍界面几何。
+//
+// ⚠️ 它**不能**叫 `layout()`：Model 上有个同名字段 `layout`（类型是
+// layoutMode，Normal / Zen 那个视觉维度 —— 见 model.go）。Go 里字段和
+// 方法不能重名，撞上就是编译错误。改名时选了动这一侧：`zen.go` 整个是
+// 上游的、我们一行没动，在那 8 处引用上改名会让以后每次合并上游都在
+// 同一个地方冲突。类型名 `layout` 没动 —— 包级类型和结构体字段不冲突。
+func (m Model) measureLayout() layout {
 	var l layout
 	l.twoPane = m.width >= singlePaneWidth
 
@@ -195,7 +210,7 @@ func (m Model) listWidth() int {
 
 // bodyHeight 是主体区的高度（含每栏自己的标题行）。
 func (m Model) bodyHeight() int {
-	return m.layout().bodyH
+	return m.measureLayout().bodyH
 }
 
 // chatPaneWidth 是会话流那一栏的总宽度（含最右那一列滚动条）。
@@ -204,7 +219,7 @@ func (m Model) bodyHeight() int {
 // 单栏时就是整幅。抽出来是因为「正文折成几行」和「正文画多宽」必须是
 // 同一个数，两边各算一遍的话，改了布局里的一处、另一处就开始骗人。
 func (m Model) chatPaneWidth() int {
-	return m.layout().chatW
+	return m.measureLayout().chatW
 }
 
 // chatBodyWidth 是正文文字可用的宽度 —— 从 chatPaneWidth 里让出最右一列
@@ -1660,8 +1675,33 @@ func (m Model) viewSetup() string {
 		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定 · Ctrl+C 退出"))
 
 	case stepEmail:
-		b.WriteString("第 1 步 · 邮箱地址\n\n")
+		b.WriteString(m.stepHeader("邮箱地址") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n")
+
+	case stepCustomIMAP:
+		b.WriteString(m.stepHeader("IMAP 服务器") + "\n\n")
+		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		b.WriteString(styleMuted.Render("  主机:端口，例如 imap.example.com:993") + "\n")
+		b.WriteString(styleMuted.Render(fmt.Sprintf(
+			"  已按你的邮箱域名预填，不对就直接改（省略端口时默认 %d）", config.DefaultIMAPPort)) + "\n")
+
+	case stepCustomSMTP:
+		b.WriteString(m.stepHeader("SMTP 服务器") + "\n\n")
+		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		b.WriteString(styleMuted.Render("  主机:端口，例如 smtp.example.com:465") + "\n")
+		b.WriteString(styleMuted.Render(fmt.Sprintf(
+			"  已按你的邮箱域名预填，不对就直接改（省略端口时默认 %d）", config.DefaultSMTPPort)) + "\n")
+
+	case stepCustomTLS:
+		b.WriteString(m.stepHeader("加密方式") + "\n\n")
+		for i, opt := range tlsOptions {
+			if i == m.setup.tls {
+				b.WriteString("  " + styleSelected.Render("▸ "+padRight(opt.Label, 24)) + "\n")
+			} else {
+				b.WriteString("    " + padRight(opt.Label, 24) + "\n")
+			}
+		}
+		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定"))
 
 	case stepPassword:
 		p := m.currentProvider()
@@ -1669,14 +1709,14 @@ func (m Model) viewSetup() string {
 		if p != nil {
 			name = p.Name
 		}
-		b.WriteString("第 2 步 · " + name + " 的凭据\n\n")
+		b.WriteString(m.stepHeader(name+" 的凭据") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
 		if p != nil && len(p.Guide) > 0 {
 			b.WriteString(renderCredentialHelp(p))
 		}
 
 	case stepMaster:
-		b.WriteString("第 3 步 · 主密码\n\n")
+		b.WriteString(m.stepHeader("主密码") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
 		b.WriteString(styleMuted.Render("  凭据会用这个密码加密后存在本地。") + "\n")
 		b.WriteString(styleMuted.Render("  它不会被发送到任何地方，忘了就只能重新配置。") + "\n")
@@ -1686,6 +1726,15 @@ func (m Model) viewSetup() string {
 		b.WriteString("\n" + styleError.Render(m.setup.err) + "\n")
 	}
 	return b.String()
+}
+
+func (m Model) stepHeader(title string) string {
+	for i, s := range m.setupFlow() {
+		if s == m.setup.step {
+			return fmt.Sprintf("第 %d 步 · %s", i+1, title)
+		}
+	}
+	return title
 }
 
 // ---- 渲染辅助 ----

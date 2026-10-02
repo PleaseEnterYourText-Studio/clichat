@@ -31,7 +31,7 @@ func openTwoPane(t *testing.T) Model {
 	m, _ = update(m, keyMsg("ctrl+down")) // 换到第二条（这一步才产生第二个「最近打开」）
 	m = loadBodies(t, m)
 
-	l := m.layout()
+	l := m.measureLayout()
 	if !l.twoPane {
 		t.Fatalf("前提不成立：宽度 %d 降级成了单栏", m.width)
 	}
@@ -59,7 +59,7 @@ func TestLayout_RegionsTileTheScreen(t *testing.T) {
 		for _, h := range []int{12, 20, 30, 60} {
 			m, _ := newFeatureModel(t)
 			m, _ = update(m, tea.WindowSizeMsg{Width: w, Height: h})
-			l := m.layout()
+			l := m.measureLayout()
 
 			rows := l.bodyH + l.inputRows + 1 // 主体 + 输入区 + 状态栏
 			if l.tabsRow >= 0 {
@@ -137,7 +137,7 @@ func TestView_NoFullWidthHorizontalRules(t *testing.T) {
 // 真实终端里比在测试里难看得多，所以在这里挡住。
 func TestView_NoLineOverflowsTheTerminal(t *testing.T) {
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 	for i, line := range viewLines(m) {
 		if w := lipgloss.Width(line); w > m.width {
 			t.Errorf("第 %d 行宽 %d 列，终端只有 %d 列", i, w, m.width)
@@ -157,7 +157,7 @@ func TestLayout_NarrowTerminalDropsTheSidebar(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	m, _ = update(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
-	if l := m.layout(); l.twoPane {
+	if l := m.measureLayout(); l.twoPane {
 		t.Fatalf("80 列不该是双栏")
 	}
 	if strings.Contains(m.View(), "邮箱") {
@@ -180,7 +180,7 @@ func TestLayout_NarrowTerminalDropsTheSidebar(t *testing.T) {
 func TestInputBlock_FloatsWithBlankLinesAround(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 
 	if l.inputRows != inputBlockHeight {
 		t.Fatalf("输入区占 %d 行，want %d", l.inputRows, inputBlockHeight)
@@ -216,7 +216,7 @@ func TestInputBlock_FallsBackToASingleLineWhenShort(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 10})
 
-	if l := m.layout(); l.inputRows != 1 {
+	if l := m.measureLayout(); l.inputRows != 1 {
 		t.Errorf("10 行的终端里输入区占 %d 行，want 1", l.inputRows)
 	}
 	if got := len(viewLines(m)); got != 10 {
@@ -233,7 +233,7 @@ func TestInputBlock_NoCapsuleInListMode(t *testing.T) {
 		t.Fatalf("前提不成立：mode=%v", m.mode)
 	}
 
-	l := m.layout()
+	l := m.measureLayout()
 	if strings.Contains(viewLines(m)[l.inputTop+1], bgSeqOf(styleInputRow)) {
 		t.Error("列表模式的那一行铺了输入框的底色")
 	}
@@ -253,7 +253,7 @@ func TestInputBlock_NoCapsuleInListMode(t *testing.T) {
 func TestInputLine_FillsItsWidth(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 	row := viewLines(m)[l.inputTop+1]
 
 	want := l.paneX + l.paneW
@@ -272,7 +272,7 @@ func TestInputLine_FillsItsWidth(t *testing.T) {
 func TestPanes_ReachTheBottomOfTheScreen(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 	rows := viewLines(m)
 
 	// 口径要对齐：bgAtFirstCell 给的是**裸参数**（"48;5;237"），而
@@ -310,7 +310,7 @@ func TestPanes_ReachTheBottomOfTheScreen(t *testing.T) {
 func TestInputCapsule_LivesInsideTheChatPane(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 	row := viewLines(m)[l.inputTop+1]
 
 	capBg := bgParamOf(bgSeqOf(styleInputRow))
@@ -364,7 +364,7 @@ func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
 	if ph == "" {
 		t.Fatal("前提不成立：会话模式的输入框没有占位提示")
 	}
-	row := viewLines(m)[m.layout().inputTop+1]
+	row := viewLines(m)[m.measureLayout().inputTop+1]
 	if !strings.Contains(plainText(row), ph) {
 		t.Fatalf("输入行里找不到占位提示 %q —— 字根本没画出来。\n这一行是：%q",
 			ph, plainText(row))
@@ -411,7 +411,7 @@ func TestNav_IsOneContinuousBand(t *testing.T) {
 		t.Fatal("拿不到侧栏底色的序列 —— 这个用例大概忘了 forceColor")
 	}
 
-	rows := strings.Split(m.renderNav(m.layout()), "\n")
+	rows := strings.Split(m.renderNav(m.measureLayout()), "\n")
 	if len(rows) < 5 {
 		t.Fatalf("侧栏只有 %d 行，前提不成立", len(rows))
 	}
@@ -532,7 +532,7 @@ func TestNav_HighlightFollowsTheActiveFolder(t *testing.T) {
 		// 量的是**画出来的**侧栏：每一行都由 renderNav 铺过底色，所以
 		// 「第一个格子的底色」就是用户看到的那块色块。
 		var highlighted []string
-		for _, r := range strings.Split(m.renderNav(m.layout()), "\n") {
+		for _, r := range strings.Split(m.renderNav(m.measureLayout()), "\n") {
 			if bgAtFirstCell(r) == want {
 				highlighted = append(highlighted, strings.TrimSpace(plainText(r)))
 			}
@@ -551,17 +551,17 @@ func TestNav_HighlightFollowsTheActiveFolder(t *testing.T) {
 // 只开过一个会话时不该有标签页：那一行既没内容也没用，白占一行正文。
 func TestTabs_AppearOnlyAfterASecondThreadIsOpened(t *testing.T) {
 	m, _ := newFeatureModel(t)
-	if l := m.layout(); l.tabsRow != -1 {
+	if l := m.measureLayout(); l.tabsRow != -1 {
 		t.Errorf("一个会话都没开时就有标签页了（tabsRow=%d）", l.tabsRow)
 	}
 
 	m, _ = update(m, keyMsg("enter"))
-	if l := m.layout(); l.tabsRow != -1 {
+	if l := m.measureLayout(); l.tabsRow != -1 {
 		t.Errorf("只开了一个会话就有标签页了（tabsRow=%d）", l.tabsRow)
 	}
 
 	m, _ = update(m, keyMsg("ctrl+down"))
-	if l := m.layout(); l.tabsRow != 0 {
+	if l := m.measureLayout(); l.tabsRow != 0 {
 		t.Errorf("开过两个会话之后标签页该出现，实际 tabsRow=%d", l.tabsRow)
 	}
 }
@@ -572,7 +572,7 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 	want := selectedBg(t)
 	m := openTwoPane(t)
 
-	chips := m.tabChips(m.layout())
+	chips := m.tabChips(m.measureLayout())
 	if len(chips) != 2 {
 		t.Fatalf("标签页有 %d 个，want 2", len(chips))
 	}
@@ -582,7 +582,7 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 
 	// 标签的坐标是正文栏里的相对列，画面是屏幕列，所以要加上 paneX
 	// （面板带 + 那 1 格内缩）那一截。
-	l := m.layout()
+	l := m.measureLayout()
 	row := viewLines(m)[l.tabsRow]
 	var marked []string
 	for _, c := range chips {
@@ -614,7 +614,7 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 func TestTabs_ClickSwitchesThread(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
-	l := m.layout()
+	l := m.measureLayout()
 
 	row := plainText(viewLines(m)[l.tabsRow])
 	for _, c := range m.tabChips(l) {
@@ -635,7 +635,7 @@ func TestTabs_ClickSwitchesThread(t *testing.T) {
 		if got.mode != modeChat {
 			t.Errorf("点了标签之后 mode=%v，want modeChat", got.mode)
 		}
-		if first := got.tabChips(got.layout())[0].id; first != c.id {
+		if first := got.tabChips(got.measureLayout())[0].id; first != c.id {
 			t.Errorf("刚点过的 %q 没排到最前面（第一个是 %q）", c.id, first)
 		}
 	}
@@ -790,7 +790,7 @@ func TestList_SelectedRowUsesBackgroundNotReverse(t *testing.T) {
 func TestMouse_EveryListRowOpensItsOwnThread(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
-	l := m.layout()
+	l := m.measureLayout()
 
 	pane := strings.Split(m.renderThreadList(l.listW, l.bodyH), "\n")
 	if len(pane) < 6 {
@@ -842,7 +842,7 @@ func threadNamed(list []thread.Thread, text string) (thread.Thread, bool) {
 func TestMouse_ClickNavSwitchesFolder(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
-	l := m.layout()
+	l := m.measureLayout()
 
 	// 在**画出来的**侧栏里找「已发送」在第几行。
 	rows := m.navRows()
@@ -888,7 +888,7 @@ func TestMouse_ClickNavSwitchesFolder(t *testing.T) {
 func TestMouse_EveryBodyColumnBelongsToAPane(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
-	l := m.layout()
+	l := m.measureLayout()
 	row := l.bodyTop + 2
 
 	names := map[hitRegion]string{
@@ -947,7 +947,7 @@ func TestMouse_ClickScrollBarJumps(t *testing.T) {
 	if max := m.maxChatScroll(); max == 0 {
 		t.Fatalf("前提不成立：正文只有 %d 行，卷不动", m.chatBodyLines())
 	}
-	l := m.layout()
+	l := m.measureLayout()
 
 	// 点最上面一格：应该滚到顶。
 	m, _ = update(m, tea.MouseMsg{
@@ -972,7 +972,7 @@ func TestMouse_ClickScrollBarJumps(t *testing.T) {
 func TestMouse_LeftReleaseIsIgnored(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
-	l := m.layout()
+	l := m.measureLayout()
 
 	rows := m.navRows()
 	y := -1
@@ -1163,7 +1163,7 @@ func TestNavAndFolderPickerAgreeOnTheFolder(t *testing.T) {
 	}
 	// 侧栏上高亮的还应该是「已发送」那一项。
 	var marked []string
-	for _, r := range strings.Split(m.renderNav(m.layout()), "\n") {
+	for _, r := range strings.Split(m.renderNav(m.measureLayout()), "\n") {
 		if bgAtFirstCell(r) == want {
 			marked = append(marked, strings.TrimSpace(plainText(r)))
 		}
@@ -1372,5 +1372,5 @@ func ansiSlice(s string, x0, x1 int) string {
 
 // listXInScreen 是列表栏在屏幕上的起始列。
 func (m Model) listXInScreen() int {
-	return m.layout().listX
+	return m.measureLayout().listX
 }

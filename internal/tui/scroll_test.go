@@ -79,6 +79,8 @@ func TestKeyMsg_ProducesRealKeys(t *testing.T) {
 		{"ctrl+down", tea.KeyCtrlDown},
 		{"ctrl+r", tea.KeyCtrlR},
 		{"ctrl+u", tea.KeyCtrlU},
+		{"f1", tea.KeyF1},
+		{"f2", tea.KeyF2},
 	}
 	for _, c := range cases {
 		got := keyMsg(c.in)
@@ -335,8 +337,8 @@ func TestChat_MouseWheelScrollsHoveredPane(t *testing.T) {
 	// 双栏：最左边一条是导航列，中间是列表，右边才是会话流。
 	// 起点从布局里取，不写死 —— 列宽一调，写死的坐标就会悄悄指到别的栏上，
 	// 判据从此量的是另一件事（这一条上次就是这么红的）。
-	rightX := m.layout().chatX + 5
-	leftX := m.layout().navX + 1
+	rightX := m.measureLayout().chatX + 5
+	leftX := m.measureLayout().navX + 1
 
 	m, _ = update(m, tea.MouseMsg{
 		X: rightX, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp,
