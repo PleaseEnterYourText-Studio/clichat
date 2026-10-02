@@ -12,6 +12,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.30
 	github.com/muesli/termenv v0.16.0
 	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
 	golang.org/x/term v0.46.0
 )
 

@@ -47,8 +47,9 @@ func SanitizeHeaderValue(s string) string {
 
 // HTMLToText 把 HTML 粗略降级成纯文本。
 //
-// 这是有意为之的「粗略」：v1 的目标是让人读得懂，不是还原排版。
-// 真要精确渲染得引 golang.org/x/net/html 做 DOM 解析，那不属于 v1 范围。
+// 它已经不是正文的主路径了 —— 主路径是 htmlmd.go 里的 HTMLToMarkdown
+// （走 DOM 解析）。这个函数现在只留一个用途：HTMLToMarkdown 连解析都
+// 失败时的兜底，至少把字交出来，而不是把一封邮件显示成空白。
 func HTMLToText(s string) string {
 	s = scriptRe.ReplaceAllString(s, "")
 	s = styleRe.ReplaceAllString(s, "")
@@ -111,9 +112,19 @@ func FirstLine(s string, max int) string {
 
 // CleanBody 是正文进入本地库前的统一处理：
 // 统一换行、砍掉引用、压掉多余空行。
+//
+// HTML 正文先转成 Markdown（见 htmlmd.go）。存 Markdown 而不是纯文本，
+// 是因为纯文本把邮件里唯一有用的那几个东西全丢了：链接、按钮、表格、
+// 标题。一封「点击这里确认订阅」的邮件降级成纯文本之后，用户连点哪儿
+// 都不知道。
+//
+// 顺序也很讲究：TrimQuoted 跑在转换之后。HTML 里的 <blockquote> 会被
+// 转成 Markdown 的 "> "，正好落进 TrimQuoted 的经典引用判据里，引用
+// 历史照砍不误；而正文里本来就有的 ">"（HTML 实体 &gt;）会被转义成
+// "\>"，不会被误当成引用起点。
 func CleanBody(raw string, isHTML bool) string {
 	if isHTML {
-		raw = HTMLToText(raw)
+		raw = HTMLToMarkdown(raw)
 	}
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = TrimQuoted(raw)

@@ -28,7 +28,13 @@ type Message struct {
 	From     string
 	FromName string
 	Date     time.Time
-	// Body 是纯文本正文。HTML 邮件已经被降级，
+	// Body 是正文。
+	//
+	// HTML 邮件在入库前已经转成了 Markdown（见 htmlmd.go 的
+	// HTMLToMarkdown），所以里面的 * _ [ ] 都是转义过的字面字符；
+	// text/plain 邮件则原样保留作者写的字符，不做转义 —— 那是他自己
+	// 的正文，不是标记，没有理由替他改。
+	//
 	// 引用历史已经被砍掉（见 TrimQuoted）。
 	Body string
 }

@@ -136,8 +136,10 @@ and the process list.
 - Threads grouped by `References` / `In-Reply-To`, not by subject line
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
-- HTML mail downgraded to plain text; quoted history trimmed — this is a chat
-  view, and quoting is noise in it
+- HTML mail converted to Markdown: links and buttons come through as clickable
+  addresses, and tables, lists and code blocks keep as much of their shape as
+  they can; quoted history trimmed — this is a chat view, and quoting is noise
+  in it
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -154,6 +156,9 @@ and the process list.
 **Keeping it working**
 
 - Cold start pulls only the last 90 days / 500 messages, whichever comes first
+- "All mail" mode (`a` in the list) rewinds the local cursor and pulls the whole
+  history in one go. While it is on, the status bar keeps saying so — the first
+  sync gets noticeably slower, and that should not be a surprise
 - Incremental sync by UID; reconnects resume from the last UID
 - `UIDVALIDITY` changes are detected and the local index is rebuilt
 - A single unparseable message is skipped and logged, not fatal
@@ -189,6 +194,7 @@ most common keys.
 | `d` | Delete (moves to *Deleted*) |
 | `f` | Forward last message |
 | `y` | Copy last message body |
+| `a` | All mail: pull the whole history too, press again to turn off |
 | `?` | Help |
 | `q` / `Ctrl+C` | Quit |
 
@@ -278,7 +284,9 @@ Deleting the whole directory resets everything.
 
 Search covers only what is synced locally — by default the last 90 days or 500
 messages. It does not query the server. Widen `sync.initial_days` /
-`sync.initial_max_messages` in `config.json` if you need more.
+`sync.initial_max_messages` in `config.json` if you need more, or press `a` in
+the conversation list to turn on "All mail" and pull the whole history down.
+Once it is down, those messages are searchable too.
 
 **Does `d` really delete the mail?**
 

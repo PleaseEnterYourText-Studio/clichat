@@ -146,3 +146,35 @@ func TestOpen_MissingFileIsNotAnError(t *testing.T) {
 		t.Error("应该是空索引")
 	}
 }
+
+// Rewind 是「接收全部邮件」的支点。它必须只把游标退回去，
+// 不能顺手把 UIDValidity 也抹掉 —— 那会让下一轮同步以为服务器
+// 重置了 UID 空间，走 Reset 把整个索引删掉重来，用户标过的已读和
+// 星标会一起丢。
+func TestIndex_RewindKeepsValidityAndHeaders(t *testing.T) {
+	ix, _ := newIndex(t)
+
+	ix.Merge([]mail.Header{hdr("<a@x>", 7, true)})
+	ix.SetFolderState("INBOX", FolderState{UIDValidity: 42, LastUID: 7})
+
+	ix.Rewind()
+
+	st, ok := ix.FolderState("INBOX")
+	if !ok {
+		t.Fatal("Rewind 不该把文件夹状态整条删掉")
+	}
+	if st.LastUID != 0 {
+		t.Errorf("LastUID = %d, want 0", st.LastUID)
+	}
+	if st.UIDValidity != 42 {
+		t.Errorf("UIDValidity 被改成了 %d —— 下一轮同步会因此清空索引", st.UIDValidity)
+	}
+	// 已经同步下来的邮件必须留着：Rewind 说的是「再拉一遍」，
+	// 不是「删了重来」。
+	if ix.Len() != 1 {
+		t.Errorf("Rewind 把邮件也删了: Len = %d", ix.Len())
+	}
+	if h := ix.All(); len(h) == 1 && !h[0].Seen {
+		t.Error("Rewind 把已读状态弄丢了")
+	}
+}

@@ -63,6 +63,16 @@ type Sync struct {
 	InitialDays         int      `json:"initial_days"`
 	InitialMaxMessages  int      `json:"initial_max_messages"`
 	Folders             []string `json:"folders"`
+
+	// AllMail 为真时不再对首次同步划窗口：InitialDays 和
+	// InitialMaxMessages 都不生效，历史邮件全部拉下来。
+	//
+	// 单独用一个开关而不是把 InitialDays 设成 0 表示「不限」，
+	// 因为 0 是不合法的输入（applyDefaults 会把它当没填而补回默认值），
+	// 复用一个「非法值」当第二含义，早晚会在某条分支上理解错。
+	//
+	// 打开它的代价是一次可能上万封的首次同步，所以界面那边要过一道确认。
+	AllMail bool `json:"all_mail"`
 }
 
 // Config 是落在磁盘上的非敏感配置。
@@ -123,14 +133,21 @@ func IndexPath() (string, error) { return filePath(IndexFileName) }
 // LogPath 返回日志文件的路径。
 func LogPath() (string, error) { return filePath(LogFileName) }
 
-// Load 读取配置。文件不存在时返回默认配置且不报错，
+// Load 读取默认位置的配置。文件不存在时返回默认配置且不报错，
 // 这样首次启动可以自然进入配置向导。
 func Load() (*Config, error) {
 	path, err := filePath(ConfigFileName)
 	if err != nil {
 		return nil, err
 	}
+	return LoadFrom(path)
+}
 
+// LoadFrom 读取指定路径的配置，语义与 Load 相同。
+//
+// 存在的理由有两个：测试需要一个不和用户真实配置打架的落点；
+// 以及「配置从哪来」这件事本身只该有一个实现。
+func LoadFrom(path string) (*Config, error) {
 	cfg := Default()
 	cfg.path = path
 
@@ -150,13 +167,14 @@ func Load() (*Config, error) {
 }
 
 // Save 把配置写回磁盘（权限 0600）。
+//
+// path 为空时直接报错，不去猜默认位置。早先的版本会退回默认路径，
+// 那不叫方便，那是一个会咬人的默认值：任何拿着内存里现造的 Config
+// （测试、向导中途）一保存，就会把用户真实的 config.json 盖掉。
+// 这种错误越早暴露越好，所以宁可让它写不出去。
 func (c *Config) Save() error {
 	if c.path == "" {
-		p, err := filePath(ConfigFileName)
-		if err != nil {
-			return err
-		}
-		c.path = p
+		return errors.New("这份配置没有绑定文件路径，拒绝保存")
 	}
 	if c.Version == 0 {
 		c.Version = CurrentVersion
@@ -173,6 +191,13 @@ func (c *Config) Save() error {
 
 // Path 返回 config.json 的绝对路径。
 func (c *Config) Path() string { return c.path }
+
+// SetPath 把配置绑到一个文件路径上。
+//
+// 给两种场合用：测试要一个不和用户真实配置打架的落点；界面上
+// 「重置配置向导」时得保留原来的路径 —— 内容可以重来，落点的
+// 位置不该跟着漂走。
+func (c *Config) SetPath(p string) { c.path = p }
 
 // Exists 报告配置文件是否已存在。
 func (c *Config) Exists() bool {

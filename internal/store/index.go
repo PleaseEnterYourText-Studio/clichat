@@ -220,6 +220,28 @@ func (ix *Index) Reset() {
 	ix.pos = map[string]int{}
 }
 
+// Rewind 把每个文件夹的同步游标退回起点（LastUID 归零），保留 UIDValidity。
+//
+// 用途是「接收全部邮件」：光把配置开关打开还不够。已经同步过的文件夹，
+// 本地游标停在半路，下一轮同步只会从 LastUID+1 往后拉 —— 用户按了开关
+// 却什么都没变，那是最糟的一种「成功」。
+//
+// UIDValidity 必须留着。清成零的话，下一轮同步会认为服务端重置了 UID
+// 空间，走 Reset() 那条更贵的路径把整个索引删掉重来，用户已经标过的
+// 已读/星标会一起丢。
+func (ix *Index) Rewind() {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	for name, st := range ix.Folders {
+		if st.LastUID == 0 {
+			continue
+		}
+		st.LastUID = 0
+		ix.Folders[name] = st
+	}
+}
+
 // Save 把索引写回磁盘。
 //
 // 先写临时文件再原子改名：中途崩了不会留下一个半截的索引文件，

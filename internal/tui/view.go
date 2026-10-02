@@ -329,11 +329,20 @@ func (m Model) renderInput() string {
 
 // confirmPrompt 是确认框上的一句话。
 func (m Model) confirmPrompt() string {
-	if m.confirmKind == confirmDelete {
+	switch m.confirmKind {
+	case confirmDelete:
 		if th, ok := m.pendingThread(); ok {
 			return "删除「" + threadTitle(th) + "」？会移到「已删除」文件夹，可恢复。  y 确认 · n 取消"
 		}
 		return "删除这个会话？会移到「已删除」文件夹。  y 确认 · n 取消"
+
+	case confirmAllMail:
+		// 关掉时说的是实话：这个开关只管「以后还拉不拉历史」。
+		// 已经同步下来的邮件不会因为关掉它就消失，那得走别的操作。
+		if m.app != nil && m.app.AllMail() {
+			return "关闭「接收全部邮件」？已经同步下来的邮件会留着，只是以后不再拉历史。  y 确认 · n 取消"
+		}
+		return "打开「接收全部邮件」？会把服务器上的历史邮件全部拉下来，可能要几分钟。  y 确认 · n 取消"
 	}
 	return "确认？  y 确认 · n 取消"
 }
@@ -433,6 +442,12 @@ func (m Model) renderStatus() string {
 		parts = append(parts, "● 在线")
 	default:
 		parts = append(parts, "● 离线")
+	}
+
+	// 「接收全部邮件」是个会改变同步代价的模式，得一直在状态栏上看得见。
+	// 只在确认框里露一次的话，用户按完 y 就再也想不起来自己开过它了。
+	if m.app != nil && m.app.AllMail() {
+		parts = append(parts, "接收全部邮件")
 	}
 
 	if !m.lastSync.IsZero() {

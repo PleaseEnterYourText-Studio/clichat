@@ -55,3 +55,72 @@ func TestHeaderValue_UnfoldsContinuationLines(t *testing.T) {
 		t.Errorf("ParseReferences 得到 %d 个, want 3: %v", len(refs), refs)
 	}
 }
+
+// multipart/alternative 里两个部分都有的情况下选错，用户看到的要么是
+// 链接全丢的退化文本，要么是没转过格式的 HTML 源码 —— 两种都很难看。
+func TestReadPlainText_PrefersHTML(t *testing.T) {
+	const raw = "From: a@x.com\r\n" +
+		"Subject: 订单\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/alternative; boundary=BOUND\r\n" +
+		"\r\n" +
+		"--BOUND\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"你好，点击 https://ex.com/confirm 确认订阅\r\n" +
+		"--BOUND\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<p>你好</p>\r\n" +
+		"<p><a href=\"https://ex.com/confirm\" style=\"background:#07c\">确认订阅</a></p>\r\n" +
+		"--BOUND--\r\n"
+
+	got, err := readPlainText(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("readPlainText 出错: %v", err)
+	}
+
+	// HTML 那一支胜出，按钮被还原成了 Markdown 链接。
+	if !strings.Contains(got, "[确认订阅](https://ex.com/confirm)") {
+		t.Errorf("没有优先用 HTML 转 Markdown:\n%s", got)
+	}
+	if strings.Contains(got, "<p>") || strings.Contains(got, "<a href") {
+		t.Errorf("原始标签漏进正文了:\n%s", got)
+	}
+}
+
+// 没有 HTML 部分时退回 text/plain，而且原样保留 —— 纯文本正文里的
+// * 和 _ 是作者自己敲的，不是 Markdown 标记，不该替他转义。
+func TestReadPlainText_PlainOnlyIsKeptAsIs(t *testing.T) {
+	const raw = "From: a@x.com\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"价格 2*3 元，字段 user_id\r\n"
+
+	got, err := readPlainText(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("readPlainText 出错: %v", err)
+	}
+	if want := "价格 2*3 元，字段 user_id"; got != want {
+		t.Errorf("纯文本正文被改动了:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// 只有 HTML 部分的邮件（营销邮件基本都是）也要转成 Markdown。
+func TestReadPlainText_HTMLOnly(t *testing.T) {
+	const raw = "From: a@x.com\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"\r\n" +
+		"<h2>本周进度</h2><ul><li>甲</li><li>乙</li></ul>\r\n"
+
+	got, err := readPlainText(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("readPlainText 出错: %v", err)
+	}
+	for _, want := range []string{"## 本周进度", "- 甲", "- 乙"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q:\n%s", want, got)
+		}
+	}
+}

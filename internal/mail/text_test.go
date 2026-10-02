@@ -122,10 +122,24 @@ func TestFirstLine(t *testing.T) {
 }
 
 func TestCleanBody(t *testing.T) {
-	if got, want := CleanBody("<p>第一段</p><p>第二段</p>", true), "第一段\n第二段"; got != want {
+	// HTML 正文转成 Markdown：段落之间是一个空行。这是 Markdown 里
+	// 「这里是两段」的唯一表达方式 —— 单个换行会被渲染进同一段。
+	if got, want := CleanBody("<p>第一段</p><p>第二段</p>", true), "第一段\n\n第二段"; got != want {
 		t.Errorf("HTML 正文: got %q, want %q", got, want)
 	}
 	if got, want := CleanBody("正文\n\n\n\n> 引用", false), "正文"; got != want {
 		t.Errorf("纯文本正文: got %q, want %q", got, want)
+	}
+
+	// HTML 的 <blockquote> 转出来就是 "> "，正好落进 TrimQuoted 的
+	// 经典引用判据里 —— 引用历史照砍，不需要为 HTML 单开一条路径。
+	if got, want := CleanBody("<p>收到</p><blockquote><p>上一句</p></blockquote>", true), "收到"; got != want {
+		t.Errorf("HTML 里的引用: got %q, want %q", got, want)
+	}
+
+	// 反过来，正文里本来就有的 ">"（HTML 实体）会被转义成 "\>"，
+	// 不会被误当成引用起点把后半封砍掉。
+	if got := CleanBody("<p>甲</p><p>&gt; 这是正文里的箭头</p>", true); !strings.Contains(got, "这是正文里的箭头") {
+		t.Errorf("正文里的 > 被误判成引用了: %q", got)
 	}
 }

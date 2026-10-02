@@ -56,7 +56,12 @@ func (m Model) handleUnlockKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+r":
 		// 凭据损坏或想换账号时的逃生出口。删掉本地凭据重新走一遍向导。
 		_ = config.DeleteCredentials()
+		// 重置的是内容，不是落点：路径要留住，向导最后那步 Save 得写回
+		// 同一个 config.json。（配置不再有「路径为空就退回默认位置」这
+		// 种兜底了，丢掉路径会让保存直接失败。）
+		path := m.cfg.Path()
 		m.cfg = config.Default()
+		m.cfg.SetPath(path)
 		m.status = ""
 		m.beginSetup()
 		return m, nil

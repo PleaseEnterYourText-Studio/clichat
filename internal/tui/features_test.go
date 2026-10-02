@@ -16,12 +16,26 @@ import (
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
+// testConfig 造一份绑在临时目录里的配置。
+//
+// 路径必须绑上：配置没有「路径为空就退回默认位置」这种兜底了，而界面上
+// 有些操作（比如「接收全部邮件」）会把配置落盘 —— 不绑的话要么保存失败，
+// 要么写进用户真实的 config.json。
+func testConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.LoadFrom(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("config.LoadFrom: %v", err)
+	}
+	return cfg
+}
+
 // newFeatureModel 造一个三个会话的模型：两个在 INBOX（一个未读一个已读），
 // 一个只在 Sent。用来观察文件夹过滤、搜索和未读跳转。
 func newFeatureModel(t *testing.T) (Model, *mail.Fake) {
 	t.Helper()
 
-	cfg := config.Default()
+	cfg := testConfig(t)
 	cfg.Account.Email = "me@example.com"
 	cfg.Account.DisplayName = "我"
 	cfg.IMAP.Host = "imap.example.com"

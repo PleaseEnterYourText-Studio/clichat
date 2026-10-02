@@ -49,12 +49,15 @@ const (
 // confirmKind 是待确认的操作类型。
 //
 // 用枚举而不是存一个闭包：闭包没法比较、没法在测试里断言，
-// 而这里要确认的动作一共就一个，枚举更清楚。
+// 而这里要确认的动作一共就两个，枚举更清楚。
 type confirmKind int
 
 const (
 	confirmNone confirmKind = iota
 	confirmDelete
+	// confirmAllMail 是「接收全部邮件」开关。它也要确认，因为打开之后
+	// 首次同步可能要把服务器上几万封邮件的头部拉一遍。
+	confirmAllMail
 )
 
 // minPollInterval 是轮询间隔的下限。
@@ -158,6 +161,15 @@ type actionResultMsg struct {
 type foldersResultMsg struct {
 	folders []string
 	err     error
+}
+
+// allMailResultMsg 是「接收全部邮件」开关切换完成的回执。
+//
+// 它没有塞进 actionResultMsg：这个开关成功之后还要接着触发一轮同步，
+// 而 actionResultMsg 的语义是「到此为止」。
+type allMailResultMsg struct {
+	on  bool
+	err error
 }
 
 // pollTickMsg 是轮询定时器到点的信号。
@@ -340,6 +352,14 @@ func (m Model) foldersCmd() tea.Cmd {
 	}
 }
 
+// allMailCmd 切换「接收全部邮件」模式（同时落盘）。
+func (m Model) allMailCmd(on bool) tea.Cmd {
+	a := m.app
+	return func() tea.Msg {
+		return allMailResultMsg{on: on, err: a.SetAllMail(on)}
+	}
+}
+
 // ---- Update ----
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -436,6 +456,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeFolder
 		return m, nil
+
+	case allMailResultMsg:
+		m.busy = false
+		if msg.err != nil {
+			m.status = "切换「接收全部邮件」失败：" + shortErr(msg.err)
+			return m, nil
+		}
+		if !msg.on {
+			m.status = "已关闭「接收全部邮件」"
+			return m, nil
+		}
+		// 打开之后立刻同步一轮。这个模式的全部意义就是把历史拉下来，
+		// 让用户自己再按一次 r 只会让人怀疑开关是不是没生效。
+		m.status = "已打开「接收全部邮件」，正在拉取历史邮件…"
+		m.busy = true
+		return m, m.syncCmd()
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -669,6 +705,21 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "y", "enter":
 		kind := m.confirmKind
+
+		// 「接收全部邮件」不作用在某个会话上，先分出去 —— 下面那段要拿
+		// pendingThread，对它不适用（硬套的话会报「会话已经不在」）。
+		if kind == confirmAllMail {
+			m.confirmKind = confirmNone
+			m.mode = modeList
+			m.input.Blur()
+			if m.app == nil {
+				return m, nil
+			}
+			m.busy = true
+			return m, m.allMailCmd(!m.app.AllMail())
+		}
+
+		// 顺序要紧：pendingThread 读的是 pendingRoot，必须趁清空之前问。
 		th, ok := m.pendingThread()
 		m.confirmKind = confirmNone
 		m.pendingRoot = ""
@@ -773,6 +824,15 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "?":
 		return m.openHelp()
+
+	case "a":
+		// 「接收全部邮件」开关。要确认 —— 打开之后首次同步可能要把
+		// 服务器上几万封邮件的头部拉一遍，那不是按错键该承担的代价。
+		if m.app != nil {
+			m.confirmKind = confirmAllMail
+			m.mode = modeConfirm
+			return m, nil
+		}
 
 	case "u":
 		if th, ok := m.currentThread(); ok {

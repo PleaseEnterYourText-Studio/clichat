@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,7 +28,12 @@ func newTestApp(t *testing.T, fake *mail.Fake) *App {
 func newTestAppWithClient(t *testing.T, client mail.Client) *App {
 	t.Helper()
 
-	cfg := config.Default()
+	// 绑到临时目录：App 上有会把配置落盘的操作（比如「接收全部邮件」），
+	// 不绑路径 Save 会直接报错，绑默认路径会写进用户真实的 config.json。
+	cfg, err := config.LoadFrom(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("config.LoadFrom: %v", err)
+	}
 	cfg.Account.Email = testSelf
 	cfg.Account.DisplayName = "me"
 	cfg.IMAP.Host = "imap.example.com"
@@ -573,5 +579,126 @@ func TestApp_LastBodyTextLoadsOnDemand(t *testing.T) {
 	}
 	if text != "正文内容" {
 		t.Errorf("正文 = %q, want %q", text, "正文内容")
+	}
+}
+
+// ---- 接收全部邮件 ----
+
+// 这个开关最容易做成一个假功能：配置改了、状态栏也显示了，但历史邮件
+// 一封都没多 —— 因为本地游标还停在半路，下一轮同步照旧从 LastUID+1 走。
+// 所以这条判据盯的不是「配置项变成 true」，而是**邮件真的多出来了**。
+func TestApp_AllMailRewindsCursorAndSkipsClamp(t *testing.T) {
+	fake := mail.NewFake()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 6; i++ {
+		fake.AddMessage("INBOX", mail.Header{
+			MessageID: fmt.Sprintf("<m%d@x>", i),
+			From:      "alice@x.com", To: []string{testSelf},
+			Subject: fmt.Sprintf("第 %d 封", i),
+			Date:    base.Add(time.Duration(i) * time.Minute),
+		}, "正文")
+	}
+
+	a := newTestApp(t, fake)
+	// 把首次同步的封数上限压到 2，好让「划窗口」这件事可观测。
+	a.Config().Sync.InitialMaxMessages = 2
+
+	if a.AllMail() {
+		t.Fatal("默认不该是全量模式")
+	}
+
+	if _, err := a.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if got := len(a.Threads()); got != 2 {
+		t.Fatalf("默认模式下首次同步只该拉最近 2 封，实际 %d 封", got)
+	}
+
+	if err := a.SetAllMail(true); err != nil {
+		t.Fatalf("SetAllMail(true): %v", err)
+	}
+	if !a.AllMail() {
+		t.Error("开关没打开")
+	}
+
+	if _, err := a.Sync(); err != nil {
+		t.Fatalf("第二轮 Sync: %v", err)
+	}
+	if got := len(a.Threads()); got != 6 {
+		t.Errorf("打开全量模式后应该看到 6 封，实际 %d 封 —— 游标没退回去", got)
+	}
+}
+
+// 关掉全量模式不该反过来删东西：已经同步下来的邮件得留着，游标也不该动。
+func TestApp_AllMailOffKeepsEverything(t *testing.T) {
+	fake := mail.NewFake()
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<a@x>", From: "alice@x.com", To: []string{testSelf},
+		Subject: "一封", Date: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC),
+	}, "正文")
+
+	a := newTestApp(t, fake)
+	if err := a.SetAllMail(true); err != nil {
+		t.Fatalf("SetAllMail(true): %v", err)
+	}
+	if _, err := a.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	before := len(a.Threads())
+
+	if err := a.SetAllMail(false); err != nil {
+		t.Fatalf("SetAllMail(false): %v", err)
+	}
+	if a.AllMail() {
+		t.Error("开关没关掉")
+	}
+	if got := len(a.Threads()); got != before {
+		t.Errorf("关掉之后会话从 %d 变成了 %d", before, got)
+	}
+}
+
+// 开关必须落到磁盘上。只在内存里改的话，重启一次用户会发现自己
+// 「打开的选项自己关回去了」，然后不知道该信哪个。
+func TestApp_SetAllMailPersists(t *testing.T) {
+	fake := mail.NewFake()
+	a := newTestApp(t, fake)
+	path := a.Config().Path()
+
+	if err := a.SetAllMail(true); err != nil {
+		t.Fatalf("SetAllMail(true): %v", err)
+	}
+
+	// 重新从同一个文件读一份，模拟重启。
+	reloaded, err := config.LoadFrom(path)
+	if err != nil {
+		t.Fatalf("config.LoadFrom: %v", err)
+	}
+	if !reloaded.Sync.AllMail {
+		t.Error("重启之后「接收全部邮件」丢了")
+	}
+}
+
+// 落盘失败时开关不能留在打开状态。
+//
+// 界面上那个「接收全部邮件」标记读的就是 AllMail()。如果保存失败还让它
+// 留在 true，用户会看到一个说自己开着、实际既没落盘也没退游标的模式 ——
+// 而这一整个功能的意义恰恰是「真的多拉邮件」，挂个假标记是最坏的结果。
+func TestApp_SetAllMailSaveFailureRevertsFlag(t *testing.T) {
+	fake := mail.NewFake()
+	a := newTestApp(t, fake)
+
+	// 把配置指到一个「路径存在但是个目录」的位置：os.WriteFile 必然失败，
+	// 又不会牵扯到权限问题（CI 里也能稳定复现）。
+	dir := filepath.Join(t.TempDir(), "not-a-file")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	a.Config().SetPath(dir)
+
+	if err := a.SetAllMail(true); err == nil {
+		t.Fatal("路径写不进去，SetAllMail 应该报错")
+	}
+	if a.AllMail() {
+		t.Error("保存失败了，开关却停在打开状态 —— 状态栏会显示一个假的模式标记")
 	}
 }

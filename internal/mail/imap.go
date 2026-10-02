@@ -276,8 +276,16 @@ func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
 
 // readPlainText 从一封邮件的 MIME 结构里取出可读正文。
 //
-// 优先用 text/plain；没有的话把 text/html 降级。附件一律忽略 ——
-// v1 不支持附件。
+// 两个部分都有时优先用 text/html，而不是反过来。看着反直觉，理由是这样：
+//
+//   - multipart/alternative 里的 text/plain 通常是同一封邮件的退化版：
+//     链接摊成裸地址、按钮变成一行「点击此处」，排版信息全没了；
+//   - HTML 这边转出来的 Markdown 把链接、按钮、表格、标题都留着。
+//
+// 代价是 HTML 分支要跑一遍 DOM 解析（比读纯文本贵）。正文上限
+// 4 MB，这点开销可以忽略。
+//
+// 附件一律忽略 —— v1 不支持附件。
 func readPlainText(r io.Reader) (string, error) {
 	mr, err := gomail.CreateReader(r)
 	if err != nil {
@@ -313,10 +321,10 @@ func readPlainText(r io.Reader) (string, error) {
 		}
 	}
 
-	if strings.TrimSpace(plain) != "" {
-		return CleanBody(plain, false), nil
+	if strings.TrimSpace(htmlBody) != "" {
+		return CleanBody(htmlBody, true), nil
 	}
-	return CleanBody(htmlBody, true), nil
+	return CleanBody(plain, false), nil
 }
 
 // hasFlag 判断标志集合里有没有某个标志。

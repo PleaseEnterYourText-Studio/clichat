@@ -73,6 +73,36 @@ func (a *App) Thread(root string) (thread.Thread, bool) {
 	return t, ok
 }
 
+// AllMail 报告是否处于「接收全部邮件」模式。
+func (a *App) AllMail() bool { return a.cfg.Sync.AllMail }
+
+// SetAllMail 切换「接收全部邮件」模式，并把选择落盘。
+//
+// 打开时顺手把本地游标全部退回起点。这一步不能省：这个模式的语义是
+// 「历史邮件也要」，而已经同步过的文件夹游标停在半路，不退回去的话
+// 只有将来新到的邮件会被拉下来 —— 用户按了开关，界面上什么都没变，
+// 那是最糟的一种「成功」。
+//
+// 关掉时不动游标：那些邮件已经在索引里了，退回去只会让它们再走一遍。
+//
+// 配置写盘失败要原样返回：这时候内存里的开关已经改了，界面得知道
+// 这次切换没落地，否则重启之后「设置自己变回去了」又是一桩悬案。
+func (a *App) SetAllMail(on bool) error {
+	prev := a.cfg.Sync.AllMail
+	a.cfg.Sync.AllMail = on
+	if err := a.cfg.Save(); err != nil {
+		// 没落盘就不算切换成功，把内存里的值退回去。
+		// 不退的话会对不上：游标没退、磁盘没写，而状态栏读的正是
+		// AllMail()，于是界面上会挂着一个「已打开」的假标记。
+		a.cfg.Sync.AllMail = prev
+		return fmt.Errorf("保存配置失败: %w", err)
+	}
+	if on {
+		a.index.Rewind()
+	}
+	return nil
+}
+
 // Sync 增量同步所有配置的文件夹。
 //
 // 返回 changed 表示有没有新数据 —— 界面靠它决定要不要重绘。
@@ -140,8 +170,9 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	var from uint32
 	if !known || st.LastUID == 0 {
 		// 首次同步不拉全部历史：按封数先划一道线。
+		// 「接收全部邮件」模式下这条线不划。
 		from = 1
-		if f.UIDNext > uint32(a.cfg.Sync.InitialMaxMessages) {
+		if !a.cfg.Sync.AllMail && f.UIDNext > uint32(a.cfg.Sync.InitialMaxMessages) {
 			from = f.UIDNext - uint32(a.cfg.Sync.InitialMaxMessages)
 		}
 	} else {
@@ -152,7 +183,7 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	if err != nil {
 		return changed, err
 	}
-	if !known {
+	if !known && !a.cfg.Sync.AllMail {
 		headers = a.withinInitialWindow(headers)
 	}
 
@@ -187,6 +218,9 @@ func (a *App) syncFolder(folder string) (bool, error) {
 //
 // 按封数裁已经在上游做了，但一个每天只有三五封信的邮箱，
 // 500 封可能是三年前的 —— 那不该被当成「最近的会话」铺满界面。
+//
+// 「接收全部邮件」模式下不会走到这里：那时连按封数那条线都不划，
+// 再留着日期线就成了「划了两道、只放开一道」。
 func (a *App) withinInitialWindow(headers []mail.Header) []mail.Header {
 	if a.cfg.Sync.InitialDays <= 0 {
 		return headers
