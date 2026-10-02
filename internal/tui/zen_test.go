@@ -11,20 +11,43 @@ import (
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
-// zenModel 造一个已经打开会话的模型 —— Zen 只在会话里有意义。
-func zenModel(t *testing.T) Model {
+// zenReadyModel 造一个打开着会话、但**还没进 Zen** 的模型。
+func zenReadyModel(t *testing.T) Model {
 	t.Helper()
 
 	m := newSampleModel(t)
 	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 34})
-	m, _ = update(m, keyMsg("enter")) // 光标默认在最新那条（产品评审）
+	m, _ = update(m, keyMsg("enter"))
 	return loadBodies(t, m)
 }
 
-// ---- 状态建模 ----
+// zenHomeModel 造一个已经进入 Zen 首页的模型。
+//
+// 先在 Normal 里打开一个会话：F2 是从会话里按的，而且首页的输入框要有个
+// 默认发送对象才测得下去。
+func zenHomeModel(t *testing.T) Model {
+	t.Helper()
 
-func TestZen_F2TogglesLayout(t *testing.T) {
-	m := zenModel(t)
+	m := zenReadyModel(t)
+	m, _ = update(m, keyMsg("f2"))
+	return m
+}
+
+// zenChatModel 进 Zen 并切到会话屏（首页 → Tab 列表 → 回车会话）。
+func zenChatModel(t *testing.T) Model {
+	t.Helper()
+
+	m := zenHomeModel(t)
+	m, _ = update(m, keyMsg("tab"))
+	m, _ = update(m, keyMsg("enter"))
+	return m
+}
+
+// ---- 三屏导航 ----
+
+// F2 从 Normal 会话进 Zen，落在首页；在首页再按 F2 才离开。
+func TestZen_F2EntersAtHomeAndLeavesFromHome(t *testing.T) {
+	m := zenReadyModel(t)
 
 	if m.layout != layoutNormal {
 		t.Fatalf("初始 layout = %v，want layoutNormal", m.layout)
@@ -34,98 +57,159 @@ func TestZen_F2TogglesLayout(t *testing.T) {
 	if m.layout != layoutZen {
 		t.Fatalf("按 F2 之后 layout = %v，want layoutZen", m.layout)
 	}
-	if !m.zenActive() {
-		t.Error("在会话里 + layoutZen 就该是 zenActive")
+	if m.zenScreen != zenHome {
+		t.Fatalf("进 Zen 应落在首页，got screen=%v", m.zenScreen)
 	}
 
 	m, _ = update(m, keyMsg("f2"))
 	if m.layout != layoutNormal {
-		t.Fatalf("再按一次 F2 应回 layoutNormal，got %v", m.layout)
+		t.Fatalf("首页按 F2 应离开 Zen，got %v", m.layout)
+	}
+	// 出 Zen 要回到进之前那个界面，不能掉到列表。
+	if m.mode != modeChat {
+		t.Errorf("出 Zen 后应回到会话，mode = %v", m.mode)
 	}
 }
 
-// Zen 是**布局**维度，不是新的 mode —— 切进去之后 mode 必须还是 modeChat。
-// 这条守着「不要把 Zen 做成 modeZen」那个决定。
+// 会话里按 F2 是「回首页」，**不是**「关掉 Zen」。
+//
+// 这条守着一次实测出来的预期：F2 是从会话里按进来的，进去之后再按同一个键，
+// 用户想的是「回到刚才那个起点」，不是「把整个 Zen 关掉重来」。
+func TestZen_F2FromChatGoesHome(t *testing.T) {
+	m := zenChatModel(t)
+	id := m.activeID
+
+	m, _ = update(m, keyMsg("f2"))
+	if !m.zenActive() {
+		t.Fatal("会话里按 F2 不该退出 Zen")
+	}
+	if m.zenScreen != zenHome {
+		t.Fatalf("会话里按 F2 应回首页，got %v", m.zenScreen)
+	}
+	if m.activeID != id {
+		t.Errorf("回首页不该丢会话：%q -> %q", id, m.activeID)
+	}
+}
+
+// 首页 → Tab → 列表 → 回车 → 会话；再一路 Esc 退回来。
+func TestZen_NavigationRoundTrip(t *testing.T) {
+	m := zenHomeModel(t)
+
+	m, _ = update(m, keyMsg("tab"))
+	if m.zenScreen != zenList {
+		t.Fatalf("Tab 应到列表，got %v", m.zenScreen)
+	}
+
+	m, _ = update(m, keyMsg("enter"))
+	if m.zenScreen != zenChat {
+		t.Fatalf("回车应开会话，got %v", m.zenScreen)
+	}
+	if m.activeID == "" {
+		t.Error("开了会话却没有 activeID")
+	}
+
+	// Esc 一次退一层，全程不离开 Zen。
+	m, _ = update(m, keyMsg("esc"))
+	if m.zenScreen != zenList {
+		t.Fatalf("会话里 Esc 应回列表，got %v", m.zenScreen)
+	}
+	m, _ = update(m, keyMsg("esc"))
+	if m.zenScreen != zenHome {
+		t.Fatalf("列表里 Esc 应回首页，got %v", m.zenScreen)
+	}
+	if !m.zenActive() {
+		t.Error("一路 Esc 不该把 Zen 关掉 —— 离开要用 F2 或首页上的 Esc")
+	}
+}
+
+// Esc 只退一层，**不关会话**。和 Normal 那边同一条原则。
+func TestZen_EscDoesNotCloseThread(t *testing.T) {
+	m := zenChatModel(t)
+	id := m.activeID
+
+	m, _ = update(m, keyMsg("esc"))
+	if m.activeID != id {
+		t.Errorf("Esc 把会话丢了：%q -> %q", id, m.activeID)
+	}
+}
+
+// 列表里上下选，回车打开的是选中的那条。
+func TestZen_ListSelectsAndOpens(t *testing.T) {
+	m := zenHomeModel(t)
+	m, _ = update(m, keyMsg("tab"))
+
+	if len(m.visible) < 2 {
+		t.Fatal("样例数据里会话太少，测不了选择")
+	}
+
+	start := m.cursor
+	m, _ = update(m, keyMsg("down"))
+	if m.cursor != start+1 {
+		t.Fatalf("↓ 之后 cursor = %d，want %d", m.cursor, start+1)
+	}
+	m, _ = update(m, keyMsg("up"))
+	if m.cursor != start {
+		t.Fatalf("↑ 之后 cursor = %d，want %d", m.cursor, start)
+	}
+
+	want := m.visible[m.cursor].ID
+	m, _ = update(m, keyMsg("enter"))
+	if m.activeID != want {
+		t.Errorf("打开的会话不对：got %q want %q", m.activeID, want)
+	}
+	if m.zenScreen != zenChat {
+		t.Errorf("回车后应在会话屏，got %v", m.zenScreen)
+	}
+}
+
+// Zen 是**布局**维度，不是新的 mode —— 切进去之后 mode 必须原样保留。
+//
+// 保留它是有用的：出 Zen 时要靠它回到原来那个界面。
 func TestZen_DoesNotChangeMode(t *testing.T) {
-	m := zenModel(t)
+	m := zenReadyModel(t)
 
 	before := m.mode
 	m, _ = update(m, keyMsg("f2"))
 
 	if m.mode != before {
-		t.Errorf("切 Zen 动了 mode：%v -> %v。layout 和 mode 是两个维度，不该互相污染",
-			before, m.mode)
-	}
-	if m.mode != modeChat {
-		t.Errorf("mode = %v，want modeChat", m.mode)
+		t.Errorf("进 Zen 动了 mode：%v -> %v。mode 记的是 Normal 世界停在哪，"+
+			"出 Zen 时要用它回去", before, m.mode)
 	}
 }
 
-// Esc 一次只退一层：Zen → 普通会话，再按一次才回列表。
-func TestZen_EscExitsZenFirst(t *testing.T) {
-	m := zenModel(t)
-	m, _ = update(m, keyMsg("f2"))
-
-	m, _ = update(m, keyMsg("esc"))
-	if m.layout != layoutNormal {
-		t.Fatalf("Zen 里按 Esc 应退回 layoutNormal，got %v", m.layout)
-	}
-	if m.mode != modeChat {
-		t.Fatalf("第一次 Esc 不该离开会话，mode = %v", m.mode)
+// 首页那个输入框：输入后回车，消息发给当前会话。
+func TestZen_HomeInputSendsToCurrentThread(t *testing.T) {
+	m := zenHomeModel(t)
+	want := m.activeID
+	if want == "" {
+		t.Fatal("前提不成立：应该有一个打开的会话")
 	}
 
-	m, _ = update(m, keyMsg("esc"))
-	if m.mode != modeList {
-		t.Fatalf("第二次 Esc 应回到列表，mode = %v", m.mode)
+	m.input.SetValue("从首页发的一句")
+	m, cmd := update(m, keyMsg("enter"))
+
+	if cmd == nil {
+		t.Fatal("回车应该产生一条发送命令")
+	}
+	if m.input.Value() != "" {
+		t.Errorf("发出后输入框该清空，got %q", m.input.Value())
+	}
+	if m.activeID != want {
+		t.Errorf("发送对象变了：%q -> %q", want, m.activeID)
 	}
 }
 
-// 列表 / 搜索 / 帮助这些界面没有 Zen 形态。
-//
-// 注意 Esc 的语义：它在 Zen 里是「退出 Zen」，一次只退一层。所以按一次
-// Esc 之后 layout 已经还原了 —— 这条同时守着「Esc 不该一步退到列表」。
-func TestZen_EscExitsZenNotSession(t *testing.T) {
-	m := zenModel(t)
-	m, _ = update(m, keyMsg("f2"))
-	if !m.zenActive() {
-		t.Fatal("前提不成立：会话里应该是 zenActive")
-	}
+// 首页那行提示说的是首页能做的事，不是会话屏的。
+func TestZen_HintIsScreenSpecific(t *testing.T) {
+	home := zenHintFor(zenHome)
+	list := zenHintFor(zenList)
+	chat := zenHintFor(zenChat)
 
-	m, _ = update(m, keyMsg("esc"))
-	if m.zenActive() {
-		t.Error("Esc 之后不该还是 zenActive")
+	if home == list || list == chat || home == chat {
+		t.Error("三屏的提示不该是同一句 —— 每屏能做的事不一样")
 	}
-	if m.layout != layoutNormal {
-		t.Errorf("Esc 应把 layout 还原成 normal，got %v", m.layout)
-	}
-	if m.mode != modeChat {
-		t.Errorf("Esc 一次不该离开会话，mode = %v", m.mode)
-	}
-}
-
-// layout 和 mode 是两个独立的维度。
-//
-// Ctrl+U 会离开会话但**不动 layout** —— 正好用来验这一点：layout 还挂在
-// Zen 上，但列表界面必须画成 Normal 的样子。
-func TestZen_LayoutFlagDoesNotLeakIntoListMode(t *testing.T) {
-	m := zenModel(t)
-	m, _ = update(m, keyMsg("f2"))
-
-	m, _ = update(m, keyMsg("ctrl+u"))
-	if m.mode != modeList {
-		t.Fatalf("Ctrl+U 之后应在列表，mode = %v", m.mode)
-	}
-	if m.layout != layoutZen {
-		t.Errorf("Ctrl+U 不该动 layout，got %v", m.layout)
-	}
-	if m.zenActive() {
-		t.Error("列表界面不该是 zenActive —— 这正是把两个维度拆开的意义")
-	}
-
-	// 画出来的必须是列表：有侧栏标题，没有输入区那条分隔线。
-	view := m.View()
-	if !strings.Contains(view, "个未读") {
-		t.Error("列表界面没画出来")
+	if !strings.Contains(home, "Tab") {
+		t.Errorf("首页的提示该提到 Tab（去列表），got %q", home)
 	}
 }
 
@@ -219,7 +303,7 @@ func TestZenContentWidth(t *testing.T) {
 
 // 窄终端上自己的消息取消右对齐 —— 正文列本来就窄，再砍一半就没法读了。
 func TestZen_RightAlignFallsBackOnNarrow(t *testing.T) {
-	m := zenModel(t)
+	m := zenChatModel(t)
 
 	if !m.zenRightAlign() {
 		t.Error("120 列的终端上自己的消息该靠右")
@@ -235,8 +319,7 @@ func TestZen_RightAlignFallsBackOnNarrow(t *testing.T) {
 
 // Zen 的核心承诺：去掉侧栏和状态栏。
 func TestZen_HasNoSidebarAndNoStatusBar(t *testing.T) {
-	m := zenModel(t)
-	m, _ = update(m, keyMsg("f2"))
+	m := zenChatModel(t)
 
 	view := m.View()
 
@@ -259,8 +342,7 @@ func TestZen_HasNoSidebarAndNoStatusBar(t *testing.T) {
 
 // 正文列居中，且分隔线铺满正文列宽。
 func TestZen_ContentColumnIsCentred(t *testing.T) {
-	m := zenModel(t)
-	m, _ = update(m, keyMsg("f2"))
+	m := zenChatModel(t)
 
 	contentW := zenContentWidth(m.width)
 	wantLeft := zenLeftPad(m.width, contentW)
@@ -313,7 +395,7 @@ func TestZen_LinesNeverExceedTerminalWidth(t *testing.T) {
 // ---- 分组在渲染结果里的样子 ----
 
 func TestZen_GroupHeaderAppearsOncePerBurst(t *testing.T) {
-	m := zenModel(t)
+	m := zenChatModel(t)
 	m, _ = update(m, keyMsg("f2"))
 
 	// 样例数据里 Alice 连发两条（p12 与 p13，间隔 6 分钟，同方向），
@@ -349,7 +431,7 @@ func TestZen_GroupHeaderAppearsOncePerBurst(t *testing.T) {
 // 两种布局的可见行数不同，滚动位置必须按当前布局收敛。
 // 不收敛的话，从 Normal 切到 Zen 会看到一片空白。
 func TestZen_ToggleClampsScroll(t *testing.T) {
-	m := zenModel(t)
+	m := zenChatModel(t)
 
 	// 先在 Normal 里卷到最上面。
 	for i := 0; i < 50; i++ {
@@ -367,7 +449,7 @@ func TestZen_ToggleClampsScroll(t *testing.T) {
 }
 
 func TestZen_ScrollClampsAtBothEnds(t *testing.T) {
-	m := zenModel(t)
+	m := zenChatModel(t)
 	m, _ = update(m, keyMsg("f2"))
 
 	for i := 0; i < 200; i++ {
@@ -389,7 +471,7 @@ func TestZen_ScrollClampsAtBothEnds(t *testing.T) {
 
 // 进出一次 Zen 之后，Normal 的渲染必须逐字节回到原样。
 func TestZen_NormalUnchangedAfterToggle(t *testing.T) {
-	m := zenModel(t)
+	m := zenReadyModel(t)
 	before := m.View()
 
 	m, _ = update(m, keyMsg("f2"))
@@ -407,7 +489,7 @@ func TestZen_NormalUnchangedAfterToggle(t *testing.T) {
 // 提示符是给「这是 Zen」的视觉信号；占位文字短一截是因为 Zen 的输入区
 // 是写作的地方，不是一张告诉你怎么用的表单。
 func TestZen_InputPromptAndPlaceholderSwapAndRestore(t *testing.T) {
-	m := zenModel(t)
+	m := zenReadyModel(t)
 
 	normalPrompt, normalPlaceholder := m.input.Prompt, m.input.Placeholder
 
@@ -448,6 +530,56 @@ func TestZen_HelpMentionsF2(t *testing.T) {
 	}
 	if !found {
 		t.Error("帮助页里没有 F2 —— 用户不会知道有 Zen")
+	}
+}
+
+// 刚进 Zen 时那一行「怎么换会话」的提示：进的时候有，按第一个键就没了。
+//
+// 这条是补一个**实测出来的可发现性问题**：Zen 为了安静把常驻提示全删了，
+// 结果连「怎么换会话」都没人知道 —— NoWint 直接来问了一遍。所以留一行，
+// 但只留到第一次按键为止，不该变成又一个常驻 footer。
+func TestZen_HintShowsOnEntryThenDisappears(t *testing.T) {
+	m := zenHomeModel(t)
+
+	if !m.zenShowHint {
+		t.Fatal("刚进 Zen 应该亮一下提示")
+	}
+	if !strings.Contains(m.View(), "会话列表") {
+		t.Errorf("首页的提示里没有「会话列表」:\n%s", m.View())
+	}
+
+	// 按任意一个别的键，提示就该收掉。
+	m, _ = update(m, keyMsg("pgup"))
+	if m.zenShowHint {
+		t.Error("按过键之后提示该收掉")
+	}
+	if strings.Contains(m.View(), "会话列表") {
+		t.Errorf("提示没从视图里消失:\n%s", m.View())
+	}
+
+	// 出去再进来，应该重新提示一次。
+	m, _ = update(m, keyMsg("f2")) // 首页按 F2 = 离开 Zen
+	m, _ = update(m, keyMsg("f2")) // 再进
+	if !m.zenShowHint {
+		t.Error("重新进 Zen 应该再提示一次")
+	}
+}
+
+// 真实状态优先于提示：一进 Zen 就掉线时，看到的应该是 offline。
+//
+// 反过来的话（提示压过 offline），用户在最需要知道「网络断了」的时候
+// 看到的却是一句快捷键说明。
+func TestZen_StatusBeatsHint(t *testing.T) {
+	m := zenChatModel(t)
+	m, _ = update(m, keyMsg("f2"))
+	m.connected = false
+
+	got := m.renderZenStatus(zenContentWidth(m.width))
+	if !strings.Contains(got, "offline") {
+		t.Errorf("掉线时该显示 offline，got %q", got)
+	}
+	if strings.Contains(got, "切会话") {
+		t.Errorf("提示不该压过真实状态，got %q", got)
 	}
 }
 

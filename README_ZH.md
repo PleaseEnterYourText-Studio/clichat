@@ -53,23 +53,37 @@ clichat 换个看法：**把邮件当消息。**
 
 [![帮助](docs/images/04-help.png)](docs/images/04-help.png)
 
-**禅模式** —— 按 `F2` 切到安静的阅读排版：没有侧栏、没有状态栏、没有消息气泡。
-正文收进一列居中的窄栏（上限 78 列，超宽终端上不会拉满），同一个人连着说的
-几句并成一组，名字和时间只标一次：
+**禅模式** —— 按 `F2` 切到一个安静的、以排版为主的阅读空间。它是一个独立的
+世界，里面有三屏：首页、会话列表、会话本身。
 
-[![禅模式 · 一对一](docs/images/05-zen-chat.png)](docs/images/05-zen-chat.png)
+首页只有字标和一个输入框。打一句、回车，就发给上次待着的那个会话：
+
+[![禅模式 · 首页](docs/images/05-zen-home.png)](docs/images/05-zen-home.png)
+
+`Tab` 打开会话列表。未读的保持明亮、已读的压暗，光标用 `›` 标出：
+
+[![禅模式 · 列表](docs/images/06-zen-list.png)](docs/images/06-zen-list.png)
+
+会话本身：没有侧栏、没有状态栏、没有消息气泡。正文收进一列居中的窄栏
+（上限 78 列，超宽终端上不会拉满），同一个人连着说的几句并成一组，
+名字和时间只标一次：
+
+[![禅模式 · 一对一](docs/images/07-zen-chat.png)](docs/images/07-zen-chat.png)
 
 **禅模式 · 群聊** —— 多人交替发言时的分组：
 
-[![禅模式 · 群聊](docs/images/06-zen-group.png)](docs/images/06-zen-group.png)
+[![禅模式 · 群聊](docs/images/08-zen-group.png)](docs/images/08-zen-group.png)
 
 **禅模式 · 长正文** —— Markdown 的标题、列表、链接、代码块、表格都收在这一列里：
 
-[![禅模式 · 长正文](docs/images/07-zen-long.png)](docs/images/07-zen-long.png)
+[![禅模式 · 长正文](docs/images/09-zen-long.png)](docs/images/09-zen-long.png)
 
 **禅模式 · 窄终端** —— 低于 80 列时自己的消息不再靠右，退回单列：
 
-[![禅模式 · 窄终端](docs/images/08-zen-narrow.png)](docs/images/08-zen-narrow.png)
+[![禅模式 · 窄终端](docs/images/10-zen-narrow.png)](docs/images/10-zen-narrow.png)
+
+禅模式内的导航：`Tab` 首页 → 列表，`Enter` 打开选中的会话，`Esc` 退一层，
+`F2` 回首页 —— 在首页再按一次才离开禅模式。
 
 ## 下载
 
@@ -309,7 +323,7 @@ clichat 自己写的：正文里来的每个 `*`、反引号、`_`、`[`、`]`�
 |---|---|
 | `Enter` | 发送 |
 | `Tab` | 发给所有人 / 只回发件人 |
-| `F2` | 禅模式：切到安静的阅读排版，再按一次回来 |
+| `F2` | 进禅模式（在禅模式里则是回它的首页） |
 | `Ctrl+R` | 刷新：立刻同步一次，并重读这个会话的正文 |
 | `PgUp` / `PgDn` | 上下翻页 |
 | `Esc` | 退出禅模式；否则返回列表 |

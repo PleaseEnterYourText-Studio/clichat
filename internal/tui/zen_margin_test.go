@@ -31,7 +31,9 @@ func TestZen_ContentColumnCentredAtEveryWidth(t *testing.T) {
 		m, _ = update(m, tea.WindowSizeMsg{Width: w, Height: 30})
 		m, _ = update(m, keyMsg("enter"))
 		m = loadBodies(t, m)
-		m, _ = update(m, keyMsg("f2"))
+		m, _ = update(m, keyMsg("f2"))    // 进 Zen（落在首页）
+		m, _ = update(m, keyMsg("tab"))   // → 列表
+		m, _ = update(m, keyMsg("enter")) // → 会话屏，那条分隔线在这里
 
 		lines := strings.Split(m.View(), "\n")
 

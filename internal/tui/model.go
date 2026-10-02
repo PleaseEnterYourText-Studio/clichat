@@ -83,6 +83,14 @@ type Model struct {
 	// Esc 动 mode，F2 动 layout。
 	layout layoutMode
 
+	// zenShowHint 控制 Zen 下那行「怎么用」的一次性提示。
+	// 进 Zen 时置起，用户按第一个键就收掉（见 handleZenKey）。
+	zenShowHint bool
+
+	// zenScreen 是 Zen 空间里的哪一屏（首页 / 列表 / 会话）。
+	// 只在 layout == layoutZen 时有意义。
+	zenScreen zenScreen
+
 	// threads 是 app 给的全部会话；visible 是当前实际显示的
 	// （按 activeFolder 和 query 过滤之后）。光标索引的是 visible。
 	//
@@ -573,6 +581,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.openHelp()
 	}
 
+	// Zen 是另一个世界：它有自己的一套屏幕和导航（首页 → 列表 → 会话），
+	// 所以在这里整块分派出去，不让 mode 参与 —— mode 记的是 Normal 世界
+	// 停在哪，出 Zen 时原样回去。
+	if m.zenActive() {
+		return m.handleZenKey(msg)
+	}
+
+	// F2 进 Zen。
+	//
+	// 放在这里而不是各 mode 的分支里：**Zen 的入口不该挑界面** —— 在列表上
+	// 按 F2 和在会话里按 F2，用户想的都是「去那个安静的地方」。原先只在
+	// handleChatKey 里接了，结果列表上按 F2 毫无反应（截图脚本一头撞上，
+	// 拍出来的「首页」其实是普通两栏）。
+	//
+	// 搜索 / 确认框 / 文件夹选择器 / 配置向导这些**中间态**不接：它们都是
+	// 「正在做一件事」，半路切走会把那件事的上下文弄丢。
+	switch msg.String() {
+	case "f2":
+		switch m.mode {
+		case modeList, modeChat, modeNewChat:
+			m.toggleZen()
+			return m, nil
+		}
+	}
+
 	switch m.mode {
 	case modeUnlock:
 		return m.handleUnlockKey(msg)
@@ -1017,18 +1050,6 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return m, tea.Quit
 
-	// F2 切 Zen / Normal。
-	//
-	// 为什么是 F2 而不是单字母：会话里输入框有焦点，裸字母会被当成正文
-	// 打进去（下面 ctrl+y 那一段注释说的就是这个坑）。F1 已经被帮助页
-	// 占了，F2 是它的邻居，好记。
-	//
-	// 为什么只有会话里有：Zen 是「读和写」的排版，列表 / 搜索 / 确认框
-	// 是「管理」界面，没有 Zen 形态（见 zenActive）。
-	case "f2":
-		m.toggleZen()
-		return m, nil
-
 	// Esc 只退出「会话视图」，**不丢弃**当前会话。
 	//
 	// 这里原先顺手把 activeID 清空、bodies 也清掉，等于「按 Esc = 关掉
@@ -1041,15 +1062,20 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 内容（renderChat 看的是 activeThread()，与 mode 无关），用户扫一眼
 	// 列表再按回车就回来了，不用重新找。
 	case "esc":
-		// Zen 下 Esc 是「退出 Zen」，**不是**「退出会话」。
+		// Normal 下 Esc 只退出「会话视图」，**不丢弃**当前会话。
 		//
-		// 一次只退一层：从 Zen 退回普通会话视图，再按一次才回列表。
-		// 一步退两层的话，用户在 Zen 里按 Esc 想「回到普通视图」，
-		// 结果直接掉到列表，还得重新找刚才那个会话。
-		if m.layout == layoutZen {
-			m.toggleZen()
-			return m, nil
-		}
+		// 这里原先顺手把 activeID 清空、bodies 也清掉，等于「按 Esc = 关掉
+		// 这个会话」；用户的原话是「怎么 esc 直接关闭当前会话了？只有在切换
+		// 会话时才更换」。Esc 的语义该是「退一层」，不是「扔掉东西」——
+		// 成熟客户端也都是这么定的：Discordo 的 composer 里 esc 只是取消
+		// 当前输入，Discord 里 esc 标记已读，**没有一个是「关闭频道」**。
+		//
+		// 保留 activeID 还有个直接好处：退回列表之后右栏仍然显示这个会话的
+		// 内容（renderChat 看的是 activeThread()，与 mode 无关），用户扫一眼
+		// 列表再按回车就回来了，不用重新找。
+		//
+		// Zen 里的 Esc 不走到这里 —— 那条路由 handleZenKey 分派掉了，
+		// 语义是「会话 → 列表」，同样不丢会话。
 		m.mode = modeList
 		m.input.Blur()
 		return m, nil
@@ -1361,7 +1387,7 @@ func (m Model) maxChatScroll() int {
 // 迟早会对不上，表现是「滚到底还差半行」，很难查（chatBodyLines 的
 // 注释里记着同一个坑）。
 func (m Model) chatViewport() int {
-	if m.zenActive() {
+	if m.zenInChat() {
 		statusH := 0
 		if m.renderZenStatus(zenContentWidth(m.width)) != "" {
 			statusH = 1
@@ -1389,7 +1415,7 @@ func (m Model) chatBodyLines() int {
 		return 0
 	}
 	// Zen 的正文是**分组之后**的行数，和 Normal 那份不一样，不能混用。
-	if m.zenActive() {
+	if m.zenInChat() {
 		return len(m.renderZenBody(th))
 	}
 	return len(m.renderChatBody(th, m.chatBodyWidth()))

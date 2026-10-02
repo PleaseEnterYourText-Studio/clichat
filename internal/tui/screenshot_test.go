@@ -132,8 +132,26 @@ func TestGenerateScreenshots(t *testing.T) {
 
 		// —— Zen Mode ——
 		//
-		// 四张分别覆盖：一对一的安静版、群聊的分组、长正文 + Markdown +
-		// 代码块 + 表格、以及窄终端下的退化。
+		// 六张按「用户实际会走的那条路」排：首页 → 列表 → 会话（一对一）→
+		// 会话（群聊分组）→ 长正文 → 窄终端。
+		{
+			// 首页：字标 + 一个输入框，两样都居中。
+			name:   "05-zen-home",
+			width:  120,
+			height: 30,
+			drive: func(t *testing.T, m Model) Model {
+				return enterZenHome(m)
+			},
+		},
+		{
+			// 列表：只剩「未读 / 已读」和选中标记，其余元数据全删了。
+			name:   "06-zen-list",
+			width:  120,
+			height: 30,
+			drive: func(t *testing.T, m Model) Model {
+				return enterZenList(m)
+			},
+		},
 		{
 			// 一对一：Zen 最想服务的那种场景 —— 两个人、话不多、
 			// 没有第三个名字来分神。
@@ -141,38 +159,34 @@ func TestGenerateScreenshots(t *testing.T) {
 			// 高度刻意压到 28 而不是跟群聊一样 34：一对一只有四条消息，
 			// 在 34 行里会剩下一大片空。留白是设计的一部分，但空到像是
 			// 「内容没加载出来」就不是了。
-			name:   "05-zen-chat",
+			name:   "07-zen-chat",
 			width:  120,
 			height: 28,
 			drive: func(t *testing.T, m Model) Model {
-				m = openThreadWith(t, m, "carol@example.com")
-				m, _ = update(m, keyMsg("f2"))
-				return m
+				return enterZenChat(t, openThreadWith(t, m, "carol@example.com"))
 			},
 		},
 		{
 			// 群聊 + 分组：三个人交替发言，正好看「名字只出现一次、
 			// 连着说的几句归到一组」这件事。
-			name:   "06-zen-group",
+			name:   "08-zen-group",
 			width:  120,
 			height: 34,
 			drive: func(t *testing.T, m Model) Model {
-				m, _ = update(m, keyMsg("enter")) // 光标默认在最新那条（产品评审）
-				m = loadBodies(t, m)
-				m, _ = update(m, keyMsg("f2"))
-				return m
+				// 光标默认在最新那条（产品评审）。
+				m, _ = update(m, keyMsg("enter"))
+				return enterZenChat(t, loadBodies(t, m))
 			},
 		},
 		{
-			// 长正文：滚动条、Markdown 标题 / 列表 / 链接 / 代码块 / 表格
-			// 一起出现，看它们在一列窄正文里会不会打架。
-			name:   "07-zen-long",
+			// 长正文：Markdown 标题 / 列表 / 链接 / 代码块 / 表格一起出现，
+			// 看它们在一列窄正文里会不会打架。
+			name:   "09-zen-long",
 			width:  120,
 			height: 40,
 			drive: func(t *testing.T, m Model) Model {
 				m, _ = update(m, keyMsg("enter"))
-				m = loadBodies(t, m)
-				m, _ = update(m, keyMsg("f2"))
+				m = enterZenChat(t, loadBodies(t, m))
 				// 往上卷一点，把代码块和表格都带进可视区。
 				m.scrollChat(8)
 				return m
@@ -181,14 +195,12 @@ func TestGenerateScreenshots(t *testing.T) {
 		{
 			// 窄终端：低于 singlePaneWidth，自己的消息取消右对齐，
 			// 正文列退化成「终端宽度减 2」。
-			name:   "08-zen-narrow",
+			name:   "10-zen-narrow",
 			width:  72,
 			height: 26,
 			drive: func(t *testing.T, m Model) Model {
 				m, _ = update(m, keyMsg("enter"))
-				m = loadBodies(t, m)
-				m, _ = update(m, keyMsg("f2"))
-				return m
+				return enterZenChat(t, loadBodies(t, m))
 			},
 		},
 	}
@@ -209,6 +221,37 @@ func TestGenerateScreenshots(t *testing.T) {
 			t.Logf("%s: %dx%d, %d 行, 首行 %q", s.name, s.width, s.height, len(lines), lines[0])
 		})
 	}
+}
+
+// 下面三个入口都收掉了那行一次性提示。
+//
+// 截图要的是**稳态**，不是「刚进来还没按键」的那一瞬 —— 那行提示只在用户
+// 按第一个键之前存在，拿它当常态会误导读者以为界面上常驻着一行快捷键。
+// 它本身在帮助页和 README 的文字里都有说明。
+
+// enterZenHome 进 Zen，停在首页。
+func enterZenHome(m Model) Model {
+	m, _ = update(m, keyMsg("f2"))
+	m.zenShowHint = false
+	return m
+}
+
+// enterZenList 进 Zen 并走到列表屏。
+func enterZenList(m Model) Model {
+	m = enterZenHome(m)
+	m, _ = update(m, keyMsg("tab"))
+	m.zenShowHint = false
+	return m
+}
+
+// enterZenChat 进 Zen 并走到会话屏。
+func enterZenChat(t *testing.T, m Model) Model {
+	t.Helper()
+	m = enterZenHome(m)
+	m, _ = update(m, keyMsg("tab"))
+	m, _ = update(m, keyMsg("enter"))
+	m.zenShowHint = false
+	return m
 }
 
 // openThreadWith 打开参与者里含 addr 的那个会话。

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
@@ -30,6 +31,28 @@ const (
 	layoutZen
 )
 
+// zenScreen 是 Zen 空间里的三屏。
+//
+// 和 layout 的分工：layout 决定「在不在 Zen 里」，zenScreen 决定「在 Zen 的
+// 哪一屏」。进入 Zen 之前 mode 记着 Normal 世界停在哪，退出时原样回去 ——
+// 所以进 Zen 不会丢掉「我本来在哪个界面」这件事。
+//
+// 三屏是一个栈，Esc 一次退一层：
+//
+//	home ──Tab──▶ list ──Enter──▶ chat
+//	 ▲             │               │
+//	 └────Esc──────┘◀─────Esc──────┘
+type zenScreen uint8
+
+const (
+	// zenHome 是首页：字标 + 一个输入框。进 Zen 的落点。
+	zenHome zenScreen = iota
+	// zenList 是会话列表。
+	zenList
+	// zenChat 是单个会话的读写界面。
+	zenChat
+)
+
 const (
 	// zenInputPrompt 是 Zen 下的输入提示符。
 	//
@@ -52,7 +75,75 @@ const (
 	// 提成常量是因为它现在有三个地方要写：进会话时设、会话里重设、
 	// 以及从 Zen 切回来时还原。三处各写一遍字面量，改一处漏两处。
 	chatInputPlaceholder = "输入消息，回车发送"
+
+	// zenHint 是刚进 Zen 时那一行一次性提示 —— 每屏一句，见 zenHintFor。
+	//
+	// Zen 为了安静把常驻提示全删了 —— 删过头了：连「怎么换会话」都没人
+	// 知道（NoWint 直接来问了一遍，这就是证据）。所以留一行，但**只留到
+	// 用户第一次按键为止**：他要找的就是这一下，找到之后这行就该消失，
+	// 不该变成又一个常驻 footer。
 )
+
+// zenHintFor 返回某一屏上那行一次性提示。
+//
+// 分屏写而不是共用一句：三屏能做的事完全不同，一句「Ctrl+↑/↓ 切会话」
+// 摆在首页上是在回答一个用户还没问的问题。
+func zenHintFor(s zenScreen) string {
+	switch s {
+	case zenHome:
+		return "Tab 会话列表 · 输入后回车发送 · F2 退出"
+	case zenList:
+		return "↑/↓ 选 · 回车打开 · Esc 回首页"
+	default:
+		return "Esc 会话列表 · F2 首页 · Ctrl+↑/↓ 换会话"
+	}
+}
+
+// zenLogoGlyphs 是字标用的 5×5 点阵字形。
+//
+// 只有 CLICHAT 用得到的六个字母。用 █ 拼：它是 U+2588 FULL BLOCK，
+// 在终端里宽度确定为 1 列（虽然 East Asian Width 把它算作 Ambiguous，
+// 但 cellWidth 会把 Ambiguous 钉成 1，和 lipgloss.Width 同一把尺子）。
+var zenLogoGlyphs = map[rune][5]string{
+	'C': {"█████", "█    ", "█    ", "█    ", "█████"},
+	'L': {"█    ", "█    ", "█    ", "█    ", "█████"},
+	'I': {"█████", "  █  ", "  █  ", "  █  ", "█████"},
+	'H': {"█   █", "█   █", "█████", "█   █", "█   █"},
+	'A': {" ███ ", "█   █", "█████", "█   █", "█   █"},
+	'T': {"█████", "  █  ", "  █  ", "  █  ", "  █  "},
+}
+
+// zenLogoWord 是字标拼的词。
+const zenLogoWord = "CLICHAT"
+
+// zenLogo 把词拼成 5 行点阵；正文列塞不下时退回一行纯文字。
+//
+// 5 行是权衡出来的：再高在小窗口（80x24）上会把输入框挤出屏幕，再矮
+// 就认不出字形了。宽度是 7×5 + 6 个间隔 = 41 列。
+//
+// 退回一行是必需的：40 列的终端上正文列只有 38 列，41 列的字标会横向溢出，
+// 把整个版面撑坏（这正是 TestZen_LinesNeverExceedTerminalWidth 抓到的）。
+// 字标是装饰，装饰不该撑破版面。退回时用「字母 + 空格」拉开的写法，
+// 13 列，窄终端上仍然像一个字标而不是普通文字。
+func zenLogo(contentW int) []string {
+	rows := make([]string, 5)
+	for i, ch := range zenLogoWord {
+		g, ok := zenLogoGlyphs[ch]
+		if !ok {
+			continue
+		}
+		for r := 0; r < 5; r++ {
+			if i > 0 {
+				rows[r] += " "
+			}
+			rows[r] += g[r]
+		}
+	}
+	if textWidth(rows[0]) > contentW {
+		return []string{strings.Join(strings.Split(zenLogoWord, ""), " ")}
+	}
+	return rows
+}
 
 // zenGroupWindow 是同一个人连着说的几句话被并成一组的时间窗。
 //
@@ -69,38 +160,72 @@ const zenGroupWindow = 15 * time.Minute
 // 状态栏 —— 差的就是这些留白。
 const zenChromeHeight = 6
 
+// zenHomeBoxChrome 是首页输入框那圈边框 + 左右内边距占掉的列数。
+//
+// 圆角边框左右各 1 列，Padding(0,1) 左右各 1 列 —— 一共 4 列。
+const zenHomeBoxChrome = 4
+
 // ---- 状态 ----
 
 // zenActive 说当前是不是真的在用 Zen 布局。
 //
-// 两个条件都要满足：layout 选了 Zen，**且**当前处在会话里。
-//
-// 列表、搜索、文件夹选择器、确认框这些界面没有 Zen 形态 —— 它们本来就是
-// 「管理」界面而不是「读」界面，做成留白排版只会把信息密度白白扔掉。
-// 所以从会话退回列表时，layout 那个开关留在原地不动（用户按 F2 再进会话
-// 时还是 Zen），但画出来的已经是 Normal 的列表。
+// 只看 layout 这一个开关。mode 不参与判断 —— 它是 Normal 世界的状态，
+// 在 Zen 里被原样保留着，退出时用来回到原来的界面。
 func (m Model) zenActive() bool {
-	return m.layout == layoutZen && (m.mode == modeChat || m.mode == modeNewChat)
+	return m.layout == layoutZen
 }
 
-// toggleZen 在 Normal 与 Zen 之间切换。
-func (m *Model) toggleZen() {
-	if m.layout == layoutZen {
-		m.layout = layoutNormal
+// zenInChat 说当前是不是在 Zen 的**会话屏**上。
+//
+// 滚动相关的几个函数只关心这一屏：首页和列表没有可滚的正文，用会话屏的
+// 可见行数去算它们的高度只会得出一个没有意义的数。
+func (m Model) zenInChat() bool {
+	return m.layout == layoutZen && m.zenScreen == zenChat
+}
+
+// applyInputStyle 按当前布局和屏幕设置输入框的提示符与占位文字。
+//
+// 集中在一处：进 Zen、在 Zen 里换屏、从 Zen 里打开一个会话（enterThread 会
+// 把占位文字设回 Normal 那套）—— 三条路都要设对，散着写必然漏一条。
+func (m *Model) applyInputStyle() {
+	if !m.zenActive() {
 		m.input.Prompt = normalInputPrompt
 		m.input.PromptStyle = lipgloss.NewStyle()
 		m.input.Placeholder = chatInputPlaceholder
-	} else {
-		m.layout = layoutZen
-		m.input.Prompt = zenInputPrompt
-		m.input.PromptStyle = zenAccent
-		m.input.Placeholder = zenInputPlaceholder
+		return
 	}
-	m.syncInputWidth()
+	m.input.Prompt = zenInputPrompt
+	m.input.PromptStyle = zenAccent
+	m.input.Placeholder = zenInputPlaceholder
+}
 
-	// 两种布局的可见行数不同，旧的滚动位置在新布局下可能越界。不收敛的话
-	// 切过去会看到一片空白 —— clampChatScroll 的注释里记着同一个坑在
-	// 窗口缩放时也踩过。
+// toggleZen 在 Normal 与 Zen 之间切换。
+//
+// 进 Zen 一律落在首页；出 Zen 回到进之前那个界面（mode 没被动过）。
+func (m *Model) toggleZen() {
+	if m.layout == layoutZen {
+		m.layout = layoutNormal
+		m.zenShowHint = false
+		m.applyInputStyle()
+		m.syncInputWidth()
+		m.clampChatScroll()
+		return
+	}
+
+	m.layout = layoutZen
+	m.zenScreen = zenHome
+	// 进来先亮一下怎么用，用户按第一个键就收掉。
+	m.zenShowHint = true
+	m.applyInputStyle()
+	m.syncInputWidth()
+	m.clampChatScroll()
+}
+
+// goZen 切到 Zen 里的某一屏。
+func (m *Model) goZen(s zenScreen) {
+	m.zenScreen = s
+	m.applyInputStyle()
+	m.syncInputWidth()
 	m.clampChatScroll()
 }
 
@@ -114,7 +239,12 @@ func (m *Model) syncInputWidth() {
 		m.input.Width = 0
 		return
 	}
-	w := zenContentWidth(m.width) - textWidth(m.input.Prompt)
+	avail := zenContentWidth(m.width)
+	if m.zenScreen == zenHome {
+		// 首页的输入框外面套了一圈边框和左右各一格内边距。
+		avail -= zenHomeBoxChrome
+	}
+	w := avail - textWidth(m.input.Prompt)
 	if w < 10 {
 		w = 10
 	}
@@ -240,26 +370,208 @@ func (m Model) zenPresentation(th thread.Thread) []zenItem {
 
 // ---- 渲染 ----
 
-// viewZen 是 Zen 布局的全部。
+// zenFrame 是 Zen 三屏共用的画布参数。
+//
+// 抽出来的直接原因是「每行补齐到终端全宽」那件事：它之前只在会话屏上做了，
+// 漏掉就会让居中排版在按最长行开窗的渲染器里整个塌掉（README 截图歪过一次）。
+// 三屏各写一遍，迟早再漏一遍。
+type zenFrame struct {
+	width    int // 终端宽
+	contentW int // 正文列宽
+	left     int // 正文列左侧留白
+}
+
+func (m Model) zenFrame() zenFrame {
+	contentW := zenContentWidth(m.width)
+	return zenFrame{width: m.width, contentW: contentW, left: zenLeftPad(m.width, contentW)}
+}
+
+// indent 把一行挪进正文列。
+func (f zenFrame) indent(s string) string {
+	if f.left <= 0 || s == "" {
+		return s
+	}
+	return strings.Repeat(" ", f.left) + s
+}
+
+// center 在正文列里把一行居中（按纯文本宽度算，所以先算补白再上色）。
+func (f zenFrame) center(s string) string {
+	pad := (f.contentW - textWidth(s)) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	return strings.Repeat(" ", pad) + s
+}
+
+// fit 把行数补齐到 height、每行补齐到终端全宽，然后拼成一整块。
+func (f zenFrame) fit(lines []string, height int) string {
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	for i, ln := range lines {
+		lines[i] = padRight(ln, f.width)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// viewZen 是 Zen 空间的入口，按 zenScreen 分派。
+func (m Model) viewZen() string {
+	switch m.zenScreen {
+	case zenHome:
+		return m.viewZenHome()
+	case zenList:
+		return m.viewZenList()
+	default:
+		return m.viewZenChat()
+	}
+}
+
+// viewZenHome 是首页：字标 + 一个输入框，两样都居中。
+//
+// 只有这两样。没有状态栏、没有最近会话、没有版本号 —— 首页是「安静地
+// 开始写一句话」的地方，多一个元素就多一次分心。
+func (m Model) viewZenHome() string {
+	f := m.zenFrame()
+
+	logo := zenLogo(f.contentW)
+
+	// 输入框外面套一圈很淡的圆角边框。这是 Zen 里唯一一处边框，值得说明：
+	// 「不要容器」那条规矩针对的是**消息**（气泡、卡片、灰底），而首页上
+	// 这是一个表单控件 —— 没有边框的话，一片空白里那个 › 提示符看不出
+	// 「这里可以打字」。
+	boxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(zenRuleFg).
+		Padding(0, 1).
+		Width(f.contentW - zenHomeBoxChrome)
+	box := strings.Split(boxStyle.Render(m.input.View()), "\n")
+
+	// 字标 + 空行 + 输入框算作一块，整块垂直居中。
+	const gap = 2
+	blockH := len(logo) + gap + len(box)
+	top := (m.height - blockH) / 2
+	if top < 1 {
+		top = 1
+	}
+
+	lines := make([]string, 0, m.height)
+	for i := 0; i < top; i++ {
+		lines = append(lines, "")
+	}
+	for _, l := range logo {
+		lines = append(lines, f.indent(f.center(zenText.Render(l))))
+	}
+	for i := 0; i < gap; i++ {
+		lines = append(lines, "")
+	}
+	for _, l := range box {
+		lines = append(lines, f.indent(f.center(l)))
+	}
+
+	// 提示单独钉在底部，不参与上面那块居中 —— 否则它一出现整块就会往上跳。
+	if status := m.renderZenStatus(f.contentW); status != "" {
+		for len(lines) < m.height-1 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, f.indent(status))
+	}
+
+	return f.fit(lines, m.height)
+}
+
+// viewZenList 是会话列表。
+//
+// 比 Normal 的列表少掉全部元数据：没有文件夹标签、没有星标、没有时间、
+// 没有「等 N 人」。留下的只有「未读 / 已读」这一条信息 —— 因为它决定了
+// 你下一眼看哪一条。选中用行首一个 › 标出来，不用反白：反白是整行的底色，
+// 正是 Zen 要去掉的那种东西。
+func (m Model) viewZenList() string {
+	f := m.zenFrame()
+
+	lines := make([]string, 0, m.height)
+	lines = append(lines, "")
+	lines = append(lines, f.indent(f.center(zenFaint.Render("会话"))))
+	lines = append(lines, "")
+
+	if len(m.visible) == 0 {
+		lines = append(lines, f.indent(f.center(zenFaint.Render("还没有会话"))))
+		return f.fit(lines, m.height)
+	}
+
+	// 正文区能放几行：扣掉上面 3 行和底部 2 行（空行 + 提示）。
+	room := m.height - 5
+	if room < 1 {
+		room = 1
+	}
+	top := m.zenListTop(room)
+
+	for i := top; i < len(m.visible) && len(lines) < m.height-2; i++ {
+		th := m.visible[i]
+		selected := i == m.cursor
+
+		// 一行装下「谁 · 在聊什么」。
+		//
+		// Normal 的列表是两行（名字一行、主题一行），这里压成一行：Zen 的
+		// 列表是「挑一个进去读」，不是「逐个核对」。但主题不能省 —— 只写
+		// 参与者的话，一眼扫过去根本不知道哪个会话是哪个（实测截图里
+		// 十条全是人名，等于没有信息）。
+		label := threadTitle(th)
+		if th.Subject != "" {
+			label += " · " + th.Subject
+		}
+
+		if !selected && th.Unread == 0 {
+			// 已读且未选中：压到最弱的一档，让未读那几条自己跳出来。
+			lines = append(lines, f.indent(zenFaint.Render(truncate("  "+label, f.contentW))))
+			continue
+		}
+
+		marker := "  "
+		if selected {
+			marker = "› "
+		}
+		style := zenText
+		if th.Unread == 0 {
+			style = zenMeta
+		}
+		lines = append(lines, f.indent(style.Render(truncate(marker+label, f.contentW))))
+	}
+
+	if status := m.renderZenStatus(f.contentW); status != "" {
+		lines = append(lines, "")
+		lines = append(lines, f.indent(status))
+	}
+	return f.fit(lines, m.height)
+}
+
+// zenListTop 是列表当前该从第几条开始画（跟随光标滚动）。
+func (m Model) zenListTop(room int) int {
+	top := 0
+	if m.cursor >= room {
+		top = m.cursor - room + 1
+	}
+	if max := len(m.visible) - room; top > max {
+		top = max
+	}
+	if top < 0 {
+		top = 0
+	}
+	return top
+}
+
+// viewZenChat 是会话屏。
 //
 // 它和 viewTwoPane / viewSinglePane 是**平级**的另一套排版，不是它们
 // 的参数化版本 —— 两边除了「都把正文按内容折行」之外没有共同结构：
 // Normal 是「列表 + 会话 + 状态栏」，Zen 是「一行头部 + 一列居中正文 +
 // 一条分隔线 + 一个输入框」。硬合并只会得到一堆 if。
-func (m Model) viewZen() string {
-	width := m.width
-	contentW := zenContentWidth(width)
-	left := zenLeftPad(width, contentW)
+func (m Model) viewZenChat() string {
+	f := m.zenFrame()
 
-	// 内容列居中：每行统一左移 left 格。
-	indent := func(s string) string {
-		if left <= 0 || s == "" {
-			return s
-		}
-		return strings.Repeat(" ", left) + s
-	}
-
-	status := m.renderZenStatus(contentW)
+	status := m.renderZenStatus(f.contentW)
 	// 可见行数走 chatViewport()，和 maxChatScroll / chatPageStep 用的是
 	// 同一个数 —— 各算一遍迟早对不上，表现是「滚到底还差半行」。
 	msgH := m.chatViewport()
@@ -268,7 +580,7 @@ func (m Model) viewZen() string {
 
 	th, ok := m.activeThread()
 	if ok {
-		lines = append(lines, indent(m.renderZenHeader(th, contentW)))
+		lines = append(lines, f.indent(m.renderZenHeader(th, f.contentW)))
 	} else {
 		lines = append(lines, "")
 	}
@@ -280,7 +592,7 @@ func (m Model) viewZen() string {
 	if ok {
 		body = tailWindow(m.renderZenBody(th), msgH, m.scroll)
 	} else {
-		body = []string{indent(zenFaint.Render(truncate(m.zenEmptyHint(), contentW)))}
+		body = []string{f.indent(zenFaint.Render(truncate(m.zenEmptyHint(), f.contentW)))}
 	}
 
 	// 不够一屏时留白留在**上面**，正文贴着输入框。
@@ -292,42 +604,18 @@ func (m Model) viewZen() string {
 		lines = append(lines, "")
 	}
 	for _, l := range body {
-		lines = append(lines, indent(l))
+		lines = append(lines, f.indent(l))
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, indent(zenRule.Render(strings.Repeat("─", contentW))))
+	lines = append(lines, f.indent(zenRule.Render(strings.Repeat("─", f.contentW))))
 	lines = append(lines, "")
-	lines = append(lines, indent(m.input.View()))
+	lines = append(lines, f.indent(m.input.View()))
 	if status != "" {
-		lines = append(lines, indent(status))
+		lines = append(lines, f.indent(status))
 	}
 
-	// 兜底：终端特别矮时上面那些固定行可能已经超出，硬裁掉，
-	// 免得 bubbletea 按超出的行数去排光标。
-	if len(lines) > m.height {
-		lines = lines[:m.height]
-	}
-	for len(lines) < m.height {
-		lines = append(lines, "")
-	}
-
-	// ⚠️ 每行都要补齐到**终端全宽**，不能只画到正文列右沿就收手。
-	//
-	// 不补的话，最长的那行（分隔线）只有「左留白 + 正文列」那么宽，
-	// 右半边是**不存在**的空白 —— 于是：
-	//
-	//   - 真实终端里靠终端背景兜着，看着还行；
-	//   - 但任何按「最长行」开窗的渲染器（截图链路里的 freeze 就是）
-	//     会把窗口开成「左留白 + 正文列」宽，正文列立刻贴到右边去，
-	//     整个居中排版全废。README 里那几张截图就是这么歪的。
-	//
-	// Normal 布局没这个问题：它的两栏加起来正好铺满，天然就是全宽。
-	// Zen 主动留白，所以必须自己把这层留白**写出来**。
-	for i, ln := range lines {
-		lines[i] = padRight(ln, m.width)
-	}
-	return strings.Join(lines, "\n")
+	return f.fit(lines, m.height)
 }
 
 // zenEmptyHint 是没有打开会话时正文区那一句话。
@@ -457,6 +745,153 @@ func (m Model) renderZenStatus(contentW int) string {
 		return zenError.Render(truncate(m.status, contentW))
 	case m.app != nil && !m.connected:
 		return zenFaint.Render("offline")
+	// 提示排在最后：真实状态（同步中 / 报错 / 掉线）优先于它。
+	// 反过来的话，一进 Zen 就掉线会看不到掉线。
+	case m.zenShowHint:
+		return zenFaint.Render(truncate(zenHintFor(m.zenScreen), contentW))
 	}
 	return ""
+}
+
+// ---- 按键 ----
+
+// handleZenKey 处理 Zen 空间里的按键。
+//
+// 会话屏把大部分键让给 handleChatKey —— 输入、滚动、发信、刷新那些行为
+// 和 Normal 会话完全一样，没有理由写第二遍。
+func (m Model) handleZenKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// 进 Zen 后那行提示只留到用户第一次按键为止。
+	//
+	// 放在分派**之前**：几乎所有按键都会在下面 return，写在后面就永远
+	// 执行不到。f2 除外 —— 它自己会把提示重新点亮。
+	if m.zenShowHint && msg.String() != "f2" {
+		m.zenShowHint = false
+	}
+
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	// F2 = 回家。在会话屏或列表上按是回首页，**在首页按才是离开 Zen**。
+	//
+	// 为什么不做成「哪儿按都直接退出」：F2 是从会话里按进来的，进去之后
+	// 再按同一个键，用户的预期是「回到刚才那个起点」而不是「把整个 Zen
+	// 关掉」—— 关掉之后他就得重新按 F2、重新找会话。分两步退（会话→首页
+	// →离开）和 Esc 那条「一次退一层」是同一个规矩。
+	case "f2":
+		if m.zenScreen == zenHome {
+			m.toggleZen()
+			return m, nil
+		}
+		m.goZen(zenHome)
+		return m, nil
+	}
+
+	switch m.zenScreen {
+	case zenHome:
+		return m.handleZenHomeKey(msg)
+	case zenList:
+		return m.handleZenListKey(msg)
+	default:
+		return m.handleZenChatKey(msg)
+	}
+}
+
+// handleZenHomeKey 是首页的按键。
+//
+// 首页只有一件事可做：写一句话。Tab 去列表，Esc / F2 退出 Zen。
+func (m Model) handleZenHomeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "tab":
+		m.goZen(zenList)
+		return m, nil
+	case "esc":
+		m.toggleZen()
+		return m, nil
+	case "enter":
+		text := strings.TrimSpace(m.input.Value())
+		if text == "" {
+			return m, nil
+		}
+		th, ok := m.zenHomeTarget()
+		if !ok {
+			m.status = "还没有会话可以发 —— 先按 Tab 挑一个"
+			return m, nil
+		}
+		m.input.SetValue("")
+		m.lastSentText = text
+		m.busy = true
+		// 发出去之后顺手把这个会话打开，让用户看见自己刚说的话落到了哪儿。
+		m.activeID = th.ID
+		m.scroll = 0
+		return m, tea.Batch(m.replyCmd(text), m.loadActiveBodiesCmd())
+	}
+
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// handleZenListKey 是列表的按键。
+//
+// 只留导航和打开：文件夹、删除、星标这些「管理」动作仍然在 Normal 的列表上，
+// Zen 的列表是「挑一个进去读」，不是「打理收件箱」。
+func (m Model) handleZenListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "tab":
+		m.goZen(zenHome)
+		return m, nil
+	case "up", "k":
+		m.moveCursor(-1)
+		return m, nil
+	case "down", "j":
+		m.moveCursor(1)
+		return m, nil
+	case "home", "g":
+		m.cursor = 0
+		m.clampCursor()
+		return m, nil
+	case "end", "G":
+		m.cursor = len(m.visible) - 1
+		m.clampCursor()
+		return m, nil
+	case "enter":
+		if m.cursor < 0 || m.cursor >= len(m.visible) {
+			return m, nil
+		}
+		next, cmd := m.enterThread(m.visible[m.cursor], false, false)
+		if mm, ok := next.(Model); ok {
+			// enterThread 会把输入框的占位文字设回 Normal 那套，这里补回来。
+			mm.goZen(zenChat)
+			return mm, cmd
+		}
+		return next, cmd
+	}
+	return m, nil
+}
+
+// handleZenChatKey 是会话屏的按键。
+func (m Model) handleZenChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		// 退一层：会话 → 列表。**不关会话** —— activeID 留着，回列表再按
+		// 回车就回来了。这条和 Normal 那边「Esc 不丢会话」是同一个原则。
+		m.goZen(zenList)
+		return m, nil
+	}
+	return m.handleChatKey(msg)
+}
+
+// zenHomeTarget 是首页输入框发出去时该发给谁。
+//
+// 优先当前打开的会话；没有的话退回列表光标选中的那条 —— 首页上不该出现
+// 「你还没选会话所以不能发」这种死路。
+func (m Model) zenHomeTarget() (thread.Thread, bool) {
+	if th, ok := m.activeThread(); ok {
+		return th, true
+	}
+	if m.cursor >= 0 && m.cursor < len(m.visible) {
+		return m.visible[m.cursor], true
+	}
+	return thread.Thread{}, false
 }

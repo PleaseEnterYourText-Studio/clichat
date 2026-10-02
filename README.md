@@ -59,26 +59,43 @@ starred:
 
 [![Help](docs/images/04-help.png)](docs/images/04-help.png)
 
-**Zen mode** — press `F2` for a quiet, typography-first reading layout: no
-sidebar, no status bar, no message bubbles. The body sits in a centred column
-that never stretches past 78 columns, and consecutive messages from the same
-person are grouped under a single name and timestamp:
+**Zen mode** — press `F2` for a quiet, typography-first reading space. It is a
+separate world with three screens: a home screen, a conversation list, and the
+conversation itself.
 
-[![Zen mode, one to one](docs/images/05-zen-chat.png)](docs/images/05-zen-chat.png)
+The home screen is just the wordmark and one input box. Type a line, hit
+`Enter`, and it goes to the conversation you were last in:
+
+[![Zen mode, home](docs/images/05-zen-home.png)](docs/images/05-zen-home.png)
+
+`Tab` opens the conversation list. Unread conversations stay bright, read ones
+fade back, and the cursor is marked with `›`:
+
+[![Zen mode, list](docs/images/06-zen-list.png)](docs/images/06-zen-list.png)
+
+The conversation itself: no sidebar, no status bar, no message bubbles. The body
+sits in a centred column that never stretches past 78 columns, and consecutive
+messages from the same person are grouped under a single name and timestamp:
+
+[![Zen mode, one to one](docs/images/07-zen-chat.png)](docs/images/07-zen-chat.png)
 
 **Zen mode, group thread** — grouping when several people take turns:
 
-[![Zen mode, group thread](docs/images/06-zen-group.png)](docs/images/06-zen-group.png)
+[![Zen mode, group thread](docs/images/08-zen-group.png)](docs/images/08-zen-group.png)
 
 **Zen mode, long body** — Markdown headings, lists, links, code blocks and
 tables all render inside that narrow column:
 
-[![Zen mode, long body](docs/images/07-zen-long.png)](docs/images/07-zen-long.png)
+[![Zen mode, long body](docs/images/09-zen-long.png)](docs/images/09-zen-long.png)
 
 **Zen mode, narrow terminal** — below 80 columns your own messages stop being
 right-aligned and everything falls back to a single column:
 
-[![Zen mode, narrow terminal](docs/images/08-zen-narrow.png)](docs/images/08-zen-narrow.png)
+[![Zen mode, narrow terminal](docs/images/10-zen-narrow.png)](docs/images/10-zen-narrow.png)
+
+Inside Zen: `Tab` goes home → list, `Enter` opens the selected conversation,
+`Esc` goes back one level, and `F2` returns to the home screen — press it again
+there to leave Zen.
 
 ## Download
 
@@ -390,7 +407,7 @@ message — every action uses a `Ctrl` combination instead.
 |---|---|
 | `Enter` | Send |
 | `Tab` | Reply-all / reply-to-sender |
-| `F2` | Zen mode: a quiet reading layout. Press again to go back |
+| `F2` | Enter Zen mode (or, inside it, go back to its home screen) |
 | `Ctrl+R` | Refresh: sync once now, and re-read this conversation's bodies |
 | `↑` / `↓` | Scroll the conversation (when the input box is empty) |
 | `PgUp` / `PgDn` | Scroll a screen |
