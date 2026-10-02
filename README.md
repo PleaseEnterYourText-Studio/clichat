@@ -370,14 +370,21 @@ message — every action uses a `Ctrl` combination instead.
 | `Enter` | Send |
 | `Tab` | Reply-all / reply-to-sender |
 | `Ctrl+R` | Refresh: sync once now, and re-read this conversation's bodies |
-| `PgUp` / `PgDn` | Scroll |
-| `Esc` | Back to list |
+| `↑` / `↓` | Scroll the conversation (when the input box is empty) |
+| `PgUp` / `PgDn` | Scroll a screen |
+| Wheel | Scrolls whatever the pointer is over: the list cursor on the left, the conversation on the right |
+| `Ctrl+↑` / `Ctrl+↓` | Previous / next conversation |
+| `Esc` | Back to list. The conversation stays open — `Enter` returns to it |
 | `Ctrl+Y` | Copy last message body |
 | `Ctrl+U` | Mark unread and go back |
 | `Ctrl+T` | Star / unstar |
 | `Ctrl+D` | Delete |
 | `F1` | Help |
 | `Ctrl+C` | Quit |
+
+A scroll bar appears on the right edge of the conversation once it is longer
+than one screen — which is also the answer to "is this thing scrollable at
+all?".
 
 ## FAQ
 
