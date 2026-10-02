@@ -56,6 +56,8 @@ func main() {
 	var (
 		showVersion = flag.Bool("version", false, "打印版本号后退出")
 		showConfDir = flag.Bool("config-dir", false, "打印配置目录后退出")
+		wantCheck   = flag.Bool("check", false, "只读自检：连一次邮箱，报出断在哪一步后退出")
+		wantDeep    = flag.Bool("check-deep", false, "自检时额外实测首拉耗时（隐含 -check，明显更慢）")
 	)
 	flag.Parse()
 
@@ -76,6 +78,13 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+
+	// -check-deep 隐含 -check：两个开关表达的是同一件事的不同深度，
+	// 要求用户写两个（而且顺序还不能错）只会让人以为它们无关。
+	if *wantCheck || *wantDeep {
+		os.Exit(runCheck(cfg, *wantDeep))
+	}
+
 	fatal(run(tui.New(cfg)))
 }
 

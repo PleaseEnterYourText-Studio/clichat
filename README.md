@@ -115,6 +115,20 @@ On first run a four-step wizard asks for:
 You will be asked for the master password every time you start. Forgetting it
 means re-configuring the account — press `Ctrl+R` on the unlock screen to do that.
 
+### Command-line flags
+
+| Flag | What it does |
+|---|---|
+| `-check` | Read-only connection self-test: connect once, report which step fails. Reads your saved config, so it does not ask for anything except the master password. |
+| `-check-deep` | Same, plus a real measurement of the initial sync. Slower. Implies `-check`. |
+| `-version` | Print the version and exit. This is also the version reported to the server via IMAP `ID`. |
+| `-config-dir` | Print the config directory and exit. |
+
+In scripts, pass the master password via the `CLICHAT_MASTER` environment
+variable — `-check` reads it before falling back to an interactive prompt. There
+is deliberately no password flag: command-line arguments leak into shell history
+and the process list.
+
 ## Features
 
 **Reading**
@@ -218,6 +232,26 @@ NetEase requires clients to announce themselves with an IMAP `ID` command
 misleading: `LOGIN` succeeds and the error appears on the following `EXAMINE`.
 clichat sends the `ID` command since v0.1.0-beta.9. If you are on an older build,
 upgrade.
+
+**Can't connect — how do I find out which step fails?**
+
+```bash
+clichat -check
+```
+
+It connects once using your saved config and reports step by step: (1) log in and
+select INBOX, (2) fetch a batch of headers, (3) probe the Sent folder. **Whichever
+step it stops at tells you which layer is broken** — a bad auth code, provider
+rate limiting, or an unreachable port.
+
+The check is **read-only**: it never reads a body, never prints subjects or
+senders, and never marks anything as read. Its output is safe to paste into an
+issue.
+
+Add `-check-deep` to also measure how long the initial sync takes. A few hundred
+headers can take tens of seconds, and the UI only says "syncing…" during that
+time — easy to mistake for a hang. This number tells you whether it is genuinely
+slow or actually stuck.
 
 **Do I have to type the master password every time?**
 
