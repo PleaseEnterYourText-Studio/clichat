@@ -129,6 +129,68 @@ func TestGenerateScreenshots(t *testing.T) {
 				return m
 			},
 		},
+
+		// —— Zen Mode ——
+		//
+		// 四张分别覆盖：一对一的安静版、群聊的分组、长正文 + Markdown +
+		// 代码块 + 表格、以及窄终端下的退化。
+		{
+			// 一对一：Zen 最想服务的那种场景 —— 两个人、话不多、
+			// 没有第三个名字来分神。
+			//
+			// 高度刻意压到 28 而不是跟群聊一样 34：一对一只有四条消息，
+			// 在 34 行里会剩下一大片空。留白是设计的一部分，但空到像是
+			// 「内容没加载出来」就不是了。
+			name:   "05-zen-chat",
+			width:  120,
+			height: 28,
+			drive: func(t *testing.T, m Model) Model {
+				m = openThreadWith(t, m, "carol@example.com")
+				m, _ = update(m, keyMsg("f2"))
+				return m
+			},
+		},
+		{
+			// 群聊 + 分组：三个人交替发言，正好看「名字只出现一次、
+			// 连着说的几句归到一组」这件事。
+			name:   "06-zen-group",
+			width:  120,
+			height: 34,
+			drive: func(t *testing.T, m Model) Model {
+				m, _ = update(m, keyMsg("enter")) // 光标默认在最新那条（产品评审）
+				m = loadBodies(t, m)
+				m, _ = update(m, keyMsg("f2"))
+				return m
+			},
+		},
+		{
+			// 长正文：滚动条、Markdown 标题 / 列表 / 链接 / 代码块 / 表格
+			// 一起出现，看它们在一列窄正文里会不会打架。
+			name:   "07-zen-long",
+			width:  120,
+			height: 40,
+			drive: func(t *testing.T, m Model) Model {
+				m, _ = update(m, keyMsg("enter"))
+				m = loadBodies(t, m)
+				m, _ = update(m, keyMsg("f2"))
+				// 往上卷一点，把代码块和表格都带进可视区。
+				m.scrollChat(8)
+				return m
+			},
+		},
+		{
+			// 窄终端：低于 singlePaneWidth，自己的消息取消右对齐，
+			// 正文列退化成「终端宽度减 2」。
+			name:   "08-zen-narrow",
+			width:  72,
+			height: 26,
+			drive: func(t *testing.T, m Model) Model {
+				m, _ = update(m, keyMsg("enter"))
+				m = loadBodies(t, m)
+				m, _ = update(m, keyMsg("f2"))
+				return m
+			},
+		},
 	}
 
 	for _, s := range shots {
@@ -147,6 +209,26 @@ func TestGenerateScreenshots(t *testing.T) {
 			t.Logf("%s: %dx%d, %d 行, 首行 %q", s.name, s.width, s.height, len(lines), lines[0])
 		})
 	}
+}
+
+// openThreadWith 打开参与者里含 addr 的那个会话。
+//
+// 按地址找而不是按列表下标：会话是按最后活跃时间排序的，往样例数据里
+// 加一条消息就会让下标整体挪位，截图脚本跟着悄悄指错人。
+func openThreadWith(t *testing.T, m Model, addr string) Model {
+	t.Helper()
+
+	for i := range m.visible {
+		for _, p := range m.visible[i].Peers {
+			if p == addr {
+				m.cursor = i
+				m, _ = update(m, keyMsg("enter"))
+				return loadBodies(t, m)
+			}
+		}
+	}
+	t.Fatalf("样例数据里找不到参与者含 %s 的会话", addr)
+	return m
 }
 
 // newSampleModel 造一份像真实使用场景的样例数据。
@@ -289,6 +371,23 @@ func newSampleModel(t *testing.T) Model {
 			`</table>`+
 			`<p>现在都恢复了，细节在共享盘。</p>`)
 
+	// 一条带代码块的普通消息。Zen 那几张截图要覆盖「长正文 + Markdown +
+	// 代码块」的形态，而上面那些 HTML 邮件转出来的 Markdown 里没有围栏代码。
+	//
+	// 位置卡在最后两条之间：既要进得了 01-chat 的末屏，也得让 07-zen-long
+	// 一屏之内同时看到代码块和表格。
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p16@x>", References: []string{"<p1@x>"},
+		From: "bob@example.com", FromName: "Bob", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(88 * time.Minute),
+	}, "接口的错误码我按这样定：\n\n"+
+		"```\n"+
+		"404  NOT_FOUND      资源不存在\n"+
+		"409  CONFLICT       版本冲突\n"+
+		"422  UNPROCESSABLE  参数校验失败\n"+
+		"```\n\n"+
+		"有异议今天说，明天就冻结了。")
+
 	// 会话的最后一条由**自己**发出。
 	//
 	// 这一条是给截图凑构图的，两个作用：
@@ -308,10 +407,29 @@ func newSampleModel(t *testing.T) Model {
 	}, "收到，我这边也正常。评审的材料我周五上午发出来。")
 
 	// —— 1:1，两条未读 ——
+	//
+	// 铺成一段真的往来而不是孤零零一条：Zen 的一对一那张图（05）要的是
+	// 「两个人安静地说话」，只有一句话的画面既看不出分组，也看不出
+	// 自己那侧的右对齐。
 	fake.AddMessage("INBOX", mail.Header{
 		MessageID: "<c1@x>", From: "carol@example.com", FromName: "Carol",
-		To: []string{"me@example.com"}, Subject: "季度预算表", Date: base.Add(-40 * time.Minute),
+		To: []string{"me@example.com"}, Subject: "季度预算表", Date: base.Add(-52 * time.Minute),
 	}, "预算表我更新了一版，你有空看一下。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<c2@x>", References: []string{"<c1@x>"},
+		From: "me@example.com", To: []string{"carol@example.com"},
+		Subject: "Re: 季度预算表", Date: base.Add(-48 * time.Minute), Seen: true,
+	}, "看到了，人力那块比上季度高了 12%，是新增了两个 headcount 吗？")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<c3@x>", References: []string{"<c1@x>"},
+		From: "carol@example.com", FromName: "Carol",
+		To: []string{"me@example.com"}, Subject: "Re: 季度预算表", Date: base.Add(-40 * time.Minute),
+	}, "对，两个后端。另外外包那笔我挪到明年一季度了。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<c4@x>", References: []string{"<c1@x>"},
+		From: "me@example.com", To: []string{"carol@example.com"},
+		Subject: "Re: 季度预算表", Date: base.Add(-35 * time.Minute), Seen: true,
+	}, "行，那我按这版报上去。")
 
 	// —— 星标会话 ——
 	fake.AddMessage("INBOX", mail.Header{

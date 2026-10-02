@@ -2,6 +2,9 @@ package tui
 
 import (
 	"errors"
+	"io"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -60,6 +63,10 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlUp}
 	case "ctrl+down":
 		return tea.KeyMsg{Type: tea.KeyCtrlDown}
+	case "f1":
+		return tea.KeyMsg{Type: tea.KeyF1}
+	case "f2":
+		return tea.KeyMsg{Type: tea.KeyF2}
 	}
 	if len(s) == 6 && strings.HasPrefix(s, "ctrl+") {
 		if c := s[5]; c >= 'a' && c <= 'z' {
@@ -68,6 +75,18 @@ func keyMsg(s string) tea.KeyMsg {
 		}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
+
+// TestMain 把日志丢掉。
+//
+// app 层现在会把每次同步的结果写进标准 logger —— 那是给用户排查「同步没
+// 跑完 / 卡住了」用的（见 app.Sync 里的注释）。测试里几乎每个用例都会同步，
+// 于是几千行日志把真正的失败信息淹掉，看一次结果得先 grep 一遍。
+//
+// 只影响测试进程：产品里 logging.Init 会把输出接到 clichat.log，行为不变。
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
 }
 
 // newMockModel 造一个跑在内存假数据上的模型。
