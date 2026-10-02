@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/app"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
@@ -24,6 +25,19 @@ import (
 var version = "dev"
 
 func main() {
+	// 声明终端为深色背景。
+	//
+	// 实测确认：这一行 **不能** 消除启动时那对终端能力查询
+	// （OSC 11 问背景色 + DSR 问光标位置）。那对查询来自 charmbracelet
+	// 栈的底层，我没找到关闭它的开关 —— 别指望这行能治那个。
+	//
+	// 保留它的理由是另一件事：clichat 现在用固定配色，但一旦以后引入
+	// lipgloss.AdaptiveColor，有这个声明就不会因为探测不到背景色而退化。
+	//
+	// 真实终端都会应答那对查询，不影响使用。只有极简终端、或某些
+	// tmux / SSH 转发场景可能不应答，那种情况下会卡在启动画面。
+	lipgloss.SetHasDarkBackground(true)
+
 	var (
 		showVersion = flag.Bool("version", false, "打印版本号后退出")
 		showConfDir = flag.Bool("config-dir", false, "打印配置目录后退出")
