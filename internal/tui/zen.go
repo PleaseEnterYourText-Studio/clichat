@@ -413,13 +413,24 @@ func (f zenFrame) indent(s string) string {
 	return strings.Repeat(" ", f.left) + s
 }
 
-// center 在正文列里把一行居中（按纯文本宽度算，所以先算补白再上色）。
-func (f zenFrame) center(s string) string {
+// center 在正文列里把一行居中。
+//
+// ⚠️ s 必须是**没上色的纯文本**，样式从 style 参数进。理由和折行那条一样：
+// 补白是按 textWidth 算的，而 textWidth 逐 rune 量、不认 ANSI —— 把一个已经
+// 上色的串喂进来，转义序列里的 `[`、`3`、`8`、`m` 这些**可打印字符**会被
+// 当成可见字符算进宽度。
+//
+// 这不是假想：列表标题原先写的是 `f.center(zenFaint.Render("会话"))`，
+// 「会话」4 列被算成 17 列（256 色下 `\x1b[38;5;240m` + `\x1b[0m` 一共 13 个
+// 可打印字符），补白从 37 列缩到 30 列，标题整体偏左 7 列。而且**偏多少取决于
+// 色深** —— 16 色下序列更短，偏得也少，所以肉眼看只是「好像有点歪」，
+// 换个终端又不一样。
+func (f zenFrame) center(s string, style lipgloss.Style) string {
 	pad := (f.contentW - textWidth(s)) / 2
 	if pad < 0 {
 		pad = 0
 	}
-	return strings.Repeat(" ", pad) + s
+	return strings.Repeat(" ", pad) + style.Render(s)
 }
 
 // fit 把行数补齐到 height、每行补齐到终端全宽，然后拼成一整块。
@@ -524,11 +535,11 @@ func (m Model) viewZenList() string {
 
 	lines := make([]string, 0, m.height)
 	lines = append(lines, "")
-	lines = append(lines, f.indent(f.center(zenFaint.Render("会话"))))
+	lines = append(lines, f.indent(f.center("会话", zenFaint)))
 	lines = append(lines, "")
 
 	if len(m.visible) == 0 {
-		lines = append(lines, f.indent(f.center(zenFaint.Render("还没有会话"))))
+		lines = append(lines, f.indent(f.center("还没有会话", zenFaint)))
 		return f.fit(lines, m.height)
 	}
 
