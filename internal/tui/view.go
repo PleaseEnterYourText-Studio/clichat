@@ -56,18 +56,53 @@ func (m Model) bodyHeight() int {
 	return h
 }
 
+// chatPaneWidth 是会话流那一栏的总宽度（含最右那一列滚动条）。
+//
+// 双栏时它是右栏 —— 左边一栏加中间那根竖线之外的全部；单栏时就是整幅。
+// 抽出来是因为「正文折成几行」和「正文画多宽」必须是同一个数，两边各
+// 算一遍的话，改了布局里的一处、另一处就开始骗人。
+func (m Model) chatPaneWidth() int {
+	if m.width < singlePaneWidth {
+		return m.width
+	}
+	return m.width - m.listWidth() - 1
+}
+
+// chatBodyWidth 是正文文字可用的宽度 —— 从 chatPaneWidth 里让出最右一列
+// 给滚动条。
+//
+// 让出的一列是**恒定**的，哪怕当前根本不需要滚动条：宽度一变折行位置
+// 就跟着变，正文行数随之变，于是「有没有滚动条」可能因为行数变少而翻转，
+// 宽度再变回来 —— 一个来回抖动的反馈回路。恒定预留一列没有这个问题。
+func (m Model) chatBodyWidth() int {
+	if w := m.chatPaneWidth() - 1; w >= 1 {
+		return w
+	}
+	return 1
+}
+
+// chatViewHeight 是会话正文区能显示的行数。
+//
+// 传进来的是 bodyHeight()（标题 + 正文 + 补白那一整块），减 1 是顶部
+// 那行会话标题。单栏双栏都一样：renderChat 永远先画一行标题。
+func chatViewHeight(bodyH int) int {
+	if bodyH < 2 {
+		return 1
+	}
+	return bodyH - 1
+}
+
 // ---- 主布局 ----
 
 func (m Model) viewTwoPane() string {
 	bodyH := m.bodyHeight()
 	listW := m.listWidth()
-	chatW := m.width - listW - 1
 
 	panes := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		m.renderThreadList(listW, bodyH),
 		"│",
-		m.renderChat(chatW, bodyH),
+		m.renderChat(m.chatPaneWidth(), bodyH),
 	)
 
 	return strings.Join([]string{
@@ -203,10 +238,22 @@ func (m Model) emptyListHint() string {
 
 // ---- 聊天流 ----
 
+// renderChat 画会话流那一栏。
+//
+// width 的契约是「这一栏的总宽度」，也就是 chatPaneWidth()（双栏时右栏、
+// 单栏时整幅）；正文文字实际用 width-1 列，最右一列留给滚动条。
+// TestChat_BodyWidthMatchesLayout 守着这条契约 —— 算行数的地方
+// （Model.chatBodyLines）走的是 chatBodyWidth()，两者差一格就会出现
+// 「能滚，但滚到底还差半行」这种对不上的怪现象。
 func (m Model) renderChat(width, height int) string {
+	contentW := width - 1
+	if contentW < 1 {
+		contentW = 1
+	}
+
 	title := m.chatTitle()
 	lines := make([]string, 0, height)
-	lines = append(lines, styleTitle.Render(truncate(title, width-2)))
+	lines = append(lines, styleTitle.Render(truncate(title, contentW)))
 
 	th, ok := m.activeThread()
 	if !ok {
@@ -222,19 +269,88 @@ func (m Model) renderChat(width, height int) string {
 		default:
 			hint = "  按回车打开左边选中的会话。"
 		}
-		lines = append(lines, styleMuted.Render(truncate(hint, width-2)))
+		lines = append(lines, styleMuted.Render(truncate(hint, contentW)))
 		return fillPane(lines, width, height)
 	}
 
+	all := m.renderChatBody(th, contentW)
+	// 只显示底部放得下的部分；scroll 是从底部往上卷的行数。
+	body := tailWindow(all, chatViewHeight(height), m.scroll)
+	body = addScrollBar(body, len(all), m.scroll, contentW)
+
+	lines = append(lines, body...)
+	return fillPane(lines, width, height)
+}
+
+// renderChatBody 把一个会话里的全部消息渲染成行（不裁剪）。
+//
+// 渲染和裁剪分开是因为「最多能卷多少行」（Model.maxChatScroll）要用到
+// 未裁剪的总行数，而裁剪要用到同一个 scroll 口径。两件事共用这一份行。
+func (m Model) renderChatBody(th thread.Thread, width int) []string {
 	var body []string
 	for _, msg := range th.Messages {
 		body = append(body, m.renderMessage(msg, width)...)
 	}
-	// 只显示底部放得下的部分；scroll 是从底部往上卷的行数。
-	body = tailWindow(body, height-1, m.scroll)
+	return body
+}
 
-	lines = append(lines, body...)
-	return fillPane(lines, width, height)
+// addScrollBar 给正文的每一行右侧接上一列滚动条。
+//
+// width 是正文文字宽度；返回的每行宽 width+1。
+//
+// 正文一屏放得下（total <= len(lines)）时什么也不画，只接一个空格 ——
+// 用不上的滚动条不该在版面边上白竖一根线。反过来说，它的存在本身就是
+// 提示：用户按 ↑/↓ 没反应时，先看一眼右边有没有这条线，就知道「是已经
+// 到底了」还是「这个界面根本不能滚」。
+//
+// 位置换算：scroll 是**从底部往上**卷的行数，滚动条要的是**从顶部往下**
+// 的偏移，所以 off = total - viewH - scroll。scroll 到顶（= max）时
+// off == 0，滑块停在最上面 —— 和「往上卷到尽头就是最早的内容」一致。
+func addScrollBar(lines []string, total, scroll, width int) []string {
+	viewH := len(lines)
+	if viewH == 0 {
+		return lines
+	}
+
+	var track, thumb string
+	thumbTop, thumbH := 0, 0
+	if total > viewH {
+		track = styleScrollBar.Render("│")
+		thumb = styleScrollThumb.Render("┃")
+
+		// 滑块高度按「可见部分占全文的比例」给，至少留一格 —— 否则
+		// 长会话里的滑块会被整除抹成 0，滚动条就只剩轨道，等于没画。
+		thumbH = viewH * viewH / total
+		if thumbH < 1 {
+			thumbH = 1
+		}
+		if thumbH > viewH {
+			thumbH = viewH
+		}
+
+		off := total - viewH - scroll
+		if off < 0 {
+			off = 0
+		}
+		if maxOff := total - viewH; off > maxOff {
+			off = maxOff
+		}
+		thumbTop = off * (viewH - thumbH) / (total - viewH)
+	}
+
+	out := make([]string, 0, viewH)
+	for i, l := range lines {
+		cell := " "
+		switch {
+		case track == "":
+		case i >= thumbTop && i < thumbTop+thumbH:
+			cell = thumb
+		default:
+			cell = track
+		}
+		out = append(out, padRight(l, width)+cell)
+	}
+	return out
 }
 
 func (m Model) chatTitle() string {
@@ -382,7 +498,9 @@ func (m Model) chatHint() string {
 	if m.replyAll {
 		scope = "发给所有人"
 	}
-	return "   （Tab：" + scope + " · Ctrl+R 刷新 · F1 帮助）"
+	// 这里必须带上 Ctrl+↑/↓：它是「输入框有焦点时唯一能换会话的键」，
+	// 而用户抱怨的正是找不到它。会话内的完整清单在帮助页（F1）。
+	return "   （Tab：" + scope + " · Ctrl+↑/↓ 切会话 · Ctrl+R 刷新 · F1 帮助）"
 }
 
 // confirmPrompt 是确认框上的一句话。
@@ -645,18 +763,28 @@ func fillPane(lines []string, width, height int) string {
 }
 
 // tailWindow 取出列表末尾的一段。scroll 是从底部往上卷的行数。
+//
+// 越界的 scroll 在这里被收进来：负数按 0，超过总行数按「卷到顶」。
+// 这是最后一道保险 —— 负责收敛的是 Model.clampChatScroll，但只要有
+// 一条路径漏了收敛（比如窗口刚变小、正文刚被替换），这里也能保证画面
+// 仍然是**正文**，而不是一片空白。空白会让人以为邮件没了。
+//
+// 以前这里没有收敛，`end < height` 时的兜底是 `end = height`，等价于
+// 「scroll 悄悄降到 len-height」；现在把这件事写明，并且两个方向都收。
 func tailWindow(lines []string, height, scroll int) []string {
-	if height <= 0 || len(lines) <= height {
+	if height <= 0 {
+		return nil
+	}
+	if len(lines) <= height {
 		return lines
 	}
-	end := len(lines) - scroll
-	if end > len(lines) {
-		end = len(lines)
+	if maxScroll := len(lines) - height; scroll > maxScroll {
+		scroll = maxScroll
 	}
-	if end < height {
-		end = height
+	if scroll < 0 {
+		scroll = 0
 	}
-	return lines[end-height : end]
+	return lines[len(lines)-height-scroll : len(lines)-scroll]
 }
 
 // threadTitle 给会话起一个短标题。

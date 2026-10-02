@@ -28,6 +28,14 @@ func update(m Model, msg tea.Msg) (Model, tea.Cmd) {
 // ctrl+<字母> 走真实的 KeyCtrl<X> 类型，而不是把 "ctrl+r" 当字面字符串
 // 塞进 KeyRunes —— 后者只是碰巧 String() 也叫 "ctrl+r"，看着能过，
 // 但它模拟的是「用户打了 ctrl+r 这六个字符」，不是按下组合键。
+//
+// ⚠️ 同理，pgup / pgdown / ctrl+up / ctrl+down 必须走下面这张显式表。
+//
+// 这里踩过一次坑：这几个名字以前没在表里，于是落进最后的兜底分支被造成
+// KeyRunes{[]rune("pgup")} —— 它的 String() 碰巧也是 "pgup"，一条测
+// 「PgUp 能滚动」的判据看着是绿的，可那个按键在真实终端里**从来没人按过**
+// （真 KeyPgUp 走的是 \x1b[5~，是键盘上的 PgUp 键）。
+// TestKeyMsg_ProducesRealKeys 守着这条，别再让它退化。
 func keyMsg(s string) tea.KeyMsg {
 	switch s {
 	case "enter":
@@ -40,6 +48,18 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
+	case "home":
+		return tea.KeyMsg{Type: tea.KeyHome}
+	case "end":
+		return tea.KeyMsg{Type: tea.KeyEnd}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
+	case "ctrl+up":
+		return tea.KeyMsg{Type: tea.KeyCtrlUp}
+	case "ctrl+down":
+		return tea.KeyMsg{Type: tea.KeyCtrlDown}
 	}
 	if len(s) == 6 && strings.HasPrefix(s, "ctrl+") {
 		if c := s[5]; c >= 'a' && c <= 'z' {
@@ -201,17 +221,41 @@ func TestModel_TabTogglesReplyAll(t *testing.T) {
 	}
 }
 
+// Esc 只是「退出会话视图」，**不关掉**当前会话。
+//
+// 这条断言曾经是反的（原先要求 Esc 清空 activeID）—— 用户的原话是
+// 「怎么 esc 直接关闭当前会话了？只有在切换会话时才更换」。改成「退一层」
+// 之后会话要留着，再按回车立刻回来，而且退回列表时右栏还显示着它的内容。
+//
+// 真正需要「离开并丢掉」的是 Ctrl+U（标记未读），那条在 scroll_test.go
+// 里单独守着 —— 两个键的语义必须分开，别再合回一个。
 func TestModel_EscReturnsToList(t *testing.T) {
 	m, _ := newMockModel(t)
 	m = syncOnce(t, m)
 	m, _ = update(m, keyMsg("enter"))
+	m = loadBodies(t, m)
+
+	opened := m.activeID
+	if opened == "" {
+		t.Fatal("回车之后应该有一个打开着的会话")
+	}
+
 	m, _ = update(m, keyMsg("esc"))
 
 	if m.mode != modeList {
 		t.Fatalf("Esc 之后 mode = %v, want modeList", m.mode)
 	}
-	if m.activeID != "" {
-		t.Error("Esc 之后应清空当前会话")
+	if m.activeID != opened {
+		t.Errorf("Esc 不该丢下当前会话：activeID = %q，原来是 %q", m.activeID, opened)
+	}
+	if len(m.bodies) == 0 {
+		t.Error("Esc 不该清掉正文 —— 退回列表时右栏还要显示它")
+	}
+
+	// 再按一次回车应该回到同一个会话。
+	m, _ = update(m, keyMsg("enter"))
+	if m.mode != modeChat || m.activeID != opened {
+		t.Errorf("回车没有回到原来的会话：mode=%v activeID=%q", m.mode, m.activeID)
 	}
 }
 

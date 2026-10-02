@@ -93,7 +93,17 @@ func main() {
 // 收尾（断连接、落盘索引）必须在 Bubble Tea 主循环结束后做，
 // 放在 defer 里会因为进程还没退出而和界面刷新抢状态。
 func run(model tui.Model) error {
-	final, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	// 开鼠标是为了滚轮。全屏（AltScreen）模式下终端自己的滚动条已经不
+	// 管用了，不开这个的话右边那栏就只能靠 PgUp/PgDn 滚，而多数人的第一
+	// 反应是滚滚轮 —— 于是「chatView 完全无法滚动」有一半是这么来的。
+	//
+	// 用 CellMotion 而不是 AllMotion：前者只在按下/松开和拖动时上报，
+	// 后者连指针每挪一格都要报一次，白白烧 CPU。滚轮事件 CellMotion
+	// 一样收得到。
+	final, err := tea.NewProgram(model,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	).Run()
 	if m, ok := final.(tui.Model); ok {
 		if closeErr := m.Close(); closeErr != nil && err == nil {
 			err = closeErr

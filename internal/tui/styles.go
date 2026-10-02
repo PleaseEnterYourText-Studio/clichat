@@ -30,6 +30,16 @@ var (
 	// 看得见，足够了。
 	styleTag = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
+	// styleScrollBar / styleScrollThumb 是会话正文右侧那条滚动条。
+	//
+	// 轨道用低调的灰、滑块用亮一些的灰：它是**背景信息**，告诉用户
+	// 「这里还有内容、能滚」，不该比正文本身更抢眼。
+	//
+	// 深浅自适应走和 stylePeerRow 一样的路子 —— 轨道在浅色终端上要用
+	// 浅灰（250），在深色终端上要用深灰（238），写死一个在这边会糊掉。
+	styleScrollBar   = lipgloss.NewStyle().Foreground(scrollBarFg)
+	styleScrollThumb = lipgloss.NewStyle().Foreground(scrollThumbFg)
+
 	// stylePeerRow 是对方消息那几行的底色。
 	//
 	// 只给**对方**的行铺灰底，自己的保持无底色 —— 自己那边靠右对齐、
@@ -47,6 +57,15 @@ var (
 // 同样只差一档）。两边都刻意贴着各自的背景走：这是**分区**用的底色，
 // 不是高亮，抢了正文的对比度就本末倒置了。
 var peerRowBg = lipgloss.AdaptiveColor{Light: "253", Dark: "236"}
+
+// scrollBarFg / scrollThumbFg 是滚动条轨道与滑块的前景色。
+//
+// 两者都刻意和 stylePeerRow 的底色错开：轨道贴着背景（浅底给浅灰、
+// 深底给深灰），滑块反着来，这样一条细线在两种终端上都能看出「有」。
+var (
+	scrollBarFg   = lipgloss.AdaptiveColor{Light: "250", Dark: "238"}
+	scrollThumbFg = lipgloss.AdaptiveColor{Light: "243", Dark: "250"}
+)
 
 // peerRowBgSeq 返回当前终端上该用的底色序列；终端不支持颜色时返回空串。
 //
