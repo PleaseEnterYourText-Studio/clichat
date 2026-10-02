@@ -139,7 +139,11 @@ and the process list.
 - HTML mail converted to Markdown: links and buttons come through as clickable
   addresses, and tables, lists and code blocks keep as much of their shape as
   they can; quoted history trimmed — this is a chat view, and quoting is noise
-  in it
+  in it. See [HTML mail, turned into
+  Markdown](#html-mail-turned-into-markdown) for how
+- …and that Markdown is rendered back into terminal styling — headings lose
+  their hashes, list items get real numbers, links stay clickable. You read
+  mail, not markup
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -170,6 +174,69 @@ and the process list.
 - Credentials: Argon2id + NaCl secretbox
 - Local index is plain JSON — no database
 - Everything on disk lives in one directory you can delete
+
+## HTML mail, turned into Markdown
+
+The mail you actually care about is HTML — and that HTML is not a document, it
+is a **layout**. A "Confirm subscription" button is an `<a>` wrapped in inline
+CSS: strip the tags and the words survive but the address does not, and the
+address was the only part that mattered. A marketing mail's *entire body* is
+often one padded `<table>`. Neither survives a regex.
+
+So clichat parses the HTML into a DOM (`golang.org/x/net/html`) and walks it,
+emitting Markdown. The rules it follows:
+
+- **Links and buttons both become `[text](url)`.** A button in mail is either a
+  styled `<a>`, or a `<button>` / `<input type=submit>`. Only the first carries
+  an `href`, so both go through one fallback chain: `href`, `formaction`,
+  `data-href`, `data-url`, `data-link`, and finally any URL inside `onclick`.
+  Find one and it becomes a link. Find none and the label is bolded instead — a
+  button with no target cannot be a link, but it should not read as body text
+  either.
+- **Image buttons use their `alt`.** `<a><img alt="View order"></a>` is how a
+  lot of transactional mail ships its buttons. A terminal cannot show the
+  image, and `alt` is exactly the text the sender wrote for when it cannot.
+- **Emphasis is wrapped around the content, not the element.** `**hello **`
+  does not render as bold — the trailing space pushes the marker off — so
+  `<b>hello </b>world` has to come out as `**hello** world`, with the space
+  moved outside the markers.
+- **A `<table>` is read as either data or layout.** Header cells in the first
+  row, or an equal column count across rows, means data: a Markdown table.
+  Otherwise it is layout, and the cells are rendered as stacked blocks.
+  Flattening a layout table would collapse the entire mail into one line.
+- **Body text is escaped.** A message containing `2*3` or `[TODAY]` should not
+  come out italic, or open a link nobody wrote.
+- **Quoted history is dropped.** In a chat view, re-quoting the thread you just
+  read is noise — the thread already has it.
+
+It does not try to reproduce CSS. A terminal has no `margin-left: 40px`.
+
+### And then it renders it
+
+Emitting Markdown is only half the job. A terminal that prints `**note**` as
+`**note**` has just moved the problem somewhere else — and until recently that
+is exactly what happened here. The conversation view now renders the body back
+into something readable: `###` becomes a bold line, list items get their real
+numbers (`1.` `2.` `3.`, not three `1.`s — the generator writes `1.` for every
+item on purpose), `[text](url)` shows only the text and stays clickable, and
+`2*3`, escaped on the way in, comes back as `2*3`.
+
+There is no Markdown library in the loop. The input is a **closed** set of
+syntax, because clichat is what wrote it in the first place: every `*`,
+backtick, `_`, `[`, `]` and `<` that came from the mail was escaped into
+`\<char>` on the way out. So an unescaped `*` is always one of ours, and the
+parser can be exact where a general-purpose one has to guess.
+
+Two details that decide whether it looks right:
+
+- **Wrapping happens on plain text, before any colour is applied.** A colour
+  escape sequence is a pile of characters, and anything that measures width per
+  rune counts them as columns — so wrapping after colouring breaks lines in the
+  wrong place, and cuts sequences in half. Colour goes on last.
+- **Links get colour and nothing else.** Give a link's style an underline and
+  the renderer emits a separate sequence per character, which shreds the
+  clickable-link sequence: the link still *looks* right and simply stops
+  working. Clichat would rather have a clickable link than a decorated one.
 
 ## Keyboard Shortcuts
 

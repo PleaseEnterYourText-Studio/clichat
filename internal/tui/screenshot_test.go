@@ -33,14 +33,16 @@ import (
 // （用 charmbracelet/freeze 出 SVG，再用 Edge 无头模式栅格化 —— 为什么
 // 要绕这一圈，见 tools/render-screenshots.py 顶部的说明）。
 //
-// **每次重出，四张 PNG 都会变，即使画面内容没动。** 状态栏那一行的
-// 「上次同步 HH:MM:SS」来自 model.go 里的 time.Now()，它走的是生产代码
-// 路径，而这里驱动的就是生产代码 —— 于是时间戳跟着当下走，四张里每张
-// 都带着它。（消息日期是固定的，见 newSampleModel 里的 base；只有这个
-// 同步时间没固定。）要真正固定得给 Model 注入一个时钟，还没做。
+// **每次重出，01-chat / 02-list / 03-search 这三张会变，即使画面内容没动。**
+// 状态栏那一行的「上次同步 HH:MM:SS」来自 model.go 里的 time.Now()，它走的是
+// 生产代码路径，而这里驱动的就是生产代码 —— 于是时间戳跟着当下走，那三张
+// 都带着它。（消息日期是固定的，见 newSampleModel 里的 base；只有这个同步
+// 时间没固定。）要真正固定得给 Model 注入一个时钟，还没做。
 //
-// 所以提交时别惊讶于 01-chat / 03-search 也进了 diff —— 那是几个数字，
-// 不是版式变了。（渲染本身是可复现的：ANSI 不变，PNG 就不变。）
+// 04-help 不受影响 —— 帮助页上没有状态栏，也就没有那个时钟。所以它是四张里
+// 唯一一张重出后应当**逐字节不变**的；它若进了 diff，那才是真出了问题。
+//
+// （渲染本身是可复现的：ANSI 不变，PNG 就不变。）
 func TestGenerateScreenshots(t *testing.T) {
 	if os.Getenv("CLICHAT_SCREENSHOTS") != "1" {
 		t.Skip("需要 CLICHAT_SCREENSHOTS=1 才跑（见本文件顶部注释）")
@@ -211,6 +213,22 @@ func newSampleModel(t *testing.T) Model {
 		From: "alice@example.com", FromName: "Alice", To: group,
 		Subject: "Re: 周五的产品评审", Date: base.Add(74 * time.Minute),
 	}, "行。那我把议程按这个顺序排一下，明天发出来。")
+	// 这条的正文就是「HTML 邮件转出来的 Markdown」—— 内容原样取自
+	// mail.HTMLToMarkdown 对一封 HTML 邮件的产出，没有手写改写。
+	//
+	// 放它是为了让 01-chat 那张截图能**看出渲染**（这是聊天视图的主角，
+	// 也是最后一条、一定在可视区内）：标题的井号没了、列表补上了真实序号
+	// （生成器一律写「1.」，序号是渲染层补的）、链接只留文字、**强调**变成
+	// 粗体。若哪天渲染器坏了，这张图会直接变成一堆 Markdown 源码。
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p13@x>", References: []string{"<p1@x>"},
+		From: "alice@example.com", FromName: "Alice", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(80 * time.Minute),
+	},
+		"### 评审议程（周五 15:00）\n\n"+
+			"1. 上季度数据回顾\n1. 接口文档里剩下的 TBD\n1. 新版设计稿\n\n"+
+			"会议链接：[meeting.example.com/abc-def-ghi](https://meeting.example.com/abc-def-ghi)\n\n"+
+			"**注意**：资料在共享盘，看**新版**那份，旧版有几处数字是错的。")
 
 	// —— 1:1，两条未读 ——
 	fake.AddMessage("INBOX", mail.Header{

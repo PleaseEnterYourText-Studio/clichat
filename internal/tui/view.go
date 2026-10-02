@@ -280,7 +280,12 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 	} else {
 		out = append(out, " "+who)
 	}
-	for _, line := range wrapLines(body, inner) {
+	// 正文里存的是 Markdown（见 mail.HTMLToMarkdown），这里渲染成终端样式。
+	//
+	// 别改成「先上色再折行」—— 折行必须在 renderMarkdown 内部、在**上色之前**
+	// 完成：按 rune 算宽度的折行会把转义序列的每个字符当成一列，折点落错位置，
+	// 还会把序列拦腰切断。详见 markdown.go 里的说明。
+	for _, line := range renderMarkdown(body, inner) {
 		if mine {
 			out = append(out, padLeft(line, width-2))
 		} else {

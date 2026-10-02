@@ -309,7 +309,7 @@ func TestModel_UnlockRejectsShortMasterPassword(t *testing.T) {
 	}
 }
 
-func TestTruncateAndWrapUseDisplayWidth(t *testing.T) {
+func TestTruncateUsesDisplayWidth(t *testing.T) {
 	// 中文一个字占两列，按 rune 数截断会把行撑宽。
 	if got := truncate("中文字符串", 5); lipgloss.Width(got) > 5 {
 		t.Errorf("truncate 结果超宽: %q (宽 %d)", got, lipgloss.Width(got))
@@ -317,10 +317,32 @@ func TestTruncateAndWrapUseDisplayWidth(t *testing.T) {
 	if got := truncate("abcdefgh", 5); got != "abcd…" {
 		t.Errorf("truncate = %q, want %q", got, "abcd…")
 	}
+}
 
-	for _, line := range wrapLines("中文混排 english words 一起折行", 10) {
-		if w := lipgloss.Width(line); w > 10 {
-			t.Errorf("wrapLines 产出超宽行 %q (宽 %d)", line, w)
+// 纯文本上，这两把尺子必须给出同一个答案。
+//
+// textWidth（styles.go）给折行和截断用，lipgloss.Width 给 padLeft / padRight
+// 用。两者一旦不一致，就会「算着刚好、画出来歪掉」—— 而 East Asian Ambiguous
+// 字符正是它们分叉的地方：go-runewidth 认 locale（本机中文 locale 下把 • —— …
+// ① 算成 2 列），lipgloss 走字素簇、不认 locale（都算 1 列）。
+//
+// 所以这条判据其实是在钉「两边都用同一把尺子」这件事，而不是某个数字。
+func TestTextWidthMatchesLipglossOnPlainText(t *testing.T) {
+	for _, s := range []string{
+		"",
+		"abc",
+		"中文字符串",
+		"• 列表项",
+		"—— 分隔 ——",
+		"省略…号",
+		"①②③",
+		"emoji 😀 混排",
+		"hello wonderful world",
+		"·中间点· 和 → 箭头",
+	} {
+		if got, want := textWidth(s), lipgloss.Width(s); got != want {
+			t.Errorf("%q：textWidth=%d，lipgloss.Width=%d —— 两把尺子不一致，"+
+				"折行和补白会互相拆台", s, got, want)
 		}
 	}
 }
