@@ -39,7 +39,11 @@ const (
 	ConfigFileName = "config.json"
 	CredsFileName  = "credentials.enc"
 	IndexFileName  = "index.json"
-	LogFileName    = "clichat.log"
+	// BodyCacheFileName 是正文缓存。和 index.json 分开放是有意的：
+	// 索引每次同步都要重写（百 KB 量级），正文缓存是 MB 量级 ——
+	// 混在一起等于每次同步都重写几 MB。
+	BodyCacheFileName = "bodies.json"
+	LogFileName       = "clichat.log"
 
 	appDirName = "clichat"
 )
@@ -172,6 +176,9 @@ func filePath(name string) (string, error) {
 
 // IndexPath 返回 header 索引文件的路径。
 func IndexPath() (string, error) { return filePath(IndexFileName) }
+
+// BodyCachePath 返回正文缓存文件的路径。
+func BodyCachePath() (string, error) { return filePath(BodyCacheFileName) }
 
 // LogPath 返回日志文件的路径。
 func LogPath() (string, error) { return filePath(LogFileName) }
