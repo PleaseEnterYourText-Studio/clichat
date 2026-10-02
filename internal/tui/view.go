@@ -209,9 +209,18 @@ func (m Model) renderChat(width, height int) string {
 	th, ok := m.activeThread()
 	if !ok {
 		lines = append(lines, "")
-		if len(m.newChatTo) > 0 {
-			lines = append(lines, styleMuted.Render("  输入内容后回车，就会给 "+strings.Join(m.newChatTo, ", ")+" 发出第一封邮件"))
+		// 右边这片空白在列表模式下是常态，什么都不说会让人以为界面坏了。
+		// 三种情况分开提示，别给一句放之四海而皆准的废话。
+		var hint string
+		switch {
+		case len(m.newChatTo) > 0:
+			hint = "  输入内容后回车，就会给 " + strings.Join(m.newChatTo, ", ") + " 发出第一封邮件"
+		case len(m.visible) == 0:
+			hint = "  左边还没有会话。按 n 新建一个。"
+		default:
+			hint = "  按回车打开左边选中的会话。"
 		}
+		lines = append(lines, styleMuted.Render(truncate(hint, width-2)))
 		return fillPane(lines, width, height)
 	}
 
