@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"hash/fnv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -95,11 +94,15 @@ var (
 	styleTitle    = lipgloss.NewStyle().Bold(true)
 	styleMuted    = lipgloss.NewStyle().Foreground(fgMuted)
 	styleTime     = lipgloss.NewStyle().Foreground(fgTime)
-	styleError    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	styleOK       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	styleSelected = lipgloss.NewStyle().Bold(true).Reverse(true)
-	styleMine     = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	styleLink     = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+
+	// styleError 是错误提示的颜色。
+	//
+	// 用**降过饱和**的红，和 Zen 那边同一个值：纯红（203）在一个安静的
+	// 界面里像一盏警报灯，而这里要说的往往只是「这一次同步没成功」。
+	// 「不正常」这件事靠**颜色出现**本身表达就够了，不需要它刺眼。
+	styleError = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "131", Dark: "174"})
 
 	// styleAccent 是界面里**唯一**的强调色。
 	//
@@ -377,27 +380,23 @@ func hyperlink(url, text string) string {
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
 
-// senderPalette 是群聊里区分不同发言人的颜色。
+// styleSender 是消息头上发件人名字的样式。
 //
-// 挑的是在中深色终端背景上都能看清的中间调，避开接近黑和接近白的两端。
+// ⚠️ 这里原先是一个**十个颜色的调色板**（senderPalette），按地址哈希稳定地
+// 给每个发言人分配一个颜色，好让群聊里一眼认人。它被删掉了，理由有两条：
 //
-// ⚠️ **141 被排除在外了** —— 它是界面唯一的强调色（styleAccent），只用来
-// 说「你现在的位置」。某个发言人碰巧也叫 141 的话，一行名字就会被读成
-// 「这一行是选中项」，强调色的语义当场漏水。这也是"强调色只能有一个"
-// 那条规矩的唯一技术落点：调色板里不许再出现它。
-var senderPalette = []lipgloss.Color{
-	"42", "45", "51", "78", "87", "114", "177", "183", "213", "220",
-}
-
-// senderStyle 按地址稳定地挑一个颜色。
+//  1. **和一个界面只有一个强调色的规矩打架。** 为了让 141 保持"只表示你
+//     现在的位置"，调色板得小心翼翼地绕开它 —— 靠一条注释和一次人工核对
+//     来维持，而"颜色够不够用"这件事每隔一阵就会有人想往里加一个色。
 //
-// 「稳定」是重点：同一个人在这次会话里和下次启动时必须是同一个颜色，
-// 否则群聊里一眼认人会失效。
-func senderStyle(addr string) lipgloss.Style {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(addr))
-	return lipgloss.NewStyle().Foreground(senderPalette[int(h.Sum32())%len(senderPalette)])
-}
+//  2. **它换来的信息，版面已经给了。** 「谁说的」由**对齐**回答：自己发的
+//     靠右，别人的靠左（见 renderMessage 的 padLeft / padRight）。名字的
+//     **亮度**只用来和右边的灰色时间分档。颜色在这里是第三个维度，而它
+//     承载的信息是零 —— 十种色相没有一种对应"这个人是谁"。
+//
+// 所以现在所有发件人**同一个样式**：粗体、终端自己的前景色。想认出是谁，
+// 读名字（名字就在旁边）。这正是 Zen 那套「去掉色相、只留明度」的做法。
+var styleSender = lipgloss.NewStyle().Bold(true)
 
 // maxCellW 是一个字符在终端里最多占的列数（CJK 汉字、全角标点、emoji 都是 2）。
 //

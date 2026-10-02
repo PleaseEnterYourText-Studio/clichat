@@ -41,13 +41,17 @@ clichat just looks at it differently: **treat mail as messages.**
 ## Screenshots
 
 **Conversation view** — the other side's rows are marked with a vertical bar
-while yours are right-aligned; in group threads every sender is coloured. The
+while yours are right-aligned. Every name shares a single style (bold, terminal
+foreground) rather than a per-sender colour: who said it is already answered by
+that alignment, and keeping one accent colour means the screen stays quiet. The
 `HTML` marker in a message head means that body was converted from an HTML mail:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
 **Conversation list** — `▌` marks unread (with the count next to it), `*` marks
-starred, and the time is right-aligned:
+starred, and the time is right-aligned. The second line of each entry summarises
+the **latest message**, not the subject — so the list tells you what was just
+said rather than what the thread was first called:
 
 [![Conversation list](docs/images/02-list.png)](docs/images/02-list.png)
 

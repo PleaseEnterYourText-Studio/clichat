@@ -530,26 +530,55 @@ func (a *App) LastBodyText(th thread.Thread) (string, error) {
 	return a.lastBody(th)
 }
 
+// LastBodyTexts 批量取一批消息的正文，key 是 Message-ID。
+//
+// 给界面做「列表副行显示最新一条消息」用。一次给齐而不是让界面逐个调
+// LastBodyText：界面要的是**当前窗口里那几条**的摘要，逐个调意味着
+// 一轮 N 个命令、N 次重绘，而滚一下就要再来一遍。
+//
+// ⚠️ 拉不到的那条**不出现在返回值里**，也不返回 error：摘要只是列表上的
+// 一行小字，为它报错或者塞一句「加载失败」进列表都是往列表里加噪音。
+// 界面认这个约定 —— 键不在就是没拉到，退回显示主题（见 listRowText）。
+// 一次失败不该让整个列表看起来像坏了。
+func (a *App) LastBodyTexts(msgs []thread.Header) map[string]string {
+	out := make(map[string]string, len(msgs))
+	for _, m := range msgs {
+		text, err := a.lastBodyOf(m)
+		if err != nil || text == "" {
+			continue
+		}
+		out[m.MessageID] = text
+	}
+	return out
+}
+
 // lastBody 取会话里最后一条消息的正文，优先用缓存。
 func (a *App) lastBody(th thread.Thread) (string, error) {
 	if len(th.Messages) == 0 {
 		return "", errors.New("这个会话里没有消息")
 	}
-	last := th.Messages[len(th.Messages)-1]
+	return a.lastBodyOf(th.Messages[len(th.Messages)-1])
+}
 
-	if b, ok := a.cachedBody(last.MessageID); ok {
+// lastBodyOf 取**某一条**消息的正文，优先用缓存。
+//
+// 拉到的正文顺手写进缓存，所以「列表摘要」和「打开会话读到的正文」是
+// 同一份东西 —— 两处各拉一份的话，同一封邮件会被下载两次，而且以后
+// 想给它们装同一个上限（比如「正文最多几 MB」）就是两处要改。
+func (a *App) lastBodyOf(h thread.Header) (string, error) {
+	if b, ok := a.cachedBody(h.MessageID); ok {
 		return b.Text, nil
 	}
-	if last.UID == 0 {
+	if h.UID == 0 {
 		// 本地乐观插入的副本还没同步到服务端，服务端上没有它。
 		return "", nil
 	}
-	msg, err := a.client.Body(last.Folder, last.UID)
+	msg, err := a.client.Body(h.Folder, h.UID)
 	if err != nil {
 		return "", err
 	}
 	b := Body{Text: msg.Body, HTML: msg.HTML}
-	a.cacheBody(last.MessageID, b)
+	a.cacheBody(h.MessageID, b)
 	return b.Text, nil
 }
 

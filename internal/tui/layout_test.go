@@ -1094,7 +1094,7 @@ func TestMouse_EveryListRowOpensItsOwnThread(t *testing.T) {
 	// 第 0 行是列表标题（当前文件夹 / 搜索词），不是会话。
 	for k := 1; k < len(pane); k++ {
 		text := plainText(pane[k])
-		want, isThread := threadNamed(m.visible, text)
+		want, isThread := threadNamed(m, text)
 
 		got, _ := update(m, tea.MouseMsg{
 			X: l.listX + 2, Y: l.bodyTop + k,
@@ -1116,16 +1116,33 @@ func TestMouse_EveryListRowOpensItsOwnThread(t *testing.T) {
 	}
 }
 
-// threadNamed 从列表里一行的文字认出它是哪条会话（标题行、主题行都算）。
+// threadNamed 从列表里一行的文字认出它是哪条会话（名字行、副行都算）。
 //
-// 认不出来就是分组标题或者空白行。取**最长**的那个匹配：主题里提到对方名字
-// 的时候，短的标题会先撞上。
-func threadNamed(list []thread.Thread, text string) (thread.Thread, bool) {
+// 认不出来就是分组标题或者空白行。取**最长**的那个匹配：摘要或主题里
+// 提到对方名字的时候，短的名字会先撞上。
+//
+// ⚠️ 副行的文字要从**模型**取（listSubLine），不能在 thread.Thread 上找。
+// 它现在是「最新一条的正文摘要」，而不在 Thread 结构里 —— 摘要没拉到时
+// 才是主题。照着 th.Subject 去匹配的话，判据只在「摘要还没到」那个相位
+// 成立，一旦夹具里把摘要装上了，它就会把真会话行认成空白行，然后**跳过
+// 那些行不点** —— 一条不再检查任何东西、却依然绿着的判据。
+func threadNamed(m Model, text string) (thread.Thread, bool) {
+	// 渲染出来的那一行可能是**截断**过的（栏宽不够时以 "…" 收尾）。拿截断后的
+	// 串去 Contains 完整的答案必然落空 —— 那是尺子的错，不是产品的错。
+	// 所以两个方向都认：整段答案在这一行里，或者这一行是答案的开头。
+	trimmed := strings.TrimSuffix(strings.TrimSpace(text), "…")
 	best := -1
 	var hit thread.Thread
-	for _, th := range list {
-		for _, s := range []string{threadTitle(th), th.Subject} {
-			if s != "" && strings.Contains(text, s) && len(s) > best {
+	for _, th := range m.visible {
+		for _, s := range []string{threadTitle(th), m.listSubLine(th)} {
+			if s == "" {
+				continue
+			}
+			if !strings.Contains(text, s) &&
+				!(len(trimmed) > 0 && strings.HasPrefix(s, trimmed)) {
+				continue
+			}
+			if len(s) > best {
 				best, hit = len(s), th
 			}
 		}

@@ -634,21 +634,49 @@ func listGroupText(group string, inner int) string {
 // 守着这一点 —— 这是唯一能挡住「改了配色顺手把宽度也改了」的判据。
 func (m Model) listRowText(th thread.Thread, first bool, width int) string {
 	if !first {
-		// 副行是「现在在聊什么」—— 会话里最新一条的主题。一个会话可以
-		// 横跨很多话题，所以它和标题（对方的名字）回答的是两个问题。
-		subject := th.Subject
-		if subject == "" {
-			subject = "(无主题)"
-		}
-		return truncate("  "+subject, width)
+		return truncate("  "+m.listSubLine(th), width)
 	}
 
-	timeStr := listTime(th.LastDate)
+	timeStr := shortTime(th.LastDate)
 	nameW := width - markWidth - textWidth(timeStr) - 2
 	if nameW < 4 {
 		nameW = 4
 	}
 	return listMark(th) + " " + padRight(truncate(threadTitle(th), nameW), nameW) + " " + timeStr
+}
+
+// listSubLine 是列表副行的文字：**这条会话里最新一条消息说了什么**。
+//
+// 它以前放的是主题，现在放正文摘要 —— 用户的原话是「消息列表展示最新
+// 一条消息」。两者回答的问题不一样：主题回答「这段对话叫什么」，摘要
+// 回答「现在讲到哪儿了」。群里聊到第三十轮的时候，主题还停在第一轮的
+// 那个名字上，而列表真正该告诉你的是刚来的那句。
+//
+// 三级兜底，顺序不能换：
+//
+//  1. 摘要 —— 已经拉到的那一条正文（见 Model.previews）。
+//  2. 主题 —— 摘要还没到、拉不到、或者那封本来就没有正文时。
+//  3. 「(无主题)」—— 连主题都没有（生成端理论上不会产出这种，存量数据
+//     里可能有）。副行留空比放一句占位更糟：空白看起来像「这条会话坏了」。
+//
+// ⚠️ 摘要没到就退回主题，是这一条**必须**成立的性质：摘要是一次网络
+// 往返，而列表在它回来之前就已经画出来了。没有兜底的话，开机的头几百
+// 毫秒里所有副行都是空的 —— 那正是用户对「新版本」的第一印象。
+//
+// 自己发的那条前面标「我: 」：摘要是正文原文，不标的话，一句「好的」
+// 会看起来像对方说的（名字那一行是对方的名字）。
+func (m Model) listSubLine(th thread.Thread) string {
+	id := listPreviewID(th)
+	if p := m.previews[id]; p != "" {
+		if m.cfg != nil && th.Messages[len(th.Messages)-1].From == m.cfg.Self() {
+			return "我: " + p
+		}
+		return p
+	}
+	if th.Subject != "" {
+		return th.Subject
+	}
+	return "(无主题)"
 }
 
 // listMark 是列表第一行行首那两列的标记。
@@ -676,7 +704,7 @@ func (m Model) listRowStyled(th thread.Thread, first bool, width int) string {
 		return styleMuted.Render(m.listRowText(th, first, width))
 	}
 
-	timeStr := listTime(th.LastDate)
+	timeStr := shortTime(th.LastDate)
 	nameW := width - markWidth - textWidth(timeStr) - 2
 	if nameW < 4 {
 		nameW = 4
@@ -701,14 +729,24 @@ func (m Model) listRowStyled(th thread.Thread, first bool, width int) string {
 	return left + right + " " + nameStyled + " " + styleTime.Render(timeStr)
 }
 
-// listTime 把会话时间压成 5 列。
+// shortTime 把一个时间压成一个很短的标签。
 //
-// 固定 5 列是**右基准线**的前提：一列时间长短不一的话，右对齐也没用 ——
-// 眼睛看到的是一条毛边（`21:43` 和 `昨天` 和 `06-01` 都是 5 列，正好）。
+// 三个地方共用它：会话列表右侧那一列，以及 Normal / Zen 两种会话里每条
+// 消息的头部。共用的理由和别处一样 —— 「什么时候」这件事只该有一条规则，
+// 各写一套必然漂成「列表说昨天、消息头说 09-28」。
 //
 // 由近及远地降精度：今天给时分、昨天给「昨天」、今年给月日、更早给年月。
 // 这是邮件客户端的老规矩，理由也简单 —— 越久远的邮件越不需要知道几点几分。
-func listTime(t time.Time) string {
+//
+// ⚠️ 消息头那边**不能只写时分**：一条三天前的消息显示 `02:25`，读的人
+// 会以为它是今天凌晨发的。列表里那个位置本来就窄，看不出问题；消息头
+// 独立成行，这个谎就露出来了。
+//
+// ⚠️ 长度**不是**固定的：`21:43` 是 5 列，`昨天` 只有 4 列（两个汉字）。
+// 列表里右边的对齐**不是**靠它等宽，而是靠 nameW 把这点差吸收掉
+// （见 listRowText：`nameW = width - markWidth - textWidth(timeStr) - 2`）——
+// 别照着「都 5 列」的假设去算宽度。
+func shortTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
@@ -1046,11 +1084,20 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 	if body.HTML {
 		tag = "HTML"
 	}
-	timeTxt := msg.Date.Local().Format("15:04")
-	nameStyle := senderStyle(msg.From)
-	if mine {
-		nameStyle = styleMine
-	}
+	// 时间和列表右边那一列走的是同一条降精度梯子（见 shortTime）。
+	//
+	// 这里原先写死 `Format("15:04")`，和 zen 那边的头一样犯过同一个错：
+	// 一条三天前的消息写 `02:25`，读的人会以为它是今天凌晨发的。列表里
+	// 那个位置本来就窄，看不出问题；消息头独立成行，这个谎就露出来了。
+	//
+	// ⚠️ 别改回「只取时分」——上面 headAvail 那段宽度预算依赖的是
+	// **时间这一段的实际宽度**（写的是 textWidth(timeTxt)），所以换了
+	// 格式也不用动那些数字。
+	timeTxt := shortTime(msg.Date)
+	// 名字的样式和发件人**无关**：所有名字同一个样式，认人靠读名字本身，
+	// 「谁说的」靠对齐（自己发的靠右）。原先这里按地址取一个调色板颜色、
+	// 自己发的再用另一支蓝色，现在两样都撤了 —— 见 styleSender。
+	nameStyle := styleSender
 	// 先按可用宽度截断**再**上色 —— 反过来的话 lipgloss 会把转义序列
 	// 算进宽度，右边的边界就歪了（styles.go 里那条硬约束）。显示名是
 	// 对方自己写的，长度没有上限，所以这一步不是多余的。
@@ -1652,7 +1699,11 @@ func (m Model) renderStatus(width int) string {
 	case m.app == nil:
 		// 还没连上，不显示连接状态。
 	case m.connected:
-		lead, leadStyle = "在线", styleOK
+		// 「在线」用灰色，不另开一支绿。正常状态应该**不说话** ——
+		// 常驻的绿色「在线」是在为一个不需要知道的时刻准备颜色，
+		// 而它的代价是整幅界面多一个色相。不正常的那一边（离线）
+		// 才值得用颜色说出来。
+		lead, leadStyle = "在线", styleMuted
 	default:
 		lead, leadStyle = "离线", styleError
 	}

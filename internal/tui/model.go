@@ -127,6 +127,17 @@ type Model struct {
 	helpScroll int
 	// helpReturn 记录帮助页是从哪个界面打开的，关掉时退回去。
 	helpReturn mode
+	// folderReturn 记录文件夹选择器是从哪个界面打开的，**取消**时退回去。
+	//
+	// 和 helpReturn 同一个规矩，但只用在「取消」上：选了一个文件夹是要去
+	// 看那个文件夹的列表，退回列表才对（见 applyFolderPick）。
+	//
+	// 少了它，「在会话里点一下列表标题 → 弹出选择器 → 按 Esc」会把人踢到
+	// 列表上：只取消了一次弹窗，却离开了会话。
+	//
+	// ⚠️ mode 的零值是 modeUnlock（不是 modeList），所以取值一律走
+	// folderReturnMode()，不要直接读这个字段。
+	folderReturn mode
 
 	// confirmKind 描述待确认的操作；pendingID 是它作用的会话 ID。
 	// 转发也复用它来记住目标会话。
@@ -136,6 +147,24 @@ type Model struct {
 	activeID string
 	bodies   map[string]app.Body
 	replyAll bool
+
+	// previews 是左侧列表副行用的正文摘要，key 是**那条会话最后一条消息的
+	// Message-ID**，不是会话 ID。
+	//
+	// 用 Message-ID 当键，是为了让「对方又来了一封」自动作废旧摘要：新消息
+	// 的 Message-ID 不在表里，于是它会被重新拉一次。用会话 ID 当键的话，
+	// 得再存一份「这份摘要对应的是哪一封」才能判断过期 —— 两处状态必然漂。
+	//
+	// ⚠️ **有键但值是空串**是有意义的：这一封已经问过，但没正文可用
+	// （拉失败、或者它本来就没有正文）。它让副行退回显示主题，同时对
+	// 「还要不要再拉」给出答案：不要。
+	//
+	// 这个记号**只在结果回来时才写**（见 previewsResultMsg），不在发请求
+	// 时抢先占位。抢占位能把并发的重复请求挡掉，但那个空位只有在命令真的
+	// 被执行时才会被结果兑现 —— 命令一旦没跑成，那几条会话就永久停在
+	// 「没有摘要」上，而且不报错。宁可多要一次，也不要一个说不清什么时候
+	// 会卡住的状态（见 previewsCmd）。
+	previews map[string]string
 
 	// lastSentText 暂存发送失败的那条消息，供重发用。
 	lastSentText string
@@ -175,6 +204,17 @@ type bodiesResultMsg struct {
 	id     string
 	bodies map[string]app.Body
 	err    error
+}
+
+// previewsResultMsg 是「列表副行的正文摘要」那一批的回执。
+type previewsResultMsg struct {
+	// want 是这一轮请求的消息的 Message-ID，而 texts 是拉到的正文。
+	//
+	// 两个都要带上：texts 里**没有**的键分不出「没拉到」和「没请求过」，
+	// 而处理时要给请求过的每一个都落一个记号（哪怕是空串），否则下一轮
+	// 会再去要一遍 —— 拉失败的那些就会一直重试（见 Model.previews）。
+	want  []string
+	texts map[string]string
 }
 
 // refreshMsg 让界面重新从 app 拉一次会话列表。
@@ -432,6 +472,184 @@ func (m Model) foldersCmd(open bool) tea.Cmd {
 	}
 }
 
+// previewBatch 是一轮最多拉几条摘要。
+//
+// 分批（而不是一次把整张列表拉完）是为了**开机那一屏**：一个几千封的
+// 邮箱一次性会瞬间发出几千个 FETCH，而它们换来的只是列表右边那一行小字。
+// 分批之后它在后台一点点补齐，先出来的正是列表最上面那几条。
+//
+// 8 这个数取的是「一屏列表的行数」量级：正常窗口里一次就够把看得见的
+// 那几条填满，不必等第二轮才看着像样。
+const previewBatch = 8
+
+// listVisibleRange 是「列表上现在看得见的那几条」在 m.visible 上的下标范围
+// [from, to)，窗口是空的时返回 (0, 0)。
+//
+// 两套版式各算各的：Zen 的列表是**一行一条**、没有副行、也没有分组标题，
+// 它的窗口由 zenListTop / zenListRoom 定；Normal 的列表是「标题 + 副行」
+// 一对两行、还夹着分组标题，窗口由 listRows / listWindow 定。
+//
+// ⚠️ 这里必须跟着**当前版式**走。拿 Normal 的几何去算 Zen 的窗口，取到的
+// 是屏幕上另外那几条 —— 拉了一堆看不见的摘要，而看得见的那几条一直空着。
+func (m Model) listVisibleRange() (int, int) {
+	if len(m.visible) == 0 {
+		return 0, 0
+	}
+	if m.zenActive() {
+		room := m.zenListRoom()
+		top := m.zenListTop(room)
+		bottom := top + room
+		if bottom > len(m.visible) {
+			bottom = len(m.visible)
+		}
+		return top, bottom
+	}
+
+	rows := m.listRows()
+	start, end := m.listWindow(rows, m.bodyHeight())
+	from, to := -1, -1
+	for _, r := range rows[start:end] {
+		if r.idx < 0 {
+			continue // 分组标题行
+		}
+		if from < 0 {
+			from = r.idx
+		}
+		if r.idx+1 > to {
+			to = r.idx + 1
+		}
+	}
+	if from < 0 {
+		return 0, 0
+	}
+	return from, to
+}
+
+// listPreviewID 是会话 th 在摘要表里的键 —— 它**最后一条消息**的
+// Message-ID；没有消息时是空串。
+func listPreviewID(th thread.Thread) string {
+	if len(th.Messages) == 0 {
+		return ""
+	}
+	return th.Messages[len(th.Messages)-1].MessageID
+}
+
+// wantedPreviews 是「列表**当前窗口**里还没拉过摘要」的那些会话的最后一条
+// 消息，按列表顺序（列表最上面那条在最前）。
+//
+// ⚠️ 只算窗口里的，不是整张列表：用户看不到的行不该花流量，而列表可能
+// 有几百条。窗口跟着光标走，所以往下翻的时候由 handleListKey 的尾巴
+// 再发一轮（见那个函数的末尾）。
+func (m Model) wantedPreviews() []thread.Header {
+	if m.app == nil {
+		return nil
+	}
+	from, to := m.listVisibleRange()
+
+	var out []thread.Header
+	seen := map[string]bool{}
+	for i := from; i < to; i++ {
+		th := m.visible[i]
+		id := listPreviewID(th)
+		if id == "" || seen[id] {
+			continue
+		}
+		// 有键就是「这一封已经排上队了」（不管是在拉、拉到了、还是拉空了）。
+		if _, done := m.previews[id]; done {
+			continue
+		}
+		seen[id] = true
+		out = append(out, th.Messages[len(th.Messages)-1])
+	}
+	if len(out) > previewBatch {
+		out = out[:previewBatch]
+	}
+	return out
+}
+
+// previewsCmd 为窗口里还没拉过摘要的会话拉最后一条消息的正文。
+//
+// 结果回来时会再调一次本函数，于是「还没拉完」这件事自己会接着往下走 ——
+// 少了那条链，它只在列表恰好变化的那一次被触发，而「列表没变」正是
+// 最常见的情况。
+//
+// 没有任何东西要拉时返回 nil，可以放心在任何地方调。
+//
+// ⚠️ 它**不修改模型** —— 「已经拉过（或问过）了没有」这件事只在结果回来时
+// 才落表（见 previewsResultMsg）。曾经试过在这一步先给这一批占个空位，好把
+// 「连按方向键把同一封正文要好几遍」挡掉：那确实挡得住，但代价是这个空位
+// **只有在命令真的被执行时才会被结果替换掉**。命令一旦没跑成（测试里手工
+// 调 update 就会丢掉返回值，将来重构也可能），那几条会话就永久停在
+// 「没有摘要」上 —— 一个安静且不报错的错误状态。
+//
+// 现在的取舍是：宁可多要一次（几次并发请求会被 app 的正文缓存摊薄），
+// 也不要一个说不清什么时候会卡住的状态。重复请求的上界是「一屏 8 条」。
+func (m Model) previewsCmd() tea.Cmd {
+	want := m.wantedPreviews()
+	if len(want) == 0 {
+		return nil
+	}
+	a := m.app
+	ids := make([]string, 0, len(want))
+	for _, h := range want {
+		ids = append(ids, h.MessageID)
+	}
+	return func() tea.Msg {
+		return previewsResultMsg{want: ids, texts: a.LastBodyTexts(want)}
+	}
+}
+
+// adoptPreviewFromBodies 把「刚打开这个会话时拉到的正文」里最后一条
+// 顺手喂给列表摘要。
+//
+// 这份正文已经在这儿了 —— 让它为了列表上那一行小字再走一次网络，纯属
+// 白跑：用户点进去看一眼、退回列表，那一行本该立刻就是对的。
+//
+// msg.err 非空时整批作废：那时 app 给拉失败的那几封填的是「（正文加载
+// 失败）」（见 app.Bodies），把它当成摘要写进列表，列表上就会有若干个
+// 会话的副行写着同一句错误提示。宁可退回显示主题，下一轮再正常拉一次。
+func (m *Model) adoptPreviewFromBodies(msg bodiesResultMsg) {
+	if msg.err != nil {
+		return
+	}
+	th, ok := m.threadByID(msg.id)
+	if !ok || len(th.Messages) == 0 {
+		return
+	}
+	id := listPreviewID(th)
+	b, ok := msg.bodies[id]
+	if !ok || b.Text == "" {
+		return
+	}
+	if m.previews == nil {
+		m.previews = map[string]string{}
+	}
+	m.previews[id] = markdownPreview(b.Text)
+}
+
+// prunePreviews 丢掉已经不在这张列表上的摘要。
+//
+// 不清的话，一个开一整天的窗口会把每一封收到过的邮件正文都留一份在内存里，
+// 而其中绝大多数早就被滚出列表了。清空的时机就是「列表变成另一张列表」
+// 的那一刻（refreshVisible），那时才知道谁还留在场上。
+//
+// ⚠️ 换文件夹会连带清掉别的文件夹的摘要，下次切回去要重拉一遍 —— 那一步
+// 走的是 app 的正文缓存，不再有网络往返，所以这个代价可以接受；而留着
+// 它们的代价（一份不封顶的内存）是不可接受的。
+func (m *Model) prunePreviews() {
+	keep := make(map[string]string, len(m.visible))
+	for _, th := range m.visible {
+		id := listPreviewID(th)
+		if id == "" {
+			continue
+		}
+		if v, ok := m.previews[id]; ok {
+			keep[id] = v
+		}
+	}
+	m.previews = keep
+}
+
 // allMailCmd 切换「接收全部邮件」模式（同时落盘）。
 func (m Model) allMailCmd(on bool) tea.Cmd {
 	a := m.app
@@ -491,7 +709,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 左边的列表里（未读标记、时间、主题都会变），右边那一屏却停在
 		// 上一轮的内容上 —— 看上去就是「刷新没用」。轮询路径原先只更新了
 		// 列表，这就是本轮修的那个 bug。
-		return m, m.reloadBodiesIfChanged(msg)
+		//
+		// 列表变了，副行那句「最新一条说了什么」也得跟着变 —— 它和主题
+		// 一样是列表的一部分；只有主题更新而摘要停在上一条，读起来就是
+		// 两封不同的邮件。
+		return m, tea.Batch(m.reloadBodiesIfChanged(msg), m.previewsCmd())
 
 	case sendResultMsg:
 		m.busy = false
@@ -515,7 +737,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeID = msg.id
 			m.openTab(msg.id)
 		}
-		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
+		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd(), m.previewsCmd())
 
 	case bodiesResultMsg:
 		if msg.id != m.activeID {
@@ -529,13 +751,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 一些，scroll 就留在了界外 —— 收敛一次，免得用户从头按到底都
 		// 「没反应」（画面靠 tailWindow 兜住了，但这个余数很难察觉）。
 		m.clampChatScroll()
+		m.adoptPreviewFromBodies(msg)
 		return m, nil
+
+	case previewsResultMsg:
+		if m.previews == nil {
+			m.previews = map[string]string{}
+		}
+		// 请求过的**每一个**都要落定，包括没拉到正文的那些（落空串）。
+		// 空串在这里是一个记号，不是「没有数据」—— 见 Model.previews。
+		// 一条也不记的话，拉不到的那几封会在每一轮里被重新请求，而每次
+		// 都要等一次网络往返（或者超时），列表就永远补不完。
+		//
+		// 落表也顺手把「这一批不用再要了」这件事记下来 —— 重复请求的
+		// 抑制靠的就是它（而不是发命令时先占位，见 previewsCmd）。
+		for _, id := range msg.want {
+			m.previews[id] = msg.texts[id]
+		}
+		// 结果到了就排下一批 —— 这是让链子往前走的唯一齿轮。
+		return m, m.previewsCmd()
 
 	case refreshMsg:
 		if m.app != nil {
 			m.setThreads(m.app.Threads())
 		}
-		return m, nil
+		return m, m.previewsCmd()
 
 	case actionResultMsg:
 		m.busy = false
@@ -581,6 +821,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.folderCursor = i
 				break
 			}
+		}
+		// 记下从哪儿打开的，取消时退回去。
+		//
+		// 在这里赋值而不是在发命令时：命令是异步的，等结果回来的这段时间
+		// 用户可能已经换到别处去了（比如点了另一个会话）。以**结果到达时**
+		// 的位置为准，取消才会退回他此刻在的地方。
+		//
+		// 已经开着的话不要覆盖 —— 覆盖成 modeFolder 之后，取消会「退回」
+		// 选择器自己，屏幕上看起来就是 Esc 没反应。
+		if m.mode != modeFolder {
+			m.folderReturn = m.mode
 		}
 		m.mode = modeFolder
 		return m, nil
@@ -804,7 +1055,8 @@ func (m Model) handleFolderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return m, tea.Quit
 	case "esc", "tab":
-		m.mode = modeList
+		// 退回来处（见 folderReturn）。
+		m.mode = m.folderReturnMode()
 		return m, nil
 	case "up", "k":
 		if m.folderCursor > 0 {
@@ -822,6 +1074,19 @@ func (m Model) handleFolderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.applyFolderPick(m.folderCursor)
 	}
 	return m, nil
+}
+
+// folderReturnMode 是取消选择器时该退回去的那个 mode。
+//
+// 只在确实是个内容屏时才用 folderReturn：它的零值是 modeUnlock，直接
+// 采信会把人送到解锁页去。退回列表比退回解锁页合理 —— 列表永远是安全的
+// 落脚点。
+func (m Model) folderReturnMode() mode {
+	switch m.folderReturn {
+	case modeList, modeChat, modeNewChat:
+		return m.folderReturn
+	}
+	return modeList
 }
 
 // clampFolderCursor 把选择器光标收进合法范围。
@@ -1095,7 +1360,16 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 	}
-	return m, nil
+
+	// 列表模式的任何一次按键之后，都顺手看一眼「窗口里还有谁的摘要没拉」。
+	//
+	// 放在这个唯一的总出口，而不是散在换文件夹 / 清搜索 / 挪光标那几处：
+	// 列表面临的变化太多了（Esc 收筛选、Ctrl+G 循环文件夹、↑↓ 翻窗口、
+	// 以后还会加），每处接一次就有 N 个漏掉的机会，而漏掉的表现只是
+	// 「滚下去的那几条一直没有摘要」—— 安静的、看起来像"还没加载完"的错。
+	//
+	// 没有东西要拉时它返回 nil，所以这里不会平白多出命令。
+	return m, m.previewsCmd()
 }
 
 // openActive 打开光标所在的会话。
@@ -1414,6 +1688,7 @@ func (m *Model) setThreads(list []thread.Thread) {
 // 「按一下 ↓ 跳到哪儿」和「屏幕上第几行亮」会对不上。
 func (m *Model) refreshVisible() {
 	m.visible = groupUnreadFirst(filterThreads(m.threads, m.activeFolder, m.query))
+	m.prunePreviews()
 }
 
 // currentThread 返回光标所在的会话。
@@ -1738,6 +2013,29 @@ func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// listIsCurrent 报告左侧列表是不是当前界面上「能直接操作的那一块」。
+//
+// 三种模式算：列表本身、会话内、新建会话内。
+//
+// ⚠️ 会话内那两种**以前是挡着的**（`if m.mode != modeList { return }`），
+// 理由是「输入框拿着焦点」。那个理由站不住：输入框有焦点只说明键盘敲的字
+// 要进输入框，不代表鼠标要失效。挡着的表现是「在会话里点左侧列表没反应」，
+// 而用户看不出是被挡了 —— 只会以为鼠标坏了，于是去按 Esc 退出来再点。
+// 一个打字的人不该为了换个会话先退出。
+//
+// 点进去照旧用 keepDraft=true（见 handleClick 的说明）：打了一半的字
+// 不该因为点到别处就没了。
+//
+// 模态层（确认框 / 搜索 / 转发 / 解锁 / 向导）不算：它们在最上面一层等
+// 一个明确的答复，点穿到背后去切会话，会把那个待答复的问题连人一起扔掉。
+func (m Model) listIsCurrent() bool {
+	switch m.mode {
+	case modeList, modeChat, modeNewChat:
+		return true
+	}
+	return false
+}
+
 // handleClick 处理左键点击。
 //
 // 会话内的点击一律用 keepDraft=true 进新会话：点击比回车「手滑」得多，
@@ -1798,10 +2096,13 @@ func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 		// 标题行就是「换文件夹」那个入口。它和 Tab 走的是同一条路：
 		// 先把文件夹列表要回来（可能还没拉过），拿到之后由 foldersMsg
 		// 把选择器打开、并把光标停在当前那一项上。
+		if !m.listIsCurrent() {
+			return m, nil
+		}
 		return m, m.foldersCmd(true)
 
 	case hitList:
-		if m.mode != modeList {
+		if !m.listIsCurrent() {
 			return m, nil
 		}
 		idx, ok := m.listRowAt(l.listW, l.bodyH, y-l.bodyTop)

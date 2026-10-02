@@ -589,15 +589,20 @@ func (m Model) viewZenList() string {
 		th := m.visible[i]
 		selected := i == m.cursor
 
-		// 一行装下「谁 · 在聊什么」。
+		// 一行装下「谁 · 现在讲到哪儿」。
 		//
-		// Normal 的列表是两行（名字一行、主题一行），这里压成一行：Zen 的
-		// 列表是「挑一个进去读」，不是「逐个核对」。但主题不能省 —— 只写
+		// Normal 的列表是两行（名字一行、副行一行），这里压成一行：Zen 的
+		// 列表是「挑一个进去读」，不是「逐个核对」。但后半句不能省 —— 只写
 		// 参与者的话，一眼扫过去根本不知道哪个会话是哪个（实测截图里
 		// 十条全是人名，等于没有信息）。
+		//
+		// 后半句走的是和 Normal 副行**同一个** listSubLine（最新一条的正文
+		// 摘要，拉不到才退回主题）。两套版式在「列表上写什么」这件事上
+		// 只该有一个答案 —— 各写一套的话，同一个会话在两边会显示两句话，
+		// 按 F2 来回切一次就能看见，而用户没有任何依据判断哪边是对的。
 		label := threadTitle(th)
-		if th.Subject != "" {
-			label += " · " + th.Subject
+		if sub := m.listSubLine(th); sub != "" {
+			label += " · " + sub
 		}
 
 		if !selected && th.Unread == 0 {
@@ -809,7 +814,16 @@ func (m Model) renderZenItem(it zenItem, body []string, width int) []string {
 	out := make([]string, 0, len(body)+3)
 
 	if it.GroupStart {
-		head := it.Sender + " · " + it.Time.Local().Format("15:04")
+		// 时间走 shortTime 那条降精度梯子（今天给时分、昨天 / 月日 / 年月），
+		// 和左侧列表用的是同一条规则。
+		//
+		// 上一版这里写死 `Format("15:04")`：一条三天前的消息显示 `02:25`，
+		// 看着像今天凌晨发的。别处都能省，这一处不能 —— 消息头是独立一行，
+		// 没有任何上下文能纠正它。
+		head := it.Sender
+		if stamp := shortTime(it.Time); stamp != "" {
+			head += " · " + stamp
+		}
 		if it.HTML {
 			// HTML 标记留着。它是「为什么这段排版和邮件原文不一样」的
 			// 答案，属于内容来源，不是界面装饰 —— 去掉了用户看到排版差异
