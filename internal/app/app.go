@@ -10,6 +10,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -271,6 +272,190 @@ func (a *App) MarkRead(th thread.Thread) error {
 	return errors.Join(errs...)
 }
 
+// Folders 返回服务端上实际存在的文件夹，供界面做切换。
+func (a *App) Folders() ([]string, error) {
+	return a.client.Folders()
+}
+
+// MarkUnread 把一个会话标回未读，服务端和本地索引一起改。
+//
+// 只动 UID 非 0 的消息：UID 为 0 的是本地乐观插入的副本，服务端上
+// 根本不存在，拿它去 STORE 只会换回一个错误。
+func (a *App) MarkUnread(th thread.Thread) error {
+	byFolder, _ := a.splitByFolder(th)
+	return a.applyFlag(byFolder, mail.FlagSeen, false, func(folder string, uids []uint32) {
+		a.index.MarkUnread(folder, uids)
+	})
+}
+
+// SetStarred 给整个会话打上或去掉星标。
+func (a *App) SetStarred(th thread.Thread, on bool) error {
+	byFolder, _ := a.splitByFolder(th)
+	return a.applyFlag(byFolder, mail.FlagFlagged, on, func(folder string, uids []uint32) {
+		a.index.SetFlagged(folder, uids, on)
+	})
+}
+
+// applyFlag 按文件夹把标志改动同时打到服务端和本地索引上。
+//
+// 服务端失败也照样改本地：否则界面会一直显示旧状态，而用户已经
+// 看到操作"没反应"了，更糟。错误照常返回给上层展示。
+func (a *App) applyFlag(byFolder map[string][]uint32, flag string, add bool, local func(string, []uint32)) error {
+	if len(byFolder) == 0 {
+		return nil
+	}
+
+	var errs []error
+	for folder, uids := range byFolder {
+		if err := a.client.SetFlag(folder, uids, flag, add); err != nil {
+			errs = append(errs, err)
+		}
+		local(folder, uids)
+	}
+	a.reaggregate()
+	return errors.Join(errs...)
+}
+
+// splitByFolder 把会话里的消息按所在文件夹分组，顺便返回全部 Message-ID。
+//
+// UID 为 0 的本地乐观副本不进分组（服务端上没有），但仍算进 Message-ID
+// 列表 —— 删除时它们也得从本地索引里移出去。
+func (a *App) splitByFolder(th thread.Thread) (map[string][]uint32, []string) {
+	byFolder := map[string][]uint32{}
+	ids := make([]string, 0, len(th.Messages))
+	for _, m := range th.Messages {
+		ids = append(ids, m.MessageID)
+		if m.UID == 0 {
+			continue
+		}
+		byFolder[m.Folder] = append(byFolder[m.Folder], m.UID)
+	}
+	return byFolder, ids
+}
+
+// Delete 把一个会话移到垃圾箱。
+//
+// 「删除」在这里是移到服务端的已删除文件夹，不是永久删除 ——
+// 用户还能从网页版找回来。不可恢复的操作不该挂在一个单键快捷键上。
+func (a *App) Delete(th thread.Thread) error {
+	dest, err := a.trashFolder()
+	if err != nil {
+		return err
+	}
+
+	byFolder, ids := a.splitByFolder(th)
+
+	var errs []error
+	for folder, uids := range byFolder {
+		if err := a.client.Move(folder, uids, dest); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// 本地这份无论如何都要移出去：那些 UID 已经被 MOVE 走了，留着的话
+	// 下一轮聚合又会把它们显示回列表里，用户会以为删除没生效。
+	a.index.Remove(ids)
+	a.reaggregate()
+	return errors.Join(errs...)
+}
+
+// trashFolder 找出服务端的垃圾箱叫什么。
+//
+// 拿不到文件夹列表时退回 "Trash" 交给 Move 去报错 —— 那比在这里
+// 编一个错误更利于排查，因为错误信息里会带上服务端真实回了什么。
+func (a *App) trashFolder() (string, error) {
+	folders, err := a.client.Folders()
+	if err != nil {
+		return "Trash", nil
+	}
+	if name, ok := mail.ResolveFolder("Trash", folders); ok {
+		return name, nil
+	}
+	return "", fmt.Errorf("服务端上没有已删除文件夹（现有：%s），无法删除",
+		strings.Join(folders, "、"))
+}
+
+// Forward 把会话里最后一条消息转发给指定收件人。
+//
+// 转发出去的是 **一封新邮件**：新的 Message-ID，不挂 References，
+// 所以它在收件人那里会开一个新会话，而不是并进原来的讨论 ——
+// 这正是转发该有的语义。
+func (a *App) Forward(th thread.Thread, to []string) (string, error) {
+	if len(to) == 0 {
+		return "", errors.New("收件人为空")
+	}
+
+	body := a.forwardBody(th)
+	if body == "" {
+		return "", errors.New("这个会话里没有可转发的内容")
+	}
+
+	subject := th.Subject
+	if subject == "" {
+		subject = "（无主题）"
+	}
+	return a.send(mail.Outgoing{
+		To:      to,
+		Subject: "Fwd: " + subject,
+		Body:    body,
+	})
+}
+
+// LastBodyText 返回会话里最后一条消息的正文，供界面复制到剪贴板。
+//
+// 单独开这个方法而不是让界面自己去读缓存：列表模式下用户还没打开过
+// 这个会话，缓存里根本没有，必须回源拉一次。
+func (a *App) LastBodyText(th thread.Thread) (string, error) {
+	return a.lastBody(th)
+}
+
+// lastBody 取会话里最后一条消息的正文，优先用缓存。
+func (a *App) lastBody(th thread.Thread) (string, error) {
+	if len(th.Messages) == 0 {
+		return "", errors.New("这个会话里没有消息")
+	}
+	last := th.Messages[len(th.Messages)-1]
+
+	if b, ok := a.cachedBody(last.MessageID); ok {
+		return b, nil
+	}
+	if last.UID == 0 {
+		// 本地乐观插入的副本还没同步到服务端，服务端上没有它。
+		return "", nil
+	}
+	msg, err := a.client.Body(last.Folder, last.UID)
+	if err != nil {
+		return "", err
+	}
+	a.cacheBody(last.MessageID, msg.Body)
+	return msg.Body, nil
+}
+
+// forwardBody 拼出转发正文：一段来源说明 + 原文。
+func (a *App) forwardBody(th thread.Thread) string {
+	if len(th.Messages) == 0 {
+		return ""
+	}
+	last := th.Messages[len(th.Messages)-1]
+
+	body, err := a.lastBody(th)
+	if err != nil || strings.TrimSpace(body) == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("---------- 转发的消息 ----------\n")
+	b.WriteString("发件人：" + last.From + "\n")
+	if !last.Date.IsZero() {
+		b.WriteString("时间：" + last.Date.Local().Format("2006-01-02 15:04") + "\n")
+	}
+	b.WriteString("主题：" + last.Subject + "\n\n")
+	b.WriteString(body)
+	return b.String()
+}
+
+
+//
 // Reply 回复一个会话。
 //
 // replyAll 为 true 时发给会话里除自己外的所有人（默认，符合聊天语义）；

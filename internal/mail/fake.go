@@ -34,11 +34,15 @@ type fakeMessage struct {
 	body   string
 }
 
-// NewFake 创建一个空的假客户端，自带 INBOX 和 Sent 两个文件夹。
+// NewFake 创建一个空的假客户端，自带 INBOX、Sent、Trash 三个文件夹。
+//
+// Trash 是必须有的：界面的「删除」是移到垃圾箱，没有这个文件夹的话
+// app.Delete 会直接报「服务端上没有已删除文件夹」，那条路径就测不到。
 func NewFake() *Fake {
 	f := &Fake{folders: map[string]*fakeFolder{}}
 	f.folder("INBOX")
 	f.folder("Sent")
+	f.folder("Trash")
 	return f
 }
 
@@ -153,14 +157,66 @@ func (f *Fake) Body(folder string, uid uint32) (Message, error) {
 
 // MarkSeen 给一批邮件打上已读标志。
 func (f *Fake) MarkSeen(folder string, uids []uint32) error {
+	return f.SetFlag(folder, uids, FlagSeen, true)
+}
+
+// Folders 返回假客户端里现有的文件夹名（排序后，便于断言）。
+func (f *Fake) Folders() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, 0, len(f.folders))
+	for name := range f.folders {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SetFlag 加上或去掉一批邮件上的某个标志。
+func (f *Fake) SetFlag(folder string, uids []uint32, flag string, add bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	fl := f.folder(folder)
 	for _, uid := range uids {
-		if m, ok := fl.messages[uid]; ok {
-			m.header.Seen = true
+		m, ok := fl.messages[uid]
+		if !ok {
+			continue
 		}
+		switch flag {
+		case FlagSeen:
+			m.header.Seen = add
+		case FlagFlagged:
+			m.header.Flagged = add
+		}
+	}
+	return nil
+}
+
+// Move 把一批邮件挪到另一个文件夹，并给它们分配新的 UID。
+//
+// 「换文件夹就换 UID」是照真实服务端的行为模仿的。这一点必须模仿到位：
+// 删除之后本地索引里那些老 UID 就失效了，如果 Fake 保留原 UID，
+// 测试就盖不住「索引没跟着更新」这类 bug。
+func (f *Fake) Move(folder string, uids []uint32, dest string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	src := f.folder(folder)
+	dst := f.folder(dest)
+
+	for _, uid := range uids {
+		m, ok := src.messages[uid]
+		if !ok {
+			continue
+		}
+		delete(src.messages, uid)
+
+		dst.nextUID++
+		m.header.UID = dst.nextUID
+		m.header.Folder = dest
+		dst.messages[dst.nextUID] = m
 	}
 	return nil
 }

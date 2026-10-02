@@ -4,12 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/mail"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/store"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
 const testSelf = "me@example.com"
@@ -418,4 +420,158 @@ type failingClient struct {
 
 func (failingClient) Folder(string) (mail.Folder, error) {
 	return mail.Folder{}, errors.New("连接被拒绝")
+}
+
+// ---- 标记 / 删除 / 转发 ----
+
+// 新建一个只有一个会话的 app，供下面几条测试复用。
+func newAppWithOneThread(t *testing.T) (*App, *mail.Fake, thread.Header) {
+	t.Helper()
+
+	h := mail.Header{
+		MessageID: "<a@x>", From: "alice@x.com", FromName: "Alice",
+		To: []string{testSelf}, Subject: "在的",
+		Date: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC),
+		Seen: true,
+	}
+
+	fake := mail.NewFake()
+	fake.AddMessage("INBOX", h, "正文内容")
+
+	a := newTestApp(t, fake)
+	if _, err := a.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	return a, fake, h
+}
+
+// 标记未读必须同时改服务端和本地索引 —— 只改一边的话，要么刷新就
+// 弹回未读，要么界面一直显示已读。
+func TestApp_MarkUnreadHitsServerAndIndex(t *testing.T) {
+	a, fake, _ := newAppWithOneThread(t)
+
+	th := a.Threads()[0]
+	if th.Unread != 0 {
+		t.Fatalf("前提不成立：这条应该是已读的（Unread=%d）", th.Unread)
+	}
+
+	if err := a.MarkUnread(th); err != nil {
+		t.Fatalf("MarkUnread: %v", err)
+	}
+
+	if got := a.Threads()[0].Unread; got != 1 {
+		t.Errorf("本地未读数 = %d, want 1", got)
+	}
+
+	hdrs, err := fake.Headers("INBOX", 1, 0)
+	if err != nil {
+		t.Fatalf("读服务端状态: %v", err)
+	}
+	if len(hdrs) != 1 || hdrs[0].Seen {
+		t.Error(`服务端的 \Seen 没被去掉`)
+	}
+}
+
+func TestApp_SetStarredBothWays(t *testing.T) {
+	a, fake, _ := newAppWithOneThread(t)
+
+	th := a.Threads()[0]
+	if th.IsStarred() {
+		t.Fatal("前提不成立：这条不该是星标")
+	}
+
+	if err := a.SetStarred(th, true); err != nil {
+		t.Fatalf("SetStarred(true): %v", err)
+	}
+	if !a.Threads()[0].IsStarred() {
+		t.Error("本地没记上星标")
+	}
+	hdrs, _ := fake.Headers("INBOX", 1, 0)
+	if len(hdrs) != 1 || !hdrs[0].Flagged {
+		t.Error(`服务端没打上 \Flagged`)
+	}
+
+	if err := a.SetStarred(a.Threads()[0], false); err != nil {
+		t.Fatalf("SetStarred(false): %v", err)
+	}
+	if a.Threads()[0].IsStarred() {
+		t.Error("取消星标没生效")
+	}
+	hdrs, _ = fake.Headers("INBOX", 1, 0)
+	if len(hdrs) != 1 || hdrs[0].Flagged {
+		t.Error(`服务端的 \Flagged 没被去掉`)
+	}
+}
+
+// 删除是「移到垃圾箱」，而且本地索引必须跟着更新。
+//
+// 这条判据的关键在于 Fake.Move 会给邮件分配 **新的 UID**（照真实服务端
+// 的行为）。所以如果 app.Delete 忘了把本地索引里那条老记录删掉，
+// 它就会带着已经失效的 UID 继续出现在列表里 —— 测试立刻红。
+func TestApp_DeleteMovesToTrashAndClearsIndex(t *testing.T) {
+	a, fake, h := newAppWithOneThread(t)
+
+	th := a.Threads()[0]
+	if err := a.Delete(th); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if n := len(a.Threads()); n != 0 {
+		t.Errorf("删除后列表里还剩 %d 个会话", n)
+	}
+
+	// 服务端：INBOX 里没了，Trash 里有一份
+	inbox, _ := fake.Headers("INBOX", 1, 0)
+	if len(inbox) != 0 {
+		t.Errorf("INBOX 里还剩 %d 封", len(inbox))
+	}
+	trash, _ := fake.Headers("Trash", 1, 0)
+	if len(trash) != 1 {
+		t.Fatalf("Trash 里有 %d 封, want 1", len(trash))
+	}
+	if trash[0].MessageID != h.MessageID {
+		t.Errorf("Trash 里的不是同一封: %q", trash[0].MessageID)
+	}
+}
+
+// 转发出去的是新会话，不能挂 References —— 挂了就会并进原来的讨论，
+// 那就不叫转发了。
+func TestApp_ForwardStartsNewConversation(t *testing.T) {
+	a, fake, _ := newAppWithOneThread(t)
+
+	th := a.Threads()[0]
+	if _, err := a.Forward(th, []string{"bob@x.com"}); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	sent := fake.SentMessages()
+	if len(sent) != 1 {
+		t.Fatalf("发出去了 %d 封, want 1", len(sent))
+	}
+	if len(sent[0].To) != 1 || sent[0].To[0] != "bob@x.com" {
+		t.Errorf("收件人不对: %v", sent[0].To)
+	}
+	if len(sent[0].References) != 0 || sent[0].InReplyTo != "" {
+		t.Errorf("转发不该挂引用链: refs=%v inReplyTo=%q",
+			sent[0].References, sent[0].InReplyTo)
+	}
+	if !strings.HasPrefix(sent[0].Subject, "Fwd: ") {
+		t.Errorf("主题没有 Fwd 前缀: %q", sent[0].Subject)
+	}
+	if !strings.Contains(sent[0].Body, "正文内容") {
+		t.Errorf("转发正文里没有原文:\n%s", sent[0].Body)
+	}
+}
+
+// 转发要拉得到正文 —— 列表模式下用户没打开过会话，缓存里是空的。
+func TestApp_LastBodyTextLoadsOnDemand(t *testing.T) {
+	a, _, _ := newAppWithOneThread(t)
+
+	text, err := a.LastBodyText(a.Threads()[0])
+	if err != nil {
+		t.Fatalf("LastBodyText: %v", err)
+	}
+	if text != "正文内容" {
+		t.Errorf("正文 = %q, want %q", text, "正文内容")
+	}
 }

@@ -21,6 +21,10 @@ func (m Model) View() string {
 		return m.viewUnlock()
 	case modeSetup:
 		return m.viewSetup()
+	case modeHelp:
+		return m.viewHelp()
+	case modeFolder:
+		return m.viewFolderPicker()
 	}
 
 	if m.width < singlePaneWidth {
@@ -94,13 +98,17 @@ func (m Model) viewSinglePane() string {
 
 // ---- 会话列表 ----
 
+// renderThreadList 画左侧的会话列表。
+//
+// 标题行带上当前文件夹和未读总数 —— 过滤生效时如果不显示，用户会
+// 以为邮件丢了。
 func (m Model) renderThreadList(width, height int) string {
 	lines := make([]string, 0, height)
-	lines = append(lines, styleTitle.Render(truncate("会话", width-2)))
+	lines = append(lines, styleTitle.Render(truncate(m.listHeader(), width-2)))
 
-	if len(m.threads) == 0 {
-		lines = append(lines, styleMuted.Render("（还没有会话）"))
-		lines = append(lines, styleMuted.Render("按 n 新建一个"))
+	if len(m.visible) == 0 {
+		lines = append(lines, styleMuted.Render(truncate("  "+m.emptyListHint(), width-2)))
+		return fillPane(lines, width, height)
 	}
 
 	// 每条会话占两行：标题 + 主题。标题行已经占掉一行，所以可显示条数要减一。
@@ -115,23 +123,30 @@ func (m Model) renderThreadList(width, height int) string {
 		start = m.cursor - capacity + 1
 	}
 	end := start + capacity
-	if end > len(m.threads) {
-		end = len(m.threads)
+	if end > len(m.visible) {
+		end = len(m.visible)
 	}
 
 	for i := start; i < end; i++ {
-		th := m.threads[i]
+		th := m.visible[i]
 		marker := "  "
 		if th.Unread > 0 {
 			marker = "● "
 		}
 
-		title := truncate(marker+threadTitle(th), width-2)
+		// 星标紧跟在未读标记后面：两个标记的列宽都是两列，
+		// 所以有没有星标都不会让后面的名字错位。
+		star := "  "
+		if th.IsStarred() {
+			star = "★ "
+		}
+
+		title := truncate(marker+star+threadTitle(th), width-2)
 		subject := th.Subject
 		if subject == "" {
 			subject = "(无主题)"
 		}
-		subject = truncate("  "+subject, width-2)
+		subject = truncate("    "+subject, width-2)
 
 		if i == m.cursor {
 			// 选中行整行反白，用 padRight 补到满宽才有「整行」的效果。
@@ -151,6 +166,37 @@ func (m Model) renderThreadList(width, height int) string {
 	}
 
 	return fillPane(lines, width, height)
+}
+
+// listHeader 是会话列表的标题行。
+func (m Model) listHeader() string {
+	title := "会话"
+	if m.activeFolder != "" {
+		title += " · " + m.activeFolder
+	}
+
+	unread := 0
+	for _, th := range m.visible {
+		if th.Unread > 0 {
+			unread++
+		}
+	}
+	if unread > 0 {
+		title += fmt.Sprintf("（%d 个未读）", unread)
+	}
+	return title
+}
+
+// emptyListHint 说明列表为什么是空的 —— 是真空，还是被过滤掉了。
+func (m Model) emptyListHint() string {
+	switch {
+	case m.query != "":
+		return "没有匹配「" + m.query + "」的会话"
+	case m.activeFolder != "":
+		return m.activeFolder + " 里还没有会话"
+	default:
+		return "还没有会话，按 n 新建一个"
+	}
 }
 
 // ---- 聊天流 ----
@@ -238,16 +284,133 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 // ---- 输入行与状态栏 ----
 
 func (m Model) renderInput() string {
-	hint := ""
-	switch {
-	case m.mode == modeNewChat:
-		hint = "   （回车确定，Esc 取消）"
-	case m.mode == modeChat && m.activeRoot != "" && m.replyAll:
-		hint = "   （Tab：发给所有人）"
-	case m.mode == modeChat && m.activeRoot != "":
-		hint = "   （Tab：只回发件人）"
+	switch m.mode {
+	case modeConfirm:
+		// 确认框占用这一行：不显示输入框，免得用户以为还能打字。
+		return styleError.Render(truncate(m.confirmPrompt(), m.width))
+
+	case modeSearch:
+		return stylePrompt.Render(m.input.View()) +
+			styleMuted.Render("   （回车保留过滤，Esc 清空）")
+
+	case modeForward:
+		return stylePrompt.Render(m.input.View()) +
+			styleMuted.Render("   （转发最后一条，回车发送，Esc 取消）")
+
+	case modeNewChat:
+		return stylePrompt.Render(m.input.View()) +
+			styleMuted.Render("   （回车确定，Esc 取消）")
+
+	case modeChat:
+		hint := ""
+		if m.activeRoot != "" {
+			if m.replyAll {
+				hint = "   （Tab：发给所有人）"
+			} else {
+				hint = "   （Tab：只回发件人）"
+			}
+		}
+		return stylePrompt.Render(m.input.View()) + styleMuted.Render(hint)
 	}
-	return stylePrompt.Render(m.input.View()) + styleMuted.Render(hint)
+
+	// 列表模式没有输入框，这一行留给常驻快捷键提示。
+	// 界面上的功能之所以长期"不存在"，就是因为它们只活在代码里。
+	return styleMuted.Render(truncate(listHints(), m.width))
+}
+
+// confirmPrompt 是确认框上的一句话。
+func (m Model) confirmPrompt() string {
+	if m.confirmKind == confirmDelete {
+		if th, ok := m.pendingThread(); ok {
+			return "删除「" + threadTitle(th) + "」？会移到「已删除」文件夹，可恢复。  y 确认 · n 取消"
+		}
+		return "删除这个会话？会移到「已删除」文件夹。  y 确认 · n 取消"
+	}
+	return "确认？  y 确认 · n 取消"
+}
+
+// viewHelp 渲染全屏帮助页。
+func (m Model) viewHelp() string {
+	lines := helpLines(m.width)
+
+	bodyH := m.height - 1
+	if bodyH < 1 {
+		bodyH = 1
+	}
+
+	scroll := m.helpScroll
+	max := len(lines) - bodyH
+	if max < 0 {
+		max = 0
+	}
+	if scroll > max {
+		scroll = max
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	end := scroll + bodyH
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	out := make([]string, 0, bodyH+1)
+	out = append(out, lines[scroll:end]...)
+	for len(out) < bodyH {
+		out = append(out, "")
+	}
+	out = append(out, styleMuted.Render(truncate(
+		"↑/↓ 或 PgUp/PgDn 滚动 · ? 或 Esc 关闭", m.width)))
+	return strings.Join(out, "\n")
+}
+
+// viewFolderPicker 渲染文件夹选择器。
+func (m Model) viewFolderPicker() string {
+	choices := m.folderChoices()
+
+	bodyH := m.height - 1
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	// 首行标题、末行操作提示，中间留给选项。
+	avail := bodyH - 3
+	if avail < 1 {
+		avail = 1
+	}
+
+	// 有些服务商的文件夹多到一屏放不下，所以也要开窗口。
+	start := 0
+	if m.folderCursor >= avail {
+		start = m.folderCursor - avail + 1
+	}
+	end := start + avail
+	if end > len(choices) {
+		end = len(choices)
+	}
+
+	lines := []string{
+		styleTitle.Render(truncate("选择文件夹", m.width)),
+		"",
+	}
+	for i := start; i < end; i++ {
+		label := choices[i]
+		if label == "" {
+			label = "（全部文件夹）"
+		}
+		label = truncate("  "+label, m.width-2)
+		if i == m.folderCursor {
+			lines = append(lines, styleSelected.Render(padRight(label, m.width-2)))
+		} else {
+			lines = append(lines, label)
+		}
+	}
+
+	for len(lines) < bodyH {
+		lines = append(lines, "")
+	}
+	lines = append(lines, styleMuted.Render(truncate(
+		"↑/↓ 选择 · 回车确定 · Esc 取消", m.width)))
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderStatus() string {

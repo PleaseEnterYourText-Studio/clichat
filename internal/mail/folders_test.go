@@ -106,7 +106,7 @@ func TestResolveFolder(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := resolveFolder(tc.want, tc.available)
+			got, ok := ResolveFolder(tc.want, tc.available)
 			if ok != tc.ok {
 				t.Fatalf("ok = %v, want %v（返回 %q）", ok, tc.ok, got)
 			}

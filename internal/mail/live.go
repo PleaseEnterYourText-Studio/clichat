@@ -147,6 +147,36 @@ func imapDebugWriter() io.Writer {
 	return log.Writer()
 }
 
+// selectLocked 解析文件夹名并选中它，返回服务端上的真实名字和 SELECT 状态。
+// 调用方必须已持有 c.mu。
+//
+// Folder / Headers / Body / 标志操作 / 移动 五个入口要做的是同一件事：
+// ensureLocked → resolveLocked → Select。抽出来是因为漏掉其中任何一步
+// 都会表现成「某个功能莫名其妙连不上」，而且很难从现象反推是哪一步。
+func (c *liveClient) selectLocked(folder string, readOnly bool) (string, *imap.MailboxStatus, error) {
+	if err := c.ensureLocked(); err != nil {
+		return "", nil, err
+	}
+	real, err := c.resolveLocked(folder)
+	if err != nil {
+		return "", nil, err
+	}
+	mbox, err := c.conn.Select(real, readOnly)
+	if err != nil {
+		return "", nil, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
+	}
+	return real, mbox, nil
+}
+
+// seqSetOf 把 UID 切片转成 IMAP 的序列集合。
+func seqSetOf(uids []uint32) *imap.SeqSet {
+	s := new(imap.SeqSet)
+	for _, u := range uids {
+		s.AddNum(u)
+	}
+	return s
+}
+
 // listFolders 列出服务端上所有文件夹。失败返回 nil。
 //
 // 故意不返回错误：拿不到列表只是让别名解析失效、退化成原样使用配置里的
@@ -172,7 +202,7 @@ func listFolders(conn *imapclient.Client) []string {
 // 错误文案刻意保持短 —— 它会被塞进状态栏，超过 60 列就被截了。
 // 完整可用的文件夹列表交给日志，不往界面上堆。
 func (c *liveClient) resolveLocked(name string) (string, error) {
-	got, ok := resolveFolder(name, c.folderList)
+	got, ok := ResolveFolder(name, c.folderList)
 	if !ok {
 		log.Printf("文件夹 %q 在服务端上不存在，可用的是：%s",
 			name, strings.Join(c.folderList, "、"))

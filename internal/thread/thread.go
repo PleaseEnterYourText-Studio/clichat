@@ -46,6 +46,8 @@ type Header struct {
 	UID        uint32
 	Folder     string
 	Seen       bool
+	// Flagged 对应 IMAP 的 \Flagged 标志，界面上呈现为星标。
+	Flagged bool
 }
 
 // Thread 是一次聚合产出的会话。
@@ -69,7 +71,16 @@ type Thread struct {
 
 	// Unread 是会话中未读消息的条数。
 	Unread int
+
+	// Starred 是会话中被星标的消息条数。
+	//
+	// 存条数而不是 bool：界面上要显示「这个会话里有几条星标」，
+	// 而 IsStarred() 由它派生，两个信息不会打架。
+	Starred int
 }
+
+// IsStarred 报告会话里是否至少有一条星标消息。
+func (t Thread) IsStarred() bool { return t.Starred > 0 }
 
 // MessageIDs 返回会话内所有消息的 Message-ID，按 Date 升序。
 func (t Thread) MessageIDs() []string {
@@ -199,6 +210,9 @@ func buildThread(root string, idx []int, msgs []Header, self string) Thread {
 		if !m.Seen {
 			t.Unread++
 		}
+		if m.Flagged {
+			t.Starred++
+		}
 		for _, addr := range addressesOf(m) {
 			a := NormalizeAddress(addr)
 			if a == "" || a == self || seen[a] {
@@ -226,6 +240,9 @@ func addressesOf(m Header) []string {
 // 也可能被两个文件夹规则同时命中。保留首次出现的那个，
 // 但 Seen 标志按「只要有一份已读就算已读」合并。
 //
+// Flagged 同理按「任一副本被星标即算星标」合并 —— 否则在 INBOX 里
+// 星标了一封同时存在于 Sent 的邮件，下一轮聚合又会把它算成未星标。
+//
 // 调用前必须保证所有消息都有非空 Message-ID。
 func dedupeByMessageID(headers []Header) []Header {
 	out := make([]Header, 0, len(headers))
@@ -234,6 +251,9 @@ func dedupeByMessageID(headers []Header) []Header {
 		if i, ok := pos[h.MessageID]; ok {
 			if h.Seen {
 				out[i].Seen = true
+			}
+			if h.Flagged {
+				out[i].Flagged = true
 			}
 			continue
 		}

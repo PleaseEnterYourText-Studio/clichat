@@ -25,16 +25,9 @@ func (c *liveClient) Folder(name string) (Folder, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.ensureLocked(); err != nil {
-		return Folder{}, err
-	}
-	real, err := c.resolveLocked(name)
+	_, mbox, err := c.selectLocked(name, true)
 	if err != nil {
 		return Folder{}, err
-	}
-	mbox, err := c.conn.Select(real, true)
-	if err != nil {
-		return Folder{}, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 	return Folder{
 		Name:        mbox.Name,
@@ -42,6 +35,25 @@ func (c *liveClient) Folder(name string) (Folder, error) {
 		UIDNext:     mbox.UidNext,
 		Messages:    mbox.Messages,
 	}, nil
+}
+
+// Folders 列出服务端上实际存在的文件夹。
+//
+// 拿不到列表（LIST 失败）时报错而不是返回空切片：界面靠它渲染文件夹
+// 切换器，给一个空列表等于告诉用户「你没有文件夹」，那是错的。
+func (c *liveClient) Folders() ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.ensureLocked(); err != nil {
+		return nil, err
+	}
+	if c.folderList == nil {
+		return nil, errors.New("没能从服务端取到文件夹列表")
+	}
+	out := make([]string, len(c.folderList))
+	copy(out, c.folderList)
+	return out, nil
 }
 
 // Headers 拉取 UID 落在 [from, to] 区间内的邮件头部。
@@ -52,16 +64,9 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.ensureLocked(); err != nil {
-		return nil, err
-	}
-	real, err := c.resolveLocked(folder)
+	_, mbox, err := c.selectLocked(folder, true)
 	if err != nil {
 		return nil, err
-	}
-	mbox, err := c.conn.Select(real, true)
-	if err != nil {
-		return nil, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 
 	high := to
@@ -108,9 +113,10 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 // headerFromMessage 把一条 IMAP FETCH 结果转成 Header。
 func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySectionName) Header {
 	h := Header{
-		UID:    msg.Uid,
-		Folder: folder,
-		Seen:   hasFlag(msg.Flags, imap.SeenFlag),
+		UID:     msg.Uid,
+		Folder:  folder,
+		Seen:    hasFlag(msg.Flags, imap.SeenFlag),
+		Flagged: hasFlag(msg.Flags, imap.FlaggedFlag),
 	}
 
 	if env := msg.Envelope; env != nil {
@@ -142,15 +148,8 @@ func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.ensureLocked(); err != nil {
+	if _, _, err := c.selectLocked(folder, true); err != nil {
 		return Message{}, err
-	}
-	real, err := c.resolveLocked(folder)
-	if err != nil {
-		return Message{}, err
-	}
-	if _, err := c.conn.Select(real, true); err != nil {
-		return Message{}, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 
 	seqset := new(imap.SeqSet)
@@ -194,6 +193,14 @@ func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
 
 // MarkSeen 给一批邮件打上 \Seen 标志。
 func (c *liveClient) MarkSeen(folder string, uids []uint32) error {
+	return c.SetFlag(folder, uids, FlagSeen, true)
+}
+
+// SetFlag 加上或去掉一批邮件上的某个标志。
+//
+// 标回未读是 SetFlag(..., FlagSeen, false)，星标是
+// SetFlag(..., FlagFlagged, true)。
+func (c *liveClient) SetFlag(folder string, uids []uint32, flag string, add bool) error {
 	if len(uids) == 0 {
 		return nil
 	}
@@ -201,24 +208,68 @@ func (c *liveClient) MarkSeen(folder string, uids []uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.ensureLocked(); err != nil {
+	// 用可写方式选中：打标志是修改操作。
+	if _, _, err := c.selectLocked(folder, false); err != nil {
 		return err
 	}
-	real, err := c.resolveLocked(folder)
+
+	// 显式标注类型：go-imap 里只有 SetFlags 带 FlagsOp 类型，
+	// AddFlags / RemoveFlags 是无类型字符串常量，`:=` 会推断成 string。
+	op := imap.FlagsOp(imap.RemoveFlags)
+	if add {
+		op = imap.AddFlags
+	}
+	// 第二个参数 silent=true：让服务端别回 FETCH 更新，省一轮往返。
+	item := imap.FormatFlagsOp(op, true)
+	if err := c.conn.UidStore(seqSetOf(uids), item, []interface{}{flag}, nil); err != nil {
+		return fmt.Errorf("更新标志 %s 失败: %w", flag, err)
+	}
+	return nil
+}
+
+// Move 把一批邮件移到另一个文件夹。界面上的「删除」走这里。
+func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
+	if len(uids) == 0 {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	realDest, err := c.resolveLocked(dest)
 	if err != nil {
 		return err
 	}
-	if _, err := c.conn.Select(real, false); err != nil {
-		return fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
+	if _, _, err := c.selectLocked(folder, false); err != nil {
+		return err
 	}
 
-	seqset := new(imap.SeqSet)
-	for _, u := range uids {
-		seqset.AddNum(u)
+	seqset := seqSetOf(uids)
+
+	// 优先用 MOVE 扩展（RFC 6851）：它是原子的，服务端自己保证
+	// 「复制 + 打删除标记 + 清空」这三步不会被打断。
+	if ok, _ := c.conn.Support("MOVE"); ok {
+		if err := c.conn.UidMove(seqset, realDest); err != nil {
+			return fmt.Errorf("移动邮件到 %s 失败: %w", realDest, err)
+		}
+		return nil
+	}
+
+	// 退化路径：COPY 过去，打上 \Deleted，再 EXPUNGE。
+	//
+	// ⚠️ 这里的 EXPUNGE 会把当前文件夹里 **所有** 带 \Deleted 的邮件
+	// 一起清掉，不只是我们刚标记的这批 —— go-imap v1 没有 UIDPLUS 的
+	// UID EXPUNGE 可用，只能这样。所以能走 MOVE 就一定走 MOVE，
+	// 这条路径只在服务端不支持 MOVE 时才会用到。
+	if err := c.conn.UidCopy(seqset, realDest); err != nil {
+		return fmt.Errorf("复制邮件到 %s 失败: %w", realDest, err)
 	}
 	item := imap.FormatFlagsOp(imap.AddFlags, true)
-	if err := c.conn.UidStore(seqset, item, []interface{}{imap.SeenFlag}, nil); err != nil {
-		return fmt.Errorf("标记已读失败: %w", err)
+	if err := c.conn.UidStore(seqset, item, []interface{}{imap.DeletedFlag}, nil); err != nil {
+		return fmt.Errorf("标记待删除失败: %w", err)
+	}
+	if err := c.conn.Expunge(nil); err != nil {
+		return fmt.Errorf("清空已删除邮件失败: %w", err)
 	}
 	return nil
 }

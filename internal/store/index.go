@@ -142,6 +142,24 @@ func (ix *Index) SetFolderState(name string, st FolderState) {
 // 服务端的已读状态由 mail.Client.MarkSeen 负责，这里同步本地副本 ——
 // 否则刚点开的会话在下次聚合时又会被算成未读。
 func (ix *Index) MarkSeen(folder string, uids []uint32) {
+	ix.eachUID(folder, uids, func(h *mail.Header) { h.Seen = true })
+}
+
+// MarkUnread 把本地索引里对应邮件标回未读。
+func (ix *Index) MarkUnread(folder string, uids []uint32) {
+	ix.eachUID(folder, uids, func(h *mail.Header) { h.Seen = false })
+}
+
+// SetFlagged 设置本地索引里对应邮件的星标状态。
+func (ix *Index) SetFlagged(folder string, uids []uint32, on bool) {
+	ix.eachUID(folder, uids, func(h *mail.Header) { h.Flagged = on })
+}
+
+// eachUID 对 (folder, uids) 命中的每条 header 跑一次 mutate。
+//
+// 三个标记操作（已读 / 未读 / 星标）的命中逻辑完全一样，只有改动内容
+// 不同，所以抽出来 —— 复制三遍的话，以后改命中规则必然漏改其中一两处。
+func (ix *Index) eachUID(folder string, uids []uint32, mutate func(*mail.Header)) {
 	if len(uids) == 0 {
 		return
 	}
@@ -155,9 +173,41 @@ func (ix *Index) MarkSeen(folder string, uids []uint32) {
 	}
 	for i := range ix.Headers {
 		if ix.Headers[i].Folder == folder && want[ix.Headers[i].UID] {
-			ix.Headers[i].Seen = true
+			mutate(&ix.Headers[i])
 		}
 	}
+}
+
+// Remove 按 Message-ID 从索引里删掉若干邮件，返回实际删掉的条数。
+//
+// 界面上说的「删除」是移到已删除文件夹，服务端那份还在。但本地这份
+// 必须先移出去 —— 它在原文件夹的 UID 已经被 MOVE 走了，本地索引却还
+// 记着，不删的话下一轮聚合又会把它显示回列表里。
+func (ix *Index) Remove(messageIDs []string) int {
+	if len(messageIDs) == 0 {
+		return 0
+	}
+
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	drop := make(map[string]bool, len(messageIDs))
+	for _, id := range messageIDs {
+		drop[id] = true
+	}
+
+	kept := ix.Headers[:0]
+	removed := 0
+	for _, h := range ix.Headers {
+		if h.MessageID != "" && drop[h.MessageID] {
+			removed++
+			continue
+		}
+		kept = append(kept, h)
+	}
+	ix.Headers = kept
+	ix.rebuildPos()
+	return removed
 }
 
 // Reset 清空索引。服务器重置 UID 空间时用。

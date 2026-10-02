@@ -39,14 +39,25 @@ var folderAliases = map[string][]string{
 		"已发送邮件",
 		"已发件箱",
 	},
+	// 删除的目标文件夹。同样各家叫法不一：Gmail 是 Trash，
+	// QQ 是 Deleted Messages，网易系（163/126）是「已删除」。
+	"TRASH": {
+		"Trash",
+		"Deleted Messages",
+		"Deleted Items",
+		"Deleted",
+		"已删除",
+		"已删除邮件",
+		"垃圾箱",
+	},
 }
 
-// resolveFolder 把配置里的文件夹名解析成服务端上真实存在的名字。
+// ResolveFolder 把配置里的文件夹名解析成服务端上真实存在的名字。
 //
 // available 为 nil 表示拿不到文件夹列表（LIST 失败）。这时不做任何
 // 猜测，原样放行 —— 宁可在 SELECT 时自然报错，也不要凭一个残缺的
 // 列表把用户本来能用的文件夹判死。
-func resolveFolder(want string, available []string) (string, bool) {
+func ResolveFolder(want string, available []string) (string, bool) {
 	if available == nil {
 		return want, true
 	}
