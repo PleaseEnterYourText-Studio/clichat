@@ -40,6 +40,14 @@ type mailServer struct {
 
 	mu     sync.Mutex
 	counts map[string]int
+
+	// pairs 是在途的（前端，后端）连接对。
+	//
+	// 留着它是为了能在测试里模拟「服务商单方面把连接掐了」—— 126 真的会
+	// 这么干（见 live.go 的 ensureLocked），而那正是重连那条路上最容易
+	// 悄悄坏掉的地方：它平时不跑，坏了也没人发现，直到用户在空闲之后
+	// 第一次操作时看到一句「同步失败」。
+	pairs [][2]net.Conn
 }
 
 // startMailServer 起一个进程内 IMAP 服务端，自带 INBOX 和 Sent。
@@ -107,6 +115,9 @@ func (ms *mailServer) pipe(cl, be net.Conn) {
 	defer cl.Close()
 	defer be.Close()
 
+	ms.addPair(cl, be)
+	defer ms.removePair(cl)
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -115,6 +126,40 @@ func (ms *mailServer) pipe(cl, be net.Conn) {
 	}()
 	_, _ = io.Copy(cl, be)
 	wg.Wait()
+}
+
+func (ms *mailServer) addPair(cl, be net.Conn) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.pairs = append(ms.pairs, [2]net.Conn{cl, be})
+}
+
+func (ms *mailServer) removePair(cl net.Conn) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	kept := ms.pairs[:0]
+	for _, p := range ms.pairs {
+		if p[0] != cl {
+			kept = append(kept, p)
+		}
+	}
+	ms.pairs = kept
+}
+
+// dropAll 掐断所有在途连接，模拟服务商单方面断连。
+//
+// 两边都关：只关一边的话，另一边的 io.Copy 未必立刻返回，测试会
+// 间歇性地量到「连接还在」—— 那就成了一条会随机变绿的判据。
+func (ms *mailServer) dropAll() {
+	ms.mu.Lock()
+	pairs := append([][2]net.Conn(nil), ms.pairs...)
+	ms.pairs = nil
+	ms.mu.Unlock()
+
+	for _, p := range pairs {
+		p[0].Close()
+		p[1].Close()
+	}
 }
 
 // commandReader 按 IMAP 的行语法识别命令。
@@ -273,9 +318,9 @@ func uidsOf(headers []Header) []uint32 {
 // 拉 N 封正文必须只发**一条** UID FETCH。
 //
 // 改之前这里是 3N 条 —— 每封一条 NOOP + SELECT + UID FETCH。实测 21 封
-// 是 63 条命令；而真实邮箱（126，索引 310 封）里最大的会话有 66 封，也就是说
-// 打开那一个会话要 198 次往返。这条判据钉住的就是那个 O(消息数)：
-// 只要有人把批量拆回逐封，它立刻变红。
+// 是 63 条命令。真实邮箱（126，索引 310 条 header / 64 个会话）里最大的
+// 会话有 19 封（用真实聚合逻辑量的），逐封的话打开它要 57 次往返。
+// 这条判据钉住的就是那个 O(消息数)：只要有人把批量拆回逐封，它立刻变红。
 func TestBodies_CostsOneFetchRegardlessOfMessageCount(t *testing.T) {
 	ms := startMailServer(t)
 
@@ -381,5 +426,157 @@ func TestBodies_EmptyRequestSendsNothing(t *testing.T) {
 	}
 	if n := ms.total(); n != 0 {
 		t.Errorf("空请求发了 %d 条命令: %s", n, ms.dump())
+	}
+}
+
+// legCost 是一段被测行为发出的命令总数与明细。
+type legCost struct {
+	total   int
+	examine int
+	noop    int
+	dump    string
+}
+
+// openThreadCost 量「打开一个会话」这条路上发出去的全部命令。
+//
+// 路径取的是界面按下回车时**真的并发发出去**的那三条命令（见
+// tui/model.go）：syncCmd → app.Sync（每个文件夹 Folder + Headers）、
+// loadActiveBodiesCmd → app.Bodies（每个文件夹一次批量）、
+// markReadCmd → app.MarkRead（每个文件夹一次 MarkSeen）。
+//
+// 这里刻意不经过 app / tui，直接在 mail 层把同样三条腿跑一遍 ——
+// 协议代价全在这一层，而这一层可以脱离界面单独量。
+func openThreadCost(t *testing.T, n int) legCost {
+	t.Helper()
+
+	ms := startMailServer(t)
+	for i := 0; i < n; i++ {
+		// seen=false：打开会话要真的去标已读，否则那条腿是空跑。
+		ms.add(t, "INBOX", rawMail(fmt.Sprintf("第%d封", i), "alice@example.com",
+			fmt.Sprintf("open-%d-%d@example.com", n, i)), false)
+	}
+
+	c := ms.client(t)
+	// 先把连接和文件夹列表握好再清零 —— 量的是「打开会话」本身，
+	// 不是首次连接的代价（LOGIN / CAPABILITY / LIST 只发生一次）。
+	if _, err := c.Folders(); err != nil {
+		t.Fatalf("Folders: %v", err)
+	}
+	ms.reset()
+
+	// 两个文件夹都要走一遍：真实配置同步的就是 INBOX + Sent，
+	// 而「每个文件夹各自一遍」正是当前实现里最主要的固定开销。
+	for _, folder := range []string{"INBOX", "Sent"} {
+		if _, err := c.Folder(folder); err != nil {
+			t.Fatalf("Folder(%s): %v", folder, err)
+		}
+		headers, err := c.Headers(folder, 1, 0)
+		if err != nil {
+			t.Fatalf("Headers(%s): %v", folder, err)
+		}
+		if _, err := c.Bodies(folder, uidsOf(headers)); err != nil {
+			t.Fatalf("Bodies(%s): %v", folder, err)
+		}
+		if err := c.MarkSeen(folder, uidsOf(headers)); err != nil {
+			t.Fatalf("MarkSeen(%s): %v", folder, err)
+		}
+	}
+
+	return legCost{
+		total:   ms.total(),
+		examine: ms.count("EXAMINE"),
+		noop:    ms.count("NOOP"),
+		dump:    ms.dump(),
+	}
+}
+
+// TestOpenThread_CostDoesNotGrowWithMessageCount 钉住一个比「命令数 ≤ K」
+// 更硬的性质：**打开会话的命令数不随会话里邮件条数增长**。
+//
+// 写法是量两个规模差 10 倍的会话、断言总数**相等**，而不是钉一个魔法数字。
+// 这样换后端、加一条探活、少一次 STATUS 都不会让它假红；而只要有谁把
+// 某一段改回「逐封」，规模大的那次立刻变大、它立刻变红。
+//
+// 这条判据是这一轮的收尾尺子：上一条（TestBodies_...）只盯正文那一段，
+// 而「打开会话」这条路上正文只占一部分 —— 剩下的是同步和标已读。
+// 两个都量，才能知道下一次该改哪儿。
+func TestOpenThread_CostDoesNotGrowWithMessageCount(t *testing.T) {
+	small := openThreadCost(t, 3)
+	big := openThreadCost(t, 30)
+
+	t.Logf("会话 3 封 → 命令 %d 条：%s", small.total, small.dump)
+	t.Logf("会话 30 封 → 命令 %d 条：%s", big.total, big.dump)
+
+	if small.total != big.total {
+		t.Errorf("打开会话的命令数随邮件条数变了：3 封 %d 条，30 封 %d 条\n  3 封:  %s\n  30 封: %s",
+			small.total, big.total, small.dump, big.dump)
+	}
+
+	// 分开钉住那一轮优化的两个具体效果。理由不是「想看到数字变小」，
+	// 而是这两件事各自会以不同的方式退化，而且退化后**功能照常能用**，
+	// 只有命令数悄悄涨回去 —— 正是那种没人会注意到的回归。
+	//
+	//   EXAMINE：每个文件夹只允许选一次。复用的记忆一旦失效，它立刻
+	//            跟着腿数（同步 / 正文 / 标已读）一起长。
+	//   NOOP：   刚用过的连接不该再探活。这条一旦失效就每步一个 NOOP。
+	if n := big.examine; n > 2 {
+		t.Errorf("EXAMINE 发了 %d 条，每个文件夹最多 1 条（INBOX + Sent = 2）: %s", n, big.dump)
+	}
+	if n := big.noop; n > 1 {
+		t.Errorf("NOOP 发了 %d 条，最多 1 条 —— 刚用过的连接又在反复探活: %s", n, big.dump)
+	}
+}
+
+// TestConn_ServerDropCostsOneCallThenRecovers 钉住重连那条路：
+// 服务商单方面掐断连接之后，**最多失败一次**，下一次必须自己重连、
+// 重新选中文件夹，并给出正确结果。
+//
+// 这条判据存在的理由是 live.go 里那两处优化的取舍：省掉重复探活之后，
+// 「连接死了」不再是下一条命令立刻就能发现的（见 livenessWindow 与
+// markSuspectLocked）。取舍是允许的 —— 但**必须只赔一条命令**。
+// 谁要是把 markSuspectLocked 从失败路径上去掉，就会变成「连接死了之后
+// 每条命令都失败一遍」，这条立刻变红。
+func TestConn_ServerDropCostsOneCallThenRecovers(t *testing.T) {
+	ms := startMailServer(t)
+	const n = 5
+	for i := 0; i < n; i++ {
+		ms.add(t, "INBOX", rawMail(fmt.Sprintf("第%d封", i), "alice@example.com",
+			fmt.Sprintf("drop-%d@example.com", i)), true)
+	}
+
+	c := ms.client(t)
+	first, err := c.Headers("INBOX", 1, 0)
+	if err != nil {
+		t.Fatalf("首次拉头部就失败了: %v", err)
+	}
+
+	// 服务端把连接掐了。客户端此刻还以为它活着（verifiedAt 在窗口内），
+	// 这正是真实世界里的样子。
+	ms.dropAll()
+
+	// 第一条：**允许失败** —— 省掉重复探活的代价就是这一条。
+	//
+	// 判据只能写成「最多一条」，不能写成「一条都不许失败」：连接死掉这件事
+	// 现在要等到一条命令真的跑起来才暴露（见 livenessWindow）。实测过，
+	// 败下来的通常是 FETCH 那一步而不是 SELECT —— go-imap 把写缓冲了，
+	// 死在读应答时才浮出来。所以下面刻意不假设失败发生在哪条命令上。
+	if _, err := c.Headers("INBOX", 1, 0); err != nil {
+		t.Logf("掐断后第一条失败（预期内）: %v", err)
+	}
+
+	// 第二条：必须自己活过来，而且结果要对。
+	got, err := c.Headers("INBOX", 1, 0)
+	if err != nil {
+		t.Fatalf("掐断之后没能自动重连（只赔一条命令是允许的，第二条就不行）: %v", err)
+	}
+	if len(got) != len(first) {
+		t.Errorf("重连后拉到 %d 条，掐断前是 %d 条 —— 重连之后漏了或重了",
+			len(got), len(first))
+	}
+
+	// 重连之后选中状态是**新连接**上的，正文照样得拉得下来。
+	// 这条专门盯「选中记忆跟着旧连接一起活了下来」那个坑。
+	if _, err := c.Bodies("INBOX", uidsOf(got)); err != nil {
+		t.Fatalf("重连后拉正文失败: %v", err)
 	}
 }

@@ -9,12 +9,24 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
 )
+
+// livenessWindow 是「多久没碰过这条连接，才值得先探一次活」。
+//
+// NOOP 探活存在的唯一理由是服务商会在**空闲一段时间**后单方面掐断连接
+// （见 ensureLocked）。那么刚用过的连接就不需要探 —— 上一条命令的应答
+// 已经把「它还活着吗」回答了。而一次「打开会话」会连着走十几条命令，
+// 每条前面插一个 NOOP 就是十几条白跑的往返：实测 15 条命令里有 6 条是它。
+//
+// 5 秒这个值很保守：真正的空闲断连是**分钟**量级（RFC 3501 建议服务端
+// 至少 30 分钟），而一次打开会话的全部操作在几十毫秒内跑完。
+const livenessWindow = 5 * time.Second
 
 var (
 	// ErrAuth 表示认证失败。
@@ -50,7 +62,41 @@ type liveClient struct {
 	// 每次 SELECT 都重新 LIST 一遍纯属浪费 —— 一次连接内不会变。
 	// nil 表示还没拉过；重连时清空。
 	folderList []string
+
+	// selName / selRO / selBox 记住**这条连接上当前选中的文件夹**。
+	//
+	// 为什么需要它：一次「打开会话」会连着走同步、正文、标已读三条腿，
+	// 每条腿都各自 SELECT 一遍同一个文件夹。实测（见 roundtrip_test.go
+	// 的 TestOpenThread_...）：15 条命令里只有 3 条在干活 —— 2 条 FETCH
+	// 加 1 条 STORE，另外 12 条全是重复的 NOOP + EXAMINE。
+	//
+	// selName 存的是**服务端上的真实名字**（解析别名之后的），空串表示
+	// 当前没有选中任何文件夹。换连接时三样一起清掉：选中状态是**连接级**
+	// 的，新连接上什么也没选中。
+	selName string
+	selRO   bool
+	selBox  *imap.MailboxStatus
+
+	// verifiedAt 是上一次**确认**这条连接还活着的时刻（探活通过、或者
+	// 一条命令成功跑完都算）。零值表示「还没确认过」—— 那时一律先探活。
+	//
+	// 它只用来省掉重复探活，不改变任何语义：连接死了照样能被发现，
+	// 只是发现它的那条命令会失败一次（调用方 markSuspectLocked 之后，
+	// 下一次就会走重连）。见 livenessWindow。
+	verifiedAt time.Time
 }
+
+// markAliveLocked 记下「刚刚确认过这条连接还活着」。
+// 调用方必须已持有 c.mu。
+func (c *liveClient) markAliveLocked() { c.verifiedAt = time.Now() }
+
+// markSuspectLocked 把连接标成可疑：下一次 ensureLocked 会重新探活，
+// 探不通就重连。**任何一条命令失败都要调它。**
+//
+// 不调的话后果是实实在在的：连接已经死了，但 verifiedAt 还在窗口内，
+// 于是接下来几秒里的每条命令都会跳过探活、各自失败一遍，而原先只要
+// 一条就能发现并重连。省探活不能省掉「发现连接死了」这个能力。
+func (c *liveClient) markSuspectLocked() { c.verifiedAt = time.Time{} }
 
 // NewClient 用配置和凭据创建一个真实的邮箱客户端。
 func NewClient(cfg *config.Config, creds config.Credentials) (Client, error) {
@@ -78,12 +124,19 @@ func tlsConfig(host string) *tls.Config {
 // 单方面掐断连接，本地却还以为连着。
 func (c *liveClient) ensureLocked() error {
 	if c.conn != nil {
+		// 刚用过的连接不必探活 —— 上一条命令的应答已经回答了这个问题。
+		if !c.verifiedAt.IsZero() && time.Since(c.verifiedAt) < livenessWindow {
+			return nil
+		}
 		if err := c.conn.Noop(); err == nil {
+			c.markAliveLocked()
 			return nil
 		}
 		_ = c.conn.Logout()
 		c.conn = nil
 		c.folderList = nil
+		c.clearSelectLocked()
+		c.markSuspectLocked()
 	}
 
 	conn, err := dialEndpoint(c.cfg.IMAP)
@@ -115,7 +168,20 @@ func (c *liveClient) ensureLocked() error {
 	c.folderList = listFolders(conn)
 
 	c.conn = conn
+	// 新连接上什么文件夹都没选中 —— 不清的话会把上一条连接的选中状态
+	// 当成这条连接的，然后对着一个没选中的邮箱发 FETCH。
+	c.clearSelectLocked()
+	// 刚登录成功，连接是活的。
+	c.markAliveLocked()
 	return nil
+}
+
+// clearSelectLocked 清掉「当前选中的文件夹」这块记忆。
+// 调用方必须已持有 c.mu。
+func (c *liveClient) clearSelectLocked() {
+	c.selName = ""
+	c.selRO = false
+	c.selBox = nil
 }
 
 // imapDebugEnv 是打开完整 IMAP 会话转储的环境变量名。
@@ -163,10 +229,22 @@ func dialEndpointTLS(ep config.Endpoint) (*imapclient.Client, error) {
 // selectLocked 解析文件夹名并选中它，返回服务端上的真实名字和 SELECT 状态。
 // 调用方必须已持有 c.mu。
 //
-// Folder / Headers / Body / 标志操作 / 移动 五个入口要做的是同一件事：
+// Folder / Headers / Bodies / 标志操作 / 移动 五个入口要做的是同一件事：
 // ensureLocked → resolveLocked → Select。抽出来是因为漏掉其中任何一步
 // 都会表现成「某个功能莫名其妙连不上」，而且很难从现象反推是哪一步。
-func (c *liveClient) selectLocked(folder string, readOnly bool) (string, *imap.MailboxStatus, error) {
+//
+// fresh 为真表示**一定要重新 SELECT**，不吃「已经选中过」的记忆。什么时候
+// 必须给真：
+//
+//   - Folder：调用方要的就是权威状态（UIDVALIDITY / UIDNEXT / 总封数），
+//     拿一份旧的回去等于把「有没有新邮件」算错；
+//   - 任何刚改过这个文件夹内容的写操作之后（见 Move 末尾的 clear）。
+//
+// 其余情况给假 —— 复用记忆能把一次「打开会话」里的重复 SELECT 从 6 次
+// 压到 3 次。这是测量出来的，不是猜的：见 roundtrip_test.go 的
+// TestOpenThread_CostDoesNotGrowWithMessageCount（改前 15 条命令，
+// 其中 12 条是重复的 NOOP + EXAMINE）。
+func (c *liveClient) selectLocked(folder string, readOnly, fresh bool) (string, *imap.MailboxStatus, error) {
 	if err := c.ensureLocked(); err != nil {
 		return "", nil, err
 	}
@@ -174,10 +252,31 @@ func (c *liveClient) selectLocked(folder string, readOnly bool) (string, *imap.M
 	if err != nil {
 		return "", nil, err
 	}
+
+	// 复用规则不是「名字相同就行」，**读写模式也得兼容**：
+	//
+	//   - 当初可写选中的（SELECT），后来的只读请求能复用 —— 可写包含只读；
+	//   - 当初只读选中的（EXAMINE），后来的可写请求**不能**复用 ——
+	//     在 EXAMINE 过的邮箱上 STORE，服务端会直接拒掉。
+	//
+	// 后者正是 MarkSeen 的情形：正文是 EXAMINE 拉的，标已读需要 SELECT，
+	// 所以那一次注定要重选一条。这不是没优化到，是协议本身要求的。
+	if !fresh && c.selName == real && (c.selRO == readOnly || !c.selRO) {
+		return real, c.selBox, nil
+	}
+
 	mbox, err := c.conn.Select(real, readOnly)
 	if err != nil {
+		// 选失败说明这条连接上的选中状态已经不可信 —— 清掉记忆，
+		// 别让下一次操作继续复用一个说不清是什么的状态；同时把连接
+		// 标成可疑，让下一次重新探活（探不通就重连）。
+		c.clearSelectLocked()
+		c.markSuspectLocked()
 		return "", nil, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
+	c.selName, c.selRO, c.selBox = real, readOnly, mbox
+	// 一条命令成功跑完 = 这条连接刚被证实是活的。
+	c.markAliveLocked()
 	return real, mbox, nil
 }
 

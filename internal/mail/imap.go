@@ -21,11 +21,14 @@ const maxHeaderBytes = 64 * 1024
 const maxBodyBytes = 4 * 1024 * 1024
 
 // Folder 选中一个文件夹并返回它的状态。
+//
+// 这是唯一要求**权威状态**的入口（UIDVALIDITY / UIDNEXT / 总封数都会被
+// 用来算拉取区间），所以它不吃「已经选中过」的记忆 —— 见 selectLocked。
 func (c *liveClient) Folder(name string) (Folder, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	real, mbox, err := c.selectLocked(name, true)
+	real, mbox, err := c.selectLocked(name, true, true)
 	if err != nil {
 		return Folder{}, err
 	}
@@ -67,6 +70,8 @@ func (c *liveClient) Folders() ([]string, error) {
 	if err := c.ensureLocked(); err != nil {
 		return nil, err
 	}
+	// 探活（或重连）走通了 —— 这条连接刚被证实是活的。
+	c.markAliveLocked()
 	if c.folderList == nil {
 		return nil, errors.New("没能从服务端取到文件夹列表")
 	}
@@ -78,11 +83,24 @@ func (c *liveClient) Folders() ([]string, error) {
 // Headers 拉取 UID 落在 [from, to] 区间内的邮件头部。
 //
 // to 传 0 表示「到最新」。
+//
+// 它复用当前选中的文件夹（fresh=false），靠的是一条**不变量**：
+// 每次调 Headers 之前，紧挨着总有一次 Folder（同文件夹或别的文件夹）。
+//
+//   - app.syncFolder：Folder(folder) → Headers(folder)，同一个；
+//   - diagnose.go 第 159 行：Folder("INBOX") → Headers("INBOX")，同一个；
+//   - diagnose.go 第 186 行：Folder("Sent") → Headers("INBOX")，
+//     文件夹不同 → 记忆对不上 → 照样重选。
+//
+// 同文件夹那一支里，两次调用之间**只隔着纯计算、没有任何 I/O**，所以
+// 用来算区间的 UIDNEXT 是新鲜的。万一真在这几微秒里有新邮件进来了，
+// 后果也只是「这一轮少看到一封」—— LastUID 只推进到看见的那封，下一轮
+// 会补上，和轮询本身的延迟是同一个量级，不是丢信。
 func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	_, mbox, err := c.selectLocked(folder, true)
+	_, mbox, err := c.selectLocked(folder, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -117,8 +135,11 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 		out = append(out, headerFromMessage(msg, folder, section))
 	}
 	if err := <-done; err != nil {
+		c.markSuspectLocked()
 		return nil, fmt.Errorf("拉取 %s 头部失败: %w", folder, err)
 	}
+	// 命令成功跑完 = 连接刚被证实是活的。
+	c.markAliveLocked()
 
 	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out, nil
@@ -196,7 +217,8 @@ func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySecti
 //
 // 一次 UID FETCH 带上整个 UID 集合。这是这一层唯一能显著降低正文代价的
 // 杠杆：往返次数从 O(邮件数) 降到 O(1)。改之前是逐封一条 FETCH，外面还
-// 套着 NOOP 和 SELECT，一个 66 封的会话要 198 次往返；现在 3 次。
+// 套着 NOOP 和 SELECT —— 真实邮箱里最大的会话 19 封，逐封要 57 次往返；
+// 现在 3 次。
 //
 // 返回的 map 里没有的 UID 就是没拉到，**不算错误** —— 单封解析失败不该
 // 让整批作废。只有「选中文件夹失败」和「整条 FETCH 失败」才返回 error。
@@ -208,7 +230,7 @@ func (c *liveClient) Bodies(folder string, uids []uint32) (map[uint32]Message, e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	real, _, err := c.selectLocked(folder, true)
+	real, _, err := c.selectLocked(folder, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -238,8 +260,10 @@ func (c *liveClient) Bodies(folder string, uids []uint32) (map[uint32]Message, e
 		out[msg.Uid] = Message{UID: msg.Uid, Folder: folder, Body: body, HTML: isHTML}
 	}
 	if err := <-done; err != nil {
+		c.markSuspectLocked()
 		return nil, fmt.Errorf("批量拉取 %s 正文失败: %w", real, err)
 	}
+	c.markAliveLocked()
 	return out, nil
 }
 
@@ -261,7 +285,11 @@ func (c *liveClient) SetFlag(folder string, uids []uint32, flag string, add bool
 	defer c.mu.Unlock()
 
 	// 用可写方式选中：打标志是修改操作。
-	if _, _, err := c.selectLocked(folder, false); err != nil {
+	//
+	// 复用记忆时它会**自动重选**：记忆里若记着「只读选中的」，而这里要
+	// 可写，selectLocked 的兼容性判断会挡住复用。这不是漏优化 ——
+	// 在 EXAMINE 过的邮箱上 STORE，服务端会直接拒。
+	if _, _, err := c.selectLocked(folder, false, false); err != nil {
 		return err
 	}
 
@@ -274,8 +302,10 @@ func (c *liveClient) SetFlag(folder string, uids []uint32, flag string, add bool
 	// 第二个参数 silent=true：让服务端别回 FETCH 更新，省一轮往返。
 	item := imap.FormatFlagsOp(op, true)
 	if err := c.conn.UidStore(seqSetOf(uids), item, []interface{}{flag}, nil); err != nil {
+		c.markSuspectLocked()
 		return fmt.Errorf("更新标志 %s 失败: %w", flag, err)
 	}
+	c.markAliveLocked()
 	return nil
 }
 
@@ -292,9 +322,15 @@ func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
 	if err != nil {
 		return err
 	}
-	if _, _, err := c.selectLocked(folder, false); err != nil {
+	if _, _, err := c.selectLocked(folder, false, false); err != nil {
 		return err
 	}
+
+	// 从这里往下不论走哪条分支，**都把「当前选中」的记忆清掉**：移动和
+	// 清空都会改变这个文件夹的内容（少了几封、UIDNEXT 也可能动），
+	// 留着那份旧状态，下一次复用它的人就会拿着一个错的 UIDNEXT 去算区间。
+	// 清掉只多花一次 SELECT，比算错区间便宜。
+	defer c.clearSelectLocked()
 
 	seqset := seqSetOf(uids)
 
@@ -302,8 +338,10 @@ func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
 	// 「复制 + 打删除标记 + 清空」这三步不会被打断。
 	if ok, _ := c.conn.Support("MOVE"); ok {
 		if err := c.conn.UidMove(seqset, realDest); err != nil {
+			c.markSuspectLocked()
 			return fmt.Errorf("移动邮件到 %s 失败: %w", realDest, err)
 		}
+		c.markAliveLocked()
 		return nil
 	}
 
@@ -314,15 +352,19 @@ func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
 	// UID EXPUNGE 可用，只能这样。所以能走 MOVE 就一定走 MOVE，
 	// 这条路径只在服务端不支持 MOVE 时才会用到。
 	if err := c.conn.UidCopy(seqset, realDest); err != nil {
+		c.markSuspectLocked()
 		return fmt.Errorf("复制邮件到 %s 失败: %w", realDest, err)
 	}
 	item := imap.FormatFlagsOp(imap.AddFlags, true)
 	if err := c.conn.UidStore(seqset, item, []interface{}{imap.DeletedFlag}, nil); err != nil {
+		c.markSuspectLocked()
 		return fmt.Errorf("标记待删除失败: %w", err)
 	}
 	if err := c.conn.Expunge(nil); err != nil {
+		c.markSuspectLocked()
 		return fmt.Errorf("清空已删除邮件失败: %w", err)
 	}
+	c.markAliveLocked()
 	return nil
 }
 
