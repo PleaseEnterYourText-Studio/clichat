@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // 正文列必须在**任何终端宽度**下都左右对称，且每行都补齐到终端全宽。
@@ -66,6 +68,51 @@ func TestZen_ContentColumnCentredAtEveryWidth(t *testing.T) {
 		}
 		if want := zenContentWidth(w); ruleW != want {
 			t.Errorf("宽度 %d：分隔线 %d 列，want %d", w, ruleW, want)
+		}
+	}
+}
+
+// 列表标题必须在正文列里居中。
+//
+// 这条抓的是「先上色、再量宽度」：viewZenList 原先写
+// `f.center(zenFaint.Render("会话"))`，而 center 内部用 textWidth 算补白，
+// textWidth 逐 rune 量、**不认 ANSI** —— 转义序列里的 `[`、`3`、`8`、`m`
+// 都是可打印字符，于是「会话」4 列被算成 17 列（256 色下
+// `\x1b[38;5;240m` + `\x1b[0m` 一共 13 个可打印字符），补白少 7 列。
+//
+// 症状是「看着好像有点歪」，量出来才知道偏了 7 列 —— 而且**偏多少取决于
+// 色深**（16 色下序列更短，偏得少），所以这里必须先把色深钉成 256 色再断言，
+// 否则这条判据在不同环境下给出不同结论。
+func TestZenList_TitleCentredInContentColumn(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
+
+	ansiSeq := regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+	for _, w := range []int{60, 72, 80, 100, 120, 160, 200, 210} {
+		m := newSampleModel(t)
+		m, _ = update(m, tea.WindowSizeMsg{Width: w, Height: 30})
+		m, _ = update(m, keyMsg("f2"))  // 进 Zen（落在首页）
+		m, _ = update(m, keyMsg("tab")) // → 列表
+
+		var title string
+		for _, ln := range strings.Split(m.View(), "\n") {
+			if strings.TrimSpace(ansiSeq.ReplaceAllString(ln, "")) == "会话" {
+				title = ln
+				break
+			}
+		}
+		if title == "" {
+			t.Fatalf("宽度 %d：列表里找不到标题行", w)
+		}
+
+		contentW := zenContentWidth(w)
+		got := lipgloss.Width(title) - lipgloss.Width(strings.TrimLeft(title, " "))
+		want := zenLeftPad(w, contentW) + (contentW-textWidth("会话"))/2
+		if got != want {
+			t.Errorf("宽度 %d：标题落在第 %d 列，want %d —— 居中的补白把转义序列算宽了",
+				w, got, want)
 		}
 	}
 }

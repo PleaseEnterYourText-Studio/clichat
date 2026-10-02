@@ -130,6 +130,25 @@ func (m Model) zenInChat() bool {
 	return m.layout == layoutZen && m.zenScreen == zenChat
 }
 
+// setZenFocus 按当前 Zen 屏决定输入框要不要焦点。
+//
+// 首页和会话屏上用户是要打字的，必须聚焦；列表上没有输入，失焦。
+//
+// ⚠️ 这条是补一个**实测出来的 bug**：输入框的焦点原先一直「继承」着进 Zen
+// 之前的状态 —— 从 Normal 会话进 Zen 恰好是聚焦的（那边本来就在打字），所以
+// 一路没暴露；从 Normal **列表**进 Zen 就是失焦的，首页上打字毫无反应。
+//
+// 表现就是用户报的「f2 后 tab 有 bug」：F2 → Tab（去列表）→ Esc（回首页），
+// 输入框彻底哑了，敲什么都没用。而且失焦的输入框**看不出来**（提示符和占位
+// 文字都照画），所以只能靠按了没反应才发现。
+func (m *Model) setZenFocus() {
+	if m.zenScreen == zenList {
+		m.input.Blur()
+		return
+	}
+	m.input.Focus()
+}
+
 // applyInputStyle 按当前布局设置输入框的提示符与占位文字。
 //
 // 集中在一处：进 Zen、在 Zen 里换屏、从 Zen 里打开一个会话（enterThread 会
@@ -154,6 +173,14 @@ func (m *Model) toggleZen() {
 		m.layout = layoutNormal
 		m.zenShowHint = false
 		m.applyInputStyle()
+		// 出 Zen 时把焦点还原成「Normal 世界该有的样子」：会话里要聚焦，
+		// 列表里不该有。不还原的话，从 Zen 首页退回 Normal 列表会留下一个
+		// 隐形的聚焦输入框。
+		if m.mode == modeChat || m.mode == modeNewChat {
+			m.input.Focus()
+		} else {
+			m.input.Blur()
+		}
 		m.syncInputWidth()
 		m.clampChatScroll()
 		return
@@ -164,6 +191,7 @@ func (m *Model) toggleZen() {
 	// 进来先亮一下怎么用，用户按第一个键就收掉。
 	m.zenShowHint = true
 	m.applyInputStyle()
+	m.setZenFocus()
 	m.syncInputWidth()
 	m.clampChatScroll()
 }
@@ -172,6 +200,7 @@ func (m *Model) toggleZen() {
 func (m *Model) goZen(s zenScreen) {
 	m.zenScreen = s
 	m.applyInputStyle()
+	m.setZenFocus()
 	m.syncInputWidth()
 	m.clampChatScroll()
 }
@@ -206,16 +235,35 @@ const zenLogoWord = "CLICHAT"
 // **最宽的那一行**算，不能逐行居中 —— 逐行居中会让每行的起始列都不一样，
 // 字立刻散开。见 viewZenHome 里那段。
 //
+// ⚠️ **第 0 行和第 5 行开头的那个空格是内容，不是缩进。**
+//
+// ANSI Shadow 的阴影相对字身右下偏移一格，所以 'C' 的顶横（`██████╗`）和底横
+// （`╚═════╝`）都比它的竖笔（`██║`）右移一列 —— 官方输出里这两行就以一个空格
+// 开头，其余四行从第 0 列起。这正是 figlet 原样：
+//
+//	 ██████╗...   ← 第 0 行
+//	██╔════╝...   ← 第 1 行
+//	 ╚═════╝...   ← 第 5 行
+//
+// 丢掉它，'C' 的上下两横会比竖笔左移一格，整个字像被斜切了一刀；行尾的空格
+// 则无所谓 —— 每行前面补的留白是**整块共用**的（见 viewZenHome），行尾多少
+// 由终端补。所以这里只保留前导空格、行尾空格一律去掉，免得被编辑器的
+// 「去尾随空白」反复改来改去。
+//
+// 这条踩过一次：从终端里复制字标时，第 0/5 行行首那个空格很容易跟着丢
+// （很多地方会顺手 trim 掉），而丢掉之后画面只是「有点歪」，不像坏了。
+// TestZenLogo_LeadingSpacesMatchFiglet 守着它。
+//
 // 改字形时注意：这些框线字符（U+2550 区）和实心块一样属于 East Asian
 // Ambiguous，本仓库的 cellWidth 把它们钉成 1 列，和 lipgloss.Width 同一把
 // 尺子（styles.go 里 cellWidth 的注释记着这条）。
 var zenLogoArt = []string{
-	"██████╗██╗     ██╗ ██████╗██╗  ██╗ █████╗ ████████╗",
+	" ██████╗██╗     ██╗ ██████╗██╗  ██╗ █████╗ ████████╗",
 	"██╔════╝██║     ██║██╔════╝██║  ██║██╔══██╗╚══██╔══╝",
 	"██║     ██║     ██║██║     ███████║███████║   ██║",
 	"██║     ██║     ██║██║     ██╔══██║██╔══██║   ██║",
 	"╚██████╗███████╗██║╚██████╗██║  ██║██║  ██║   ██║",
-	"╚═════╝╚══════╝╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝",
+	" ╚═════╝╚══════╝╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝",
 }
 
 // zenLogoWidth 是字标整块的宽度（最宽那一行）。
@@ -384,13 +432,24 @@ func (f zenFrame) indent(s string) string {
 	return strings.Repeat(" ", f.left) + s
 }
 
-// center 在正文列里把一行居中（按纯文本宽度算，所以先算补白再上色）。
-func (f zenFrame) center(s string) string {
+// center 在正文列里把一行居中。
+//
+// ⚠️ s 必须是**没上色的纯文本**，样式从 style 参数进。理由和折行那条一样：
+// 补白是按 textWidth 算的，而 textWidth 逐 rune 量、不认 ANSI —— 把一个已经
+// 上色的串喂进来，转义序列里的 `[`、`3`、`8`、`m` 这些**可打印字符**会被
+// 当成可见字符算进宽度。
+//
+// 这不是假想：列表标题原先写的是 `f.center(zenFaint.Render("会话"))`，
+// 「会话」4 列被算成 17 列（256 色下 `\x1b[38;5;240m` + `\x1b[0m` 一共 13 个
+// 可打印字符），补白从 37 列缩到 30 列，标题整体偏左 7 列。而且**偏多少取决于
+// 色深** —— 16 色下序列更短，偏得也少，所以肉眼看只是「好像有点歪」，
+// 换个终端又不一样。
+func (f zenFrame) center(s string, style lipgloss.Style) string {
 	pad := (f.contentW - textWidth(s)) / 2
 	if pad < 0 {
 		pad = 0
 	}
-	return strings.Repeat(" ", pad) + s
+	return strings.Repeat(" ", pad) + style.Render(s)
 }
 
 // fit 把行数补齐到 height、每行补齐到终端全宽，然后拼成一整块。
@@ -514,11 +573,11 @@ func (m Model) viewZenList() string {
 
 	lines := make([]string, 0, m.height)
 	lines = append(lines, "")
-	lines = append(lines, f.indent(f.center(zenFaint.Render("会话"))))
+	lines = append(lines, f.indent(f.center("会话", zenFaint)))
 	lines = append(lines, "")
 
 	if len(m.visible) == 0 {
-		lines = append(lines, f.indent(f.center(zenFaint.Render("还没有会话"))))
+		lines = append(lines, f.indent(f.center("还没有会话", zenFaint)))
 		return f.fit(lines, m.height)
 	}
 

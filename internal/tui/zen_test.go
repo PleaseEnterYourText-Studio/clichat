@@ -199,6 +199,62 @@ func TestZen_HomeInputSendsToCurrentThread(t *testing.T) {
 	}
 }
 
+// 首页和会话屏的输入框必须是聚焦的，列表上必须失焦。
+//
+// 这条抓过一个真 bug（用户原话「f2 后 tab 有 bug」）：输入框的焦点原先一直
+// **继承**着进 Zen 之前的状态 —— 从 Normal 会话进 Zen 恰好是聚焦的（那边本来
+// 就在打字），所以一路没暴露；从 Normal **列表**进 Zen 就是失焦的，首页上敲
+// 什么都没反应。而且失焦的输入框**看不出来**：提示符和占位文字照画不误，
+// 只能靠「按了没反应」发现。
+//
+// 下面这条特意从 **Normal 列表**出发 —— 之前所有测试都先开一个会话，
+// 正好绕开了出问题的那条路。
+func TestZen_InputFocusFollowsScreen(t *testing.T) {
+	m := newSampleModel(t)
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	if m.input.Focused() {
+		t.Fatal("前提不成立：Normal 列表上输入框本该是失焦的")
+	}
+
+	m, _ = update(m, keyMsg("f2"))
+	if !m.input.Focused() {
+		t.Error("Zen 首页的输入框必须聚焦 —— 否则首页上打不了字")
+	}
+
+	m, _ = update(m, keyMsg("tab"))
+	if m.input.Focused() {
+		t.Error("Zen 列表上没有输入，输入框该失焦")
+	}
+
+	// 回首页要重新聚焦。这就是用户报的那条路：F2 → Tab → Esc。
+	m, _ = update(m, keyMsg("esc"))
+	if !m.input.Focused() {
+		t.Error("从列表回首页后输入框必须重新聚焦")
+	}
+
+	// 出 Zen 回到 Normal 列表，输入框也该是失焦的。
+	m, _ = update(m, keyMsg("f2"))
+	if m.input.Focused() {
+		t.Error("退回 Normal 列表后输入框不该还聚焦着")
+	}
+}
+
+// 首页能真的把字打进去 —— 上面那条只验焦点，这条验端到端。
+func TestZen_HomeAcceptsTyping(t *testing.T) {
+	m := newSampleModel(t)
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ = update(m, keyMsg("f2"))
+
+	// 逐字敲进去，走真实的 textinput 更新路径。
+	for _, r := range "你好" {
+		m, _ = update(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if got := m.input.Value(); got != "你好" {
+		t.Errorf("首页输入框收到的是 %q，want %q —— 焦点没设对", got, "你好")
+	}
+}
+
 // 字标各行的宽度必须和 lipgloss 那把尺子一致。
 //
 // 字标里全是 █ ╗ ╔ ╚ ═ ║ 这类 East Asian Ambiguous 字符。本仓库的
@@ -214,6 +270,36 @@ func TestZenLogo_WidthMatchesLipgloss(t *testing.T) {
 	}
 	if w := zenLogoWidth(); w <= 0 {
 		t.Errorf("字标整块宽度算出来是 %d", w)
+	}
+}
+
+// 字标第 0 行和第 5 行开头的空格不能丢。
+//
+// ANSI Shadow 的阴影相对字身右下偏移一格，所以 'C' 的顶横 `██████╗` 和底横
+// `╚═════╝` 都比它的竖笔 `██║` 右移一列 —— figlet 官方输出里这两行就以一个
+// 空格开头，其余四行从第 0 列起。丢掉这个空格，'C' 的上下两横会比竖笔左移
+// 一格，整个字像被斜切了一刀。
+//
+// 这条抓的是**复制粘贴吃字符**：从终端里拷字标时行首那个空格很容易被顺手
+// trim 掉，而丢掉之后画面只是「有点歪」，不像坏了 —— 肉眼扫过去会当成设计。
+// 下面两组数来自 figlet 的 ansi_shadow 字体生成 "CLICHAT" 的官方输出
+// （去掉行尾空格）。
+func TestZenLogo_LeadingSpacesMatchFiglet(t *testing.T) {
+	wantIndent := []int{1, 0, 0, 0, 0, 1}
+	wantWidth := []int{52, 52, 49, 49, 49, 49}
+
+	if len(zenLogoArt) != len(wantIndent) {
+		t.Fatalf("字标 %d 行，want %d 行", len(zenLogoArt), len(wantIndent))
+	}
+	for i, l := range zenLogoArt {
+		if got := len(l) - len(strings.TrimLeft(l, " ")); got != wantIndent[i] {
+			t.Errorf("第 %d 行前导空格 %d 个，want %d —— 行首那个空格是字的一部分，不是缩进",
+				i, got, wantIndent[i])
+		}
+		if got := textWidth(strings.TrimRight(l, " ")); got != wantWidth[i] {
+			t.Errorf("第 %d 行去掉行尾空格后 %d 列，want %d —— 字形和 figlet 官方输出对不上",
+				i, got, wantWidth[i])
+		}
 	}
 }
 
