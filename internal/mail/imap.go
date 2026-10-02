@@ -192,55 +192,53 @@ func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySecti
 	return h
 }
 
-// Body 拉取单封邮件的正文。
+// Bodies 批量拉取一个文件夹里若干封邮件的正文。
 //
-// HTML 邮件会被转成 Markdown（不是降级成纯文本 —— 链接、表格、标题都
-// 要留着，见 readPlainText），引用历史会被砍掉，这是聊天视图该有的样子。
-// 返回的 Message.HTML 说明正文走的是哪一支。
-func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
+// 一次 UID FETCH 带上整个 UID 集合。这是这一层唯一能显著降低正文代价的
+// 杠杆：往返次数从 O(邮件数) 降到 O(1)。改之前是逐封一条 FETCH，外面还
+// 套着 NOOP 和 SELECT，一个 66 封的会话要 198 次往返；现在 3 次。
+//
+// 返回的 map 里没有的 UID 就是没拉到，**不算错误** —— 单封解析失败不该
+// 让整批作废。只有「选中文件夹失败」和「整条 FETCH 失败」才返回 error。
+func (c *liveClient) Bodies(folder string, uids []uint32) (map[uint32]Message, error) {
+	if len(uids) == 0 {
+		return map[uint32]Message{}, nil
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, _, err := c.selectLocked(folder, true); err != nil {
-		return Message{}, err
+	real, _, err := c.selectLocked(folder, true)
+	if err != nil {
+		return nil, err
 	}
 
-	seqset := new(imap.SeqSet)
-	seqset.AddNum(uid)
+	// 只取正文。ENVELOPE 不再拉 —— 主题/发件人/时间早就从 Headers
+	// 拿全了（会话流读的是 thread.Header，不是这里），再取一遍是白花
+	// 的字节，而且每封都要花。
 	section := &imap.BodySectionName{Peek: true}
-	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, section.FetchItem()}
+	items := []imap.FetchItem{imap.FetchUid, section.FetchItem()}
 
-	fetched := make(chan *imap.Message, 1)
+	fetched := make(chan *imap.Message, 32)
 	done := make(chan error, 1)
-	go func() { done <- c.conn.UidFetch(seqset, items, fetched) }()
+	go func() { done <- c.conn.UidFetch(seqSetOf(uids), items, fetched) }()
 
-	var out Message
-	found := false
+	out := make(map[uint32]Message, len(uids))
 	for msg := range fetched {
-		found = true
-		out = Message{UID: msg.Uid, Folder: folder}
-		if env := msg.Envelope; env != nil {
-			out.Subject = decodeMIMEHeader(env.Subject)
-			out.Date = env.Date
-			if len(env.From) > 0 {
-				out.From = addressOf(env.From[0])
-				out.FromName = decodeMIMEHeader(env.From[0].PersonalName)
-			}
+		r := msg.GetBody(section)
+		if r == nil {
+			continue
 		}
-		if r := msg.GetBody(section); r != nil {
-			body, isHTML, err := readPlainText(r)
-			if err != nil {
-				return Message{}, fmt.Errorf("解析 %s 的正文失败: %w", folder, err)
-			}
-			out.Body = body
-			out.HTML = isHTML
+		body, isHTML, err := readPlainText(r)
+		if err != nil {
+			// 这一封解析不了就跳过，剩下的照常返回 —— 调用方按差集
+			// 把它单独标成加载失败。
+			continue
 		}
+		out[msg.Uid] = Message{UID: msg.Uid, Folder: folder, Body: body, HTML: isHTML}
 	}
 	if err := <-done; err != nil {
-		return Message{}, fmt.Errorf("拉取 %s 正文失败: %w", folder, err)
-	}
-	if !found {
-		return Message{}, fmt.Errorf("在 %s 里找不到 UID %d", folder, uid)
+		return nil, fmt.Errorf("批量拉取 %s 正文失败: %w", real, err)
 	}
 	return out, nil
 }

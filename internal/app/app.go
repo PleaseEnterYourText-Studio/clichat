@@ -319,12 +319,18 @@ func (a *App) threadIDOf(messageID string) string {
 
 // Bodies 返回一个会话里所有消息的正文，key 是 Message-ID。
 //
+// ⚠️ 取正文必须**按文件夹批量**取，不能逐封取。逐封的代价全在协议往返上：
+// 每封要走 NOOP + SELECT + UID FETCH 三条命令，一个 66 封的会话就是 198 次
+// 往返（实测：21 封 = 63 条，见 mail 包的 roundtrip_test.go）。按文件夹批量
+// 之后，同一个会话落到「每个文件夹 3 条」。这个函数是那条慢路径唯一的入口，
+// 改这里等于改所有"打开会话"的耗时。
+//
 // 单封拉取失败不会让整个会话打不开 —— 那一封填一句提示，
 // 其余的照常显示。返回的 error 只表示「有部分失败」。
 func (a *App) Bodies(th thread.Thread) (map[string]Body, error) {
 	out := make(map[string]Body, len(th.Messages))
 
-	var missing []mail.Header
+	var missing []thread.Header
 	for _, m := range th.Messages {
 		if b, ok := a.cachedBody(m.MessageID); ok {
 			out[m.MessageID] = b
@@ -338,19 +344,72 @@ func (a *App) Bodies(th thread.Thread) (map[string]Body, error) {
 		missing = append(missing, m)
 	}
 
-	var errs []error
+	fetched, errs := a.loadBodies(missing)
+	for id, b := range fetched {
+		out[id] = b
+	}
+	// 请求了却没回来的，就是加载失败的那几封。逐封标一句提示，而不是
+	// 让整个会话打不开 —— 一封坏邮件不该挡住其余几十封。
 	for _, m := range missing {
-		msg, err := a.client.Body(m.Folder, m.UID)
-		if err != nil {
+		if _, ok := out[m.MessageID]; !ok {
 			out[m.MessageID] = Body{Text: "（正文加载失败）"}
-			errs = append(errs, fmt.Errorf("%s UID %d: %w", m.Folder, m.UID, err))
-			continue
 		}
-		b := Body{Text: msg.Body, HTML: msg.HTML}
-		a.cacheBody(m.MessageID, b)
-		out[m.MessageID] = b
 	}
 	return out, errors.Join(errs...)
+}
+
+// folderUID 是「一封邮件在服务端上的位置」。
+//
+// UID 只在**一个文件夹内**唯一：收件箱的第 7 封和已发送的第 7 封是两个
+// 不同的东西，所以这个键必须带上文件夹，不能只用 UID。
+type folderUID struct {
+	folder string
+	uid    uint32
+}
+
+// loadBodies 按文件夹分组批量取正文，并把拉到的写进缓存。
+//
+// 分组不是优化而是必需：IMAP 的 FETCH 只作用于当前选中的那**一个**文件夹，
+// 而一个会话里的邮件可能一半在收件箱、一半在已发送。分组之后往返次数只随
+// 文件夹数增长，不随邮件数增长。
+//
+// 返回 Message-ID -> 正文（只含**真拉到**的），以及各文件夹的传输错误。
+// 「请求了但没回来」的那些留给调用方处置：填一句「加载失败」和当作
+// 「没有正文」是两种不同的处理，不该替它们选。
+func (a *App) loadBodies(msgs []thread.Header) (map[string]Body, []error) {
+	byFolder := map[string][]uint32{}
+	byUID := map[folderUID][]string{}
+
+	for _, m := range msgs {
+		if m.UID == 0 {
+			// 本地乐观插入的副本，服务端上没有这一封。
+			continue
+		}
+		k := folderUID{folder: m.Folder, uid: m.UID}
+		if _, dup := byUID[k]; !dup {
+			byFolder[m.Folder] = append(byFolder[m.Folder], m.UID)
+		}
+		byUID[k] = append(byUID[k], m.MessageID)
+	}
+
+	out := map[string]Body{}
+	var errs []error
+
+	for folder, uids := range byFolder {
+		got, err := a.client.Bodies(folder, uids)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for uid, msg := range got {
+			b := Body{Text: msg.Body, HTML: msg.HTML}
+			for _, id := range byUID[folderUID{folder: folder, uid: uid}] {
+				a.cacheBody(id, b)
+				out[id] = b
+			}
+		}
+	}
+	return out, errs
 }
 
 func (a *App) cachedBody(id string) (Body, bool) {
@@ -536,18 +595,36 @@ func (a *App) LastBodyText(th thread.Thread) (string, error) {
 // LastBodyText：界面要的是**当前窗口里那几条**的摘要，逐个调意味着
 // 一轮 N 个命令、N 次重绘，而滚一下就要再来一遍。
 //
+// ⚠️ 取的时候同样是**按文件夹批量**的（见 loadBodies）。摘要看起来便宜，
+// 但它滚一屏就是十几封 —— 逐封取的话每封三条命令，滚一下列表就是几十次
+// 往返，而换来的只是右边一行小字。
+//
 // ⚠️ 拉不到的那条**不出现在返回值里**，也不返回 error：摘要只是列表上的
 // 一行小字，为它报错或者塞一句「加载失败」进列表都是往列表里加噪音。
 // 界面认这个约定 —— 键不在就是没拉到，退回显示主题（见 listRowText）。
 // 一次失败不该让整个列表看起来像坏了。
 func (a *App) LastBodyTexts(msgs []thread.Header) map[string]string {
 	out := make(map[string]string, len(msgs))
+
+	var want []thread.Header
 	for _, m := range msgs {
-		text, err := a.lastBodyOf(m)
-		if err != nil || text == "" {
+		if b, ok := a.cachedBody(m.MessageID); ok {
+			if b.Text != "" {
+				out[m.MessageID] = b.Text
+			}
 			continue
 		}
-		out[m.MessageID] = text
+		if m.UID == 0 {
+			continue
+		}
+		want = append(want, m)
+	}
+
+	got, _ := a.loadBodies(want)
+	for id, b := range got {
+		if b.Text != "" {
+			out[id] = b.Text
+		}
 	}
 	return out
 }
@@ -562,9 +639,9 @@ func (a *App) lastBody(th thread.Thread) (string, error) {
 
 // lastBodyOf 取**某一条**消息的正文，优先用缓存。
 //
-// 拉到的正文顺手写进缓存，所以「列表摘要」和「打开会话读到的正文」是
-// 同一份东西 —— 两处各拉一份的话，同一封邮件会被下载两次，而且以后
-// 想给它们装同一个上限（比如「正文最多几 MB」）就是两处要改。
+// 拉到的正文顺手写进缓存（见 loadBodies），所以「列表摘要」和「打开会话
+// 读到的正文」是同一份东西 —— 两处各拉一份的话，同一封邮件会被下载两次，
+// 而且以后想给它们装同一个上限（比如「正文最多几 MB」）就是两处要改。
 func (a *App) lastBodyOf(h thread.Header) (string, error) {
 	if b, ok := a.cachedBody(h.MessageID); ok {
 		return b.Text, nil
@@ -573,13 +650,17 @@ func (a *App) lastBodyOf(h thread.Header) (string, error) {
 		// 本地乐观插入的副本还没同步到服务端，服务端上没有它。
 		return "", nil
 	}
-	msg, err := a.client.Body(h.Folder, h.UID)
-	if err != nil {
+
+	got, errs := a.loadBodies([]thread.Header{h})
+	if b, ok := got[h.MessageID]; ok {
+		return b.Text, nil
+	}
+	// 传输失败原样上报。传出去了、服务端却没给这一封，也要说清楚 ——
+	// 静默返回空串会让「复制正文」悄悄复制出一片空白，而用户以为复制成功了。
+	if err := errors.Join(errs...); err != nil {
 		return "", err
 	}
-	b := Body{Text: msg.Body, HTML: msg.HTML}
-	a.cacheBody(h.MessageID, b)
-	return b.Text, nil
+	return "", fmt.Errorf("在 %s 里找不到 UID %d", h.Folder, h.UID)
 }
 
 // forwardBody 拼出转发正文：一段来源说明 + 原文。

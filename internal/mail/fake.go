@@ -195,25 +195,23 @@ func (f *Fake) Headers(folder string, from, to uint32) ([]Header, error) {
 	return out, nil
 }
 
-// Body 拉取单封邮件的正文。
-func (f *Fake) Body(folder string, uid uint32) (Message, error) {
+// Bodies 批量拉取一个文件夹里若干封邮件的正文。
+//
+// 和真实实现同一个约定：返回的 map 里没有的 UID 就是没拉到，不算错误。
+func (f *Fake) Bodies(folder string, uids []uint32) (map[uint32]Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	m, ok := f.folder(folder).messages[uid]
-	if !ok {
-		return Message{}, fmt.Errorf("在 %s 里找不到 UID %d", folder, uid)
+	fl := f.folder(folder)
+	out := make(map[uint32]Message, len(uids))
+	for _, uid := range uids {
+		m, ok := fl.messages[uid]
+		if !ok {
+			continue
+		}
+		out[uid] = Message{UID: uid, Folder: folder, Body: m.body, HTML: m.html}
 	}
-	return Message{
-		UID:      uid,
-		Folder:   folder,
-		Subject:  m.header.Subject,
-		From:     m.header.From,
-		FromName: m.header.FromName,
-		Date:     m.header.Date,
-		Body:     m.body,
-		HTML:     m.html,
-	}, nil
+	return out, nil
 }
 
 // MarkSeen 给一批邮件打上已读标志。

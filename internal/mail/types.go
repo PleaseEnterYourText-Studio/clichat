@@ -1,8 +1,6 @@
 package mail
 
 import (
-	"time"
-
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
@@ -20,14 +18,16 @@ type Folder struct {
 	Messages    uint32
 }
 
-// Message 是一封邮件的正文与元信息。
+// Message 是一封邮件的**正文**。
+//
+// 只有正文，没有元信息 —— 主题 / 发件人 / 时间都从 Header 来（会话流渲染
+// 读的是 thread.Header）。原先这里还挂着 Subject / From / FromName / Date
+// 四个字段，但**一个读者都没有**，代价却是每拉一封正文都要在 FETCH 里多带
+// 一项 ENVELOPE。删掉之后请求变小，也不会再有人误以为「拉正文顺便就拿到
+// 了时间」。
 type Message struct {
-	UID      uint32
-	Folder   string
-	Subject  string
-	From     string
-	FromName string
-	Date     time.Time
+	UID    uint32
+	Folder string
 	// Body 是正文。
 	//
 	// HTML 邮件在入库前已经转成了 Markdown（见 htmlmd.go 的

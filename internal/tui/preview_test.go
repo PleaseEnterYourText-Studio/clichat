@@ -89,8 +89,11 @@ type bodyFailClient struct {
 	*mail.Fake
 }
 
-func (c bodyFailClient) Body(string, uint32) (mail.Message, error) {
-	return mail.Message{}, errors.New("连接断了")
+// 整个批量拉取都失败：返回 error 且不给任何正文。界面这一侧认的约定是
+// 「键不在 = 没拉到」，所以这条错误会一路落到 loadBodies 的 errs 里，
+// 而 out 里不会有这一封 —— 副行于是退回主题。
+func (c bodyFailClient) Bodies(string, []uint32) (map[uint32]mail.Message, error) {
+	return nil, errors.New("连接断了")
 }
 
 // loadPreviews 反复跑「拉列表摘要」那条链，直到没有新的要拉。

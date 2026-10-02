@@ -86,22 +86,9 @@ func (c *liveClient) ensureLocked() error {
 		c.folderList = nil
 	}
 
-	ep := c.cfg.IMAP
-	var (
-		conn *imapclient.Client
-		err  error
-	)
-
-	if ep.TLS == config.TLSStartTLS {
-		conn, err = imapclient.Dial(ep.Addr())
-		if err == nil {
-			err = conn.StartTLS(tlsConfig(ep.Host))
-		}
-	} else {
-		conn, err = imapclient.DialTLS(ep.Addr(), tlsConfig(ep.Host))
-	}
+	conn, err := dialEndpoint(c.cfg.IMAP)
 	if err != nil {
-		return fmt.Errorf("连接 IMAP 服务器 %s 失败: %w", ep.Addr(), err)
+		return fmt.Errorf("连接 IMAP 服务器 %s 失败: %w", c.cfg.IMAP.Addr(), err)
 	}
 
 	// 调试转储要赶在 LOGIN 之前挂上，否则会把登录那段对话漏掉。
@@ -145,6 +132,32 @@ func imapDebugWriter() io.Writer {
 		return nil
 	}
 	return log.Writer()
+}
+
+// dialEndpoint 建立一条到 ep 的 IMAP 连接（按配置升级 TLS），**但不登录**。
+//
+// 抽成变量是为了让协议层能在**进程内**的假服务端上被测到：假服务端跑明文，
+// 走不了生产这条 TLS 路径（见 imap_roundtrip_test.go）。生产路径上它恒等于
+// dialEndpointTLS —— 没有任何配置项能把它指向别处。
+var dialEndpoint = dialEndpointTLS
+
+// dialEndpointTLS 是 dialEndpoint 的生产实现：隐式 TLS 或 STARTTLS。
+func dialEndpointTLS(ep config.Endpoint) (*imapclient.Client, error) {
+	if ep.TLS != config.TLSStartTLS {
+		return imapclient.DialTLS(ep.Addr(), tlsConfig(ep.Host))
+	}
+
+	conn, err := imapclient.Dial(ep.Addr())
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.StartTLS(tlsConfig(ep.Host)); err != nil {
+		// 升级失败要主动断开：留着这条明文连接，后面每条命令都会以
+		// 「未加密」的身份发出去，而调用方只看到一句「连接失败」。
+		_ = conn.Logout()
+		return nil, err
+	}
+	return conn, nil
 }
 
 // selectLocked 解析文件夹名并选中它，返回服务端上的真实名字和 SELECT 状态。

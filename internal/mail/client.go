@@ -30,8 +30,18 @@ type Client interface {
 	// 只拉头部不拉正文，并且用 BODY.PEEK 以免把邮件误标为已读。
 	Headers(folder string, from, to uint32) ([]Header, error)
 
-	// Body 拉取单封邮件的纯文本正文。
-	Body(folder string, uid uint32) (Message, error)
+	// Bodies 批量拉取**同一个文件夹**里若干封邮件的正文，key 是 UID。
+	//
+	// 必须批量，不能逐封 —— 正文的代价几乎全在网络往返上。逐封拉时
+	// 每封要走 NOOP + SELECT + UID FETCH 三条命令（见 ensureLocked /
+	// selectLocked），一个 66 封的会话就是 198 次往返。实测（见
+	// roundtrip_test.go）：21 封 = 63 条命令。一次 FETCH 带上整个 UID
+	// 集合之后，同一个会话落到 3 条。
+	//
+	// 返回的 map 里**没有**的 UID 就是没拉到 —— 服务端上不存在，或者
+	// 那一封解析失败。调用方按 UID 对差集就行，批量操作不该因为其中
+	// 一封坏掉而整批作废。
+	Bodies(folder string, uids []uint32) (map[uint32]Message, error)
 
 	// MarkSeen 给一批邮件打上 \Seen 标志。
 	// 已读状态只存在服务端，本地不另存一份。
