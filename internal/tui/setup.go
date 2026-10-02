@@ -2,6 +2,8 @@ package tui
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -93,8 +95,34 @@ func (m Model) handleUnlockKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func parseMailServers(addr string) (smtpHost string, smtpPort int, imapHost string, imapPort int, err error) {
+	_, domain, ok := strings.Cut(addr, "@")
+	if !ok || domain == "" {
+		return "", 0, "", 0, fmt.Errorf("invalid email address")
+	}
+
+	if _, records, e := net.LookupSRV("_submission", "_tcp", domain); e == nil && len(records) > 0 {
+		smtpHost = strings.TrimSuffix(records[0].Target, ".")
+		smtpPort = int(records[0].Port)
+	} else if _, records, e := net.LookupSRV("_submissions", "_tcp", domain); e == nil && len(records) > 0 {
+		smtpHost = strings.TrimSuffix(records[0].Target, ".")
+		smtpPort = int(records[0].Port)
+	} else if records, e := net.LookupMX(domain); e == nil && len(records) > 0 {
+		smtpHost = strings.TrimSuffix(records[0].Host, ".")
+		smtpPort = 587
+	} else {
+		smtpHost = domain
+		smtpPort = 465
+	}
+
+	imapHost = smtpHost
+	imapPort = 993
+
+	return
+}
+
 // handleSetupKey 处理配置向导的按键。
-func (m Model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -122,6 +150,8 @@ func (m Model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setup.err = "地址格式不对"
 			return m, nil
 		}
+		m.cfg.SMTP.Host, m.cfg.SMTP.Port, m.cfg.IMAP.Host, m.cfg.IMAP.Port, _ = parseMailServers(value)
+
 		m.cfg.Account.Email = value
 		m.cfg.Account.DisplayName = localPart(value)
 		m.setup.err = ""
