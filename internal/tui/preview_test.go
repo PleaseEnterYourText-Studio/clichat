@@ -213,32 +213,48 @@ func TestListSubLine_MarksYourOwnMessage(t *testing.T) {
 	}
 }
 
-// 只拉**当前窗口里**那几条的摘要。
+// 只拉**当前窗口里**那几条的摘要，而且**一轮就够**。
 //
 // 列表可能有几百条，开机时一次全拉完意味着几百个 FETCH 换一行小字。
 // 窗口是跟着光标走的，翻下去的时候由键盘的尾巴再发一轮。
+//
+// 这里曾经还有一道「一轮最多 8 条」的闸（previewBatch）。它是在窗口过滤
+// 落地之前留下的，现在只剩副作用：窗口里第 9 条往后要等下一轮，而 app
+// 那边本来就把整批合并成「每个文件夹一条 FETCH」（见 loadBodies），
+// 多带几条几乎不花钱。所以上界交给窗口本身。
 func TestPreviews_FetchOnlyWhatTheWindowShows(t *testing.T) {
 	forceColor(t)
 	m := manyThreadsModel(t, 40)
+
+	// 窗口开高一点，好让「窗口里的会话数」真的超过原来那个 8 ——
+	// 否则「去掉分批」这件事在夹具上根本观察不到，判据会是一条永绿的空壳。
+	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 60})
 
 	from, to := m.listVisibleRange()
 	if to-from >= len(m.visible) {
 		t.Fatalf("前提不成立：窗口 %d 行盖住了全部 %d 条会话", to-from, len(m.visible))
 	}
 
-	want := m.wantedPreviews()
-	if len(want) == 0 {
-		t.Fatal("窗口里一条都没有要拉的 —— 摘要永远不会出现")
-	}
-	if len(want) > previewBatch {
-		t.Errorf("一轮发了 %d 条，超过 previewBatch=%d", len(want), previewBatch)
-	}
-
-	// 每一条要拉的都得落在窗口里。
+	// 窗口里有几条会话要拉（同一封只算一次）。
 	inWindow := map[string]bool{}
 	for i := from; i < to; i++ {
-		inWindow[listPreviewID(m.visible[i])] = true
+		if id := listPreviewID(m.visible[i]); id != "" {
+			inWindow[id] = true
+		}
 	}
+	if len(inWindow) <= 8 {
+		t.Fatalf("前提不成立：窗口里只有 %d 条会话，盖不住原来那个 8 的上限", len(inWindow))
+	}
+
+	want := m.wantedPreviews()
+
+	// ① 上界来自窗口：窗口里有几条就该发几条，一条都不能被分批挡下来。
+	if len(want) != len(inWindow) {
+		t.Errorf("窗口里有 %d 条会话要拉，一轮却发了 %d 条 —— 又在分批了",
+			len(inWindow), len(want))
+	}
+
+	// ② 反过来，也没人看的不该拉：每一条要拉的都得落在窗口里。
 	for _, h := range want {
 		if !inWindow[h.MessageID] {
 			t.Errorf("要拉 %q，但它不在窗口（%d,%d）里 —— 花了没人看的流量",

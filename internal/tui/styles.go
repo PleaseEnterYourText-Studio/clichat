@@ -4,7 +4,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/mail"
 )
 
 // 终端宽度低于这个值就从两栏降级成单栏。
@@ -29,7 +30,7 @@ const inputBlockHeight = 3
 
 // 引用的几何。两个数是一组，改一个要连着看另一个。
 //
-//	 ←inset→│▎←gap→正文……
+//	←inset→│▎←gap→正文……
 //
 // paneInset 是**正文栏里所有内容的左内缩**：引用条、会话标题、输入行、
 // 状态栏都从栏左沿 +1 格开始。它必须存在：不留这一格的话，引用条就直接
@@ -88,6 +89,17 @@ var (
 	// 比正文弱一档、同时比 fgMuted 亮一点 —— 它要读得清，因为那是输入框
 	// 唯一的用法说明。
 	fgPlaceholder = lipgloss.AdaptiveColor{Light: "238", Dark: "250"}
+
+	// fgPreview 是会话列表副行（最新一条正文摘要）的颜色。
+	//
+	// ⚠️ 这一档**比 fgMuted 更弱**，是刻意的，而且是这一版列表层次的
+	// 关键一步。副行和已读会话名挨着，两者都在"次要信息"这个大致范围里；
+	// 不给副行再降一档，那两行就糊在一起 —— 用户说的「元素堆砌挤压」
+	// 有一半是"所有字一样重"。
+	//
+	// 但也不能太弱：副行是**这条会话现在讲到哪儿了**，是列表里被真正
+	// 阅读的那一行。所以它比时间（fgTime）亮一点，只是不和时间拉开太多。
+	fgPreview = lipgloss.AdaptiveColor{Light: "245", Dark: "243"}
 )
 
 var (
@@ -122,13 +134,30 @@ var (
 	// stylePrompt 是输入框前面那个提示符。
 	stylePrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	// styleMDRule 是正文里分隔线（---）被渲染成的那条横线。
-	styleMDRule = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	//
+	// ⚠️ 这一档从写死的 `Color("240")` 改成 **fgDim**。240 是个**不随底色
+	// 变的**深灰：在深色终端上它确实很淡（正是想要的效果），可到了浅色
+	// 终端上它就是一条 #585858 的重线 —— 一条横贯正文的深灰线，比正文本身
+	// 还抢眼。而它要表达的恰恰是"这里只是一道分区"。
+	//
+	// 这和上面 Faint 那一条是同一类错：**从一个底色上挑出来的值，搬到另一个
+	// 底色上就错了**。分隔线属于「只是分区、不需要读」的那一档，直接取
+	// fgDim 就是了 —— 和分组标题、HTML 标记同一档，语义也对得上。
+	//
+	// 判据见 TestSecondaryTones_MustBeAdaptive：写死的灰在两种底色上必错一种。
+	styleMDRule = lipgloss.NewStyle().Foreground(fgDim)
 	// styleTag 是消息头上那个「HTML」小标记。
 	//
 	// 用灰色而不是亮色：它是一条**只读说明**（这条正文是转出来的），
-	// 不是状态、更不是警告，亮起来会跟发件人名字抢注意力。灰色却仍然
-	// 看得见，足够了。
-	styleTag = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	// 不是状态、更不是警告，亮起来会跟发件人名字抢注意力。
+	//
+	// ⚠️ 这一版把它从 fgMuted 降到 **fgDim**（再弱一档）。
+	//
+	// 原因是消息头这一行现在有了**三层**：名字 → 时间 → 标记。原先标记
+	// 和时间各自取自不同的灰阶常量，亮度却几乎一样，于是那三个东西读起来
+	// 是"一坨字"——用户说的「元素堆砌挤压」正是这个。和名字拉开两档、
+	// 和时间齐平，这一行的层次才能一眼看出来：谁是主角、哪两个是附注。
+	styleTag = lipgloss.NewStyle().Foreground(fgDim)
 
 	// styleSideline 是对方消息左边那条竖条。
 	//
@@ -162,6 +191,28 @@ var (
 	styleRowSelected = lipgloss.NewStyle().Background(rowSelectedBg).Bold(true)
 	// styleGroupTitle 是列表里「未读 / 已读」这类分组小标题。
 	styleGroupTitle = lipgloss.NewStyle().Foreground(fgDim)
+
+	// styleRowNameUnread / styleRowNameRead 是会话列表里名字那一格的两种
+	// 状态。
+	//
+	// ⚠️ 两个都必须**显式给前景色**，不能靠"默认前景就是最亮的"。
+	//
+	// 上一版只给未读加了粗体，已读用的是渲染默认前景 —— 于是列表里
+	// "读过"和"没读过"只差一个字重，而默认前景恰好是最亮的那一档。
+	// 结果就是满屏一样重的字，用户的原话是「元素堆砌挤压」。显式分档
+	// 之后，"哪几条还没读"是一眼的事。
+	//
+	// ⚠️ **不许给这两个样式加 Background。** 名字那一格是**补过空格**的
+	// 定宽格子（见 listRowSplit），一加底色，右边那些补位空格就变成一条
+	// 伸到时间列跟前的色带 —— 而这一版列表里唯一的底色块是"当前选中"。
+	styleRowNameUnread = lipgloss.NewStyle().Bold(true)
+	styleRowNameRead   = lipgloss.NewStyle().Foreground(fgMuted)
+
+	// stylePreview 是列表副行（最新一条正文摘要）。
+	//
+	// 比已读名字再弱一档：它排在名字之下，层级也该在名字之下。但它是
+	// 被真正阅读的那一行，所以只降半档，不降到时间那一档去。
+	stylePreview = lipgloss.NewStyle().Foreground(fgPreview)
 
 	// styleInputRow 原先在这里（浮起输入卡的底色）。
 	//
@@ -330,7 +381,7 @@ func hyperlink(url, text string) string {
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
 
-// styleSender 是消息头上发件人名字的样式。
+// styleSender 是消息头上发件人名字的样式（对方）。
 //
 // ⚠️ 这里原先是一个**十个颜色的调色板**（senderPalette），按地址哈希稳定地
 // 给每个发言人分配一个颜色，好让群聊里一眼认人。它被删掉了，理由有两条：
@@ -347,6 +398,21 @@ func hyperlink(url, text string) string {
 // 所以现在所有发件人**同一个样式**：粗体、终端自己的前景色。想认出是谁，
 // 读名字（名字就在旁边）。这正是 Zen 那套「去掉色相、只留明度」的做法。
 var styleSender = lipgloss.NewStyle().Bold(true)
+
+// styleSenderSelf 是「我」那两个字在消息头上的样式：比对方的名字**弱一档**。
+//
+// ⚠️ 这一档不是审美选择，是层次选择。两个名字都用最亮的那一档时，
+// 一屏里最亮的文字里有相当一部分是"我"—— 而那是这一屏里最不需要读的
+// 两个字（每一屏都有，而且永远在右边）。压下去之后，亮着的名字就都是
+// **别人**的名字，扫一屏看"谁说了什么"会快很多。
+//
+// 灰 + 粗体而不是纯灰：它仍然是这一行的**标注**（"这条是我发的"），
+// 只是不该和对方的名字一个音量。
+//
+// 别改成 fgDim —— 那一档是给"扫一眼就够、不需要读"的东西（分组标题、
+// 时间戳）的；「我」虽然不值得强调，但它是**认得出这一条是谁发的**那句话，
+// 得看得清。
+var styleSenderSelf = lipgloss.NewStyle().Bold(true).Foreground(fgMuted)
 
 // maxCellW 是一个字符在终端里最多占的列数（CJK 汉字、全角标点、emoji 都是 2）。
 //
@@ -368,12 +434,12 @@ const maxCellW = 2
 // 组合符/制表符/控制符 0），所以这里只把 Ambiguous 钉成 1 列。
 // 「textWidth 对纯文本必须等于 lipgloss.Width」这条有测试守着：
 // TestTextWidthMatchesLipglossOnPlainText。
-func cellWidth(r rune) int {
-	if runewidth.IsAmbiguousWidth(r) {
-		return 1
-	}
-	return runewidth.RuneWidth(r)
-}
+//
+// ⚠️ 实现**只有一份**，在 mail.CellWidth。这里的复用不是为了省几行：
+// html2md 要用同一把尺子去算补几个空格（见 mail.displayWidth），两边
+// 对「一个字符几列」的答案不一样的话，它补出来的空格正好错在那些字符上，
+// 分栏就会整列歪掉 —— 而中文邮件里 Ambiguous 字符满地都是。
+func cellWidth(r rune) int { return mail.CellWidth(r) }
 
 // textWidth 是 cellWidth 的整串版本。
 //

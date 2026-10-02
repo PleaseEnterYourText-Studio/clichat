@@ -440,4 +440,3 @@ func TestChat_HeadTimeIsMutedNotSenderColored(t *testing.T) {
 		t.Errorf("消息头里的时间没套 styleTime（期望序列 %q）：%q", timeSeq, head)
 	}
 }
-

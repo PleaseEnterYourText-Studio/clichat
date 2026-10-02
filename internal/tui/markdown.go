@@ -385,7 +385,6 @@ func plainSpans(spans []span) string {
 
 // ---- 解析 ----
 
-
 // parseMarkdown 把正文按行解析成块。
 //
 // 用下标遍历而不是 range：表格是**多行**结构，识别表头时要往后看一行

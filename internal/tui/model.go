@@ -472,16 +472,6 @@ func (m Model) foldersCmd(open bool) tea.Cmd {
 	}
 }
 
-// previewBatch 是一轮最多拉几条摘要。
-//
-// 分批（而不是一次把整张列表拉完）是为了**开机那一屏**：一个几千封的
-// 邮箱一次性会瞬间发出几千个 FETCH，而它们换来的只是列表右边那一行小字。
-// 分批之后它在后台一点点补齐，先出来的正是列表最上面那几条。
-//
-// 8 这个数取的是「一屏列表的行数」量级：正常窗口里一次就够把看得见的
-// 那几条填满，不必等第二轮才看着像样。
-const previewBatch = 8
-
 // listVisibleRange 是「列表上现在看得见的那几条」在 m.visible 上的下标范围
 // [from, to)，窗口是空的时返回 (0, 0)。
 //
@@ -491,6 +481,8 @@ const previewBatch = 8
 //
 // ⚠️ 这里必须跟着**当前版式**走。拿 Normal 的几何去算 Zen 的窗口，取到的
 // 是屏幕上另外那几条 —— 拉了一堆看不见的摘要，而看得见的那几条一直空着。
+//
+// 它同时也是摘要请求量的**唯一上界**（见 wantedPreviews）。
 func (m Model) listVisibleRange() (int, int) {
 	if len(m.visible) == 0 {
 		return 0, 0
@@ -540,6 +532,18 @@ func listPreviewID(th thread.Thread) string {
 // ⚠️ 只算窗口里的，不是整张列表：用户看不到的行不该花流量，而列表可能
 // 有几百条。窗口跟着光标走，所以往下翻的时候由 handleListKey 的尾巴
 // 再发一轮（见那个函数的末尾）。
+//
+// # 为什么这里没有「一轮最多几条」
+//
+// 这里曾经截断到 8 条（previewBatch）。那个数是在**窗口本身就是上界**这件
+// 事落地之前留下的：那时怕的是「一个几千封的邮箱一次发出几千个 FETCH」。
+// 现在源头已经只取可见窗口，一屏就是十几条，8 反而变成了纯粹的速度限制 ——
+// 窗口里第 9 条往后要等下一轮，而 app.LastBodyTexts 本来就会把整批合并成
+// 「每个文件夹一条 FETCH」（见 loadBodies），多带几条几乎不花钱。
+//
+// 所以上界交给 listVisibleRange：**请求量由「看得见多少」决定，不由一个
+// 写死的数字决定**。将来谁把窗口算法改成整张列表，请求量会跟着涨 ——
+// 那是窗口那一侧的问题，不该在这里用另一个数字盖住。
 func (m Model) wantedPreviews() []thread.Header {
 	if m.app == nil {
 		return nil
@@ -560,9 +564,6 @@ func (m Model) wantedPreviews() []thread.Header {
 		}
 		seen[id] = true
 		out = append(out, th.Messages[len(th.Messages)-1])
-	}
-	if len(out) > previewBatch {
-		out = out[:previewBatch]
 	}
 	return out
 }
@@ -2198,7 +2199,14 @@ func (m *Model) attach(client mail.Client) error {
 		return err
 	}
 
-	m.app = app.New(m.cfg, client, idx)
+	// 正文缓存打不开不算错误（见 store.OpenBodyCache）—— 它只是缓存，
+	// 最坏情况是这次启动把刚看过的那些重新下载一遍。
+	var cache *store.BodyCache
+	if cachePath, err := config.BodyCachePath(); err == nil {
+		cache = store.OpenBodyCache(cachePath, store.DefaultBodyCacheBytes)
+	}
+
+	m.app = app.NewWithCache(m.cfg, client, idx, cache)
 	m.setThreads(m.app.Threads())
 	m.mode = modeList
 	m.status = "正在同步…"

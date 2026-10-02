@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -646,6 +647,96 @@ func listGroupText(group string, inner int) string {
 	return title + strings.Repeat(" ", gap) + count
 }
 
+// 列表行的两列宽度预算。
+//
+// 那一行是「标记 名字 …… 时间」，右边两样都是**定宽列**。上一版不是：
+// 名字的宽度是 `inner - markWidth - textWidth(timeStr) - 2` —— 时间串多长，
+// 名字就少多长。上一版的时间是定长的（5 列或 4 列），勉强看不出问题；
+// 改成「前天 15:30」「2026-4-1 15:23」之后长度从 5 摇到 15，**同一个列表
+// 里每一行的名字宽度都不一样**，名字右边参差不齐、时间也被挤到各处 ——
+// 用户说的「元素堆砌挤压」有一半是这么来的。
+//
+// 现在的规矩：**两个都在宽度固定的列里，右对齐到栏的右边缘**。名字那一
+// 列的宽度对所有行都相同，时间的右边缘对所有行都相同，中间的空隙随
+// 时间串长短变化 —— 空隙变化是看不见的，参差是看得见的。
+const (
+	// listTimeW 是时间列的目标宽度。11 列够放「前天 15:04」（10 列）
+	// 和「2026-9-25」（9 列），也就是退到**带日子锚点**的最后一档。
+	listTimeW = 11
+	// listTimeMinW 是时间列能让到的最小宽度：5 列，正好一个 `15:04`。
+	// 再窄就连时分都放不下，时间整列让掉（见 listTimeField 的返回 0）。
+	listTimeMinW = 5
+	// listNameW 是名字列的**下限**（12 列 ≈ 6 个汉字）。
+	//
+	// 半角名字在这一档能放 12 个字符（`HTML2MD Geri`），日常的用户名都
+	// 够；中文名 6 个字也够。再长的靠 truncate 出省略号。
+	listNameW = 12
+)
+
+// listTimeField 返回列表行里**时间列**占的列数（0 表示这一行不画时间）。
+//
+// 它只取决于栏宽，**不取决于时间串的长短** —— 这是上面那两条定宽列的
+// 前提。谁在别处"顺手"改成按 timeStr 算宽度，参差就会回来。
+func listTimeField(width int) int {
+	// 标记区 + 名字和时间之间那两格间隔。
+	avail := width - markWidth - 2
+	// 连「名字的下限 + 一个时分」都放不下时，这一行只画名字：名字是
+	// 这一行的主语，时间只是修饰，窄到这一步该让的是时间。
+	if avail < listNameW+listTimeMinW {
+		return 0
+	}
+	w := avail - listNameW
+	if w > listTimeW {
+		w = listTimeW
+	}
+	return w
+}
+
+// listCells 是列表第一行被切成的三段。
+//
+// 三个字段都是**已经补好宽度的定宽格子**（mark 除外，它本身就是 markWidth
+// 列）。plain 拼出来的就是这一行的纯文本，上色那一版逐段套样式即可 ——
+// 两处共用同一套几何，不会出现「改了配色顺手改了宽度」。
+type listCells struct {
+	mark string // 2 列：未读块 + 星标
+	name string // nameW 列，右补空格
+	time string // timeW 列，左补空格（右对齐）；没有时间时是空串
+}
+
+// plain 拼出这一行的纯文本。
+func (c listCells) plain() string {
+	out := c.mark + " " + c.name
+	if c.time != "" {
+		out += " " + c.time
+	}
+	return out
+}
+
+// listRowSplit 把「标记 + 名字 + 时间」这三格算出来，返回**纯文本**的各段。
+//
+// timeW 只由 width 决定（见 listTimeField），所以同一列表里每一行的时间
+// 右边缘都是栏的右边缘，名字右边缘也都对齐在同一列 —— 相邻两行不会互相
+// 错开。这是这一版列表能"读得动"的几何基础。
+func listRowSplit(th thread.Thread, width int) listCells {
+	timeW := listTimeField(width)
+	timeStr := ""
+	if timeW > 0 {
+		// 时间的写法按预算取档（listTime），且**右对齐到定宽的列里**：
+		// 不同档长短不一（`15:04` 和 `2026-9-25`），左对齐会让这一列
+		// 看起来像被啃过。
+		timeStr = padLeft(listTime(th.LastDate, timeW), timeW)
+	}
+	nameW := width - markWidth - 2 - timeW
+	if nameW < 1 {
+		nameW = 1
+	}
+	return listCells{
+		mark: listMark(th),
+		name: padRight(truncate(threadTitle(th), nameW), nameW),
+		time: timeStr,
+	}
+}
+
 // listRowText 是列表某一行的**纯文本**（未上色）。
 //
 // 先拼纯文本、再上色是硬约束：带上转义序列之后再截断，会把序列剪断
@@ -656,15 +747,18 @@ func listGroupText(group string, inner int) string {
 // 守着这一点 —— 这是唯一能挡住「改了配色顺手把宽度也改了」的判据。
 func (m Model) listRowText(th thread.Thread, first bool, width int) string {
 	if !first {
-		return truncate("  "+m.listSubLine(th), width)
+		// 副行缩到**名字那一列**（标记区 + 一格间隔），和名字共用一条
+		// 左边缘。
+		//
+		// 上一版这里是写死的两个空格，而名字在 markWidth+1 = 3 列处 ——
+		// 也就是副行比名字**靠左一格**。一格而已，但一栏里十条会话就有
+		// 十条这样的错位，整栏的左边缘是毛的。用户说的「元素堆砌挤压」，
+		// 一半是灰度没拉开（见 listRowStyled），另一半就是这个：两行
+		// 本该是一个块，却各自站开了一格。
+		indent := strings.Repeat(" ", markWidth+1)
+		return truncate(indent+m.listSubLine(th), width)
 	}
-
-	timeStr := shortTime(th.LastDate)
-	nameW := width - markWidth - textWidth(timeStr) - 2
-	if nameW < 4 {
-		nameW = 4
-	}
-	return listMark(th) + " " + padRight(truncate(threadTitle(th), nameW), nameW) + " " + timeStr
+	return listRowSplit(th, width).plain()
 }
 
 // listSubLine 是列表副行的文字：**这条会话里最新一条消息说了什么**。
@@ -718,19 +812,29 @@ func listMark(th thread.Thread) string {
 
 // listRowStyled 是列表第一行的**带样式**版本。
 //
-// 分段上色：未读标记是界面上唯一"状态"用色（强调色），名字按未读与否
-// 加粗，时间是背景信息所以用灰。这三段的关系是这一行能"读得动"的原因 ——
-// 全部同色的话，名字、时间、标记挤在一行里，眼睛得逐字读才知道哪个是哪个。
+// 分段上色，三段各是一个**层级**，用的正是用户要的那套「深浅灰阶」：
+//
+//	标记    强调色（141）+ 粗体   ← 唯一的"状态"用色，一眼能扫到
+//	名字    未读：默认前景 + 粗体  ← 最亮，这是这一行的主语
+//	        已读：fgMuted          ← 明显弱一档，铺开看就是「这一屏哪些没读」
+//	时间    fgTime                 ← 最弱，背景信息
+//
+// ⚠️ 已读的名字**必须**降一档，这一条是这一版的重点。
+//
+// 上一版未读用 styleTitle（粗体），已读用**默认前景色**——于是"读过"和
+// "没读过"只差一个粗体，在满屏都是默认色的列表里根本看不出来。用户的原话
+// 是「元素堆砌挤压」，而"堆砌"的第一层含义就是**所有字一样重**：名字、时间、
+// 摘要挤在一起，眼睛得逐字读才知道哪个是哪个。拉开灰度之后，"哪几条还没
+// 读"是一眼的事，"哪一段是名字"也是一眼的事。
+//
+// 副行（listRowStyled 的 !first 分支）用 fgDim，比已读名字再弱半档 ——
+// 它排在名字之下，层级也该在名字之下。
 func (m Model) listRowStyled(th thread.Thread, first bool, width int) string {
 	if !first {
-		return styleMuted.Render(m.listRowText(th, first, width))
+		return stylePreview.Render(m.listRowText(th, first, width))
 	}
 
-	timeStr := shortTime(th.LastDate)
-	nameW := width - markWidth - textWidth(timeStr) - 2
-	if nameW < 4 {
-		nameW = 4
-	}
+	c := listRowSplit(th, width)
 
 	// 标记区两格，各自按有无上色；空格原样留着 —— 它占位，保证有没有
 	// 标记后面的名字都不会错位。
@@ -742,13 +846,55 @@ func (m Model) listRowStyled(th thread.Thread, first bool, width int) string {
 		right = styleUnread.Render(starMark)
 	}
 
-	name := truncate(threadTitle(th), nameW)
-	nameStyled := padRight(name, nameW)
+	// 名字：未读最亮、已读降一档。注意**不是**「未读才上色」—— 那样
+	// 已读会落到默认前景（也就是最亮的那一档），层次正好反了。
+	//
+	// `c.name` 已经补过宽度，直接上色就行；样式里不能带背景，否则
+	// 右边那些补位空格会变成一条色带（见 styleRowName* 的注释）。
+	nameStyle := styleRowNameRead
 	if th.Unread > 0 {
-		nameStyled = styleTitle.Render(padRight(name, nameW))
+		nameStyle = styleRowNameUnread
 	}
 
-	return left + right + " " + nameStyled + " " + styleTime.Render(timeStr)
+	out := left + right + " " + nameStyle.Render(c.name)
+	if c.time != "" {
+		out += " " + styleTime.Render(c.time)
+	}
+	return out
+}
+
+// timeForms 返回同一个时间点**由详到简**的几种写法。
+//
+// 第 0 个是完整形式（消息头用 —— 那一行有地方）；后面的是窄栏的退路
+// （会话列表右侧那一列只有 10 来列）。
+//
+// ⚠️ 所有形式由**同一个 switch** 生成，而且性质是**逐级做减法**：
+// 后一个必须是前一个的子串（`2026-9-25` 是 `2026-9-25 02:19` 的子串，
+// `9-25` 又是 `2026-9-25` 的子串）。这一条比"看着像"要紧得多 ——
+// 它保证列表和消息头**永远说的是同一天**，不会出现列表说「昨天」而
+// 消息头说「09-30」这种分家。TestTimeForms_ShrinkBySubtraction 守着它。
+//
+// 时间点从参数进来（不是内部取 time.Now）—— 判据才能一次造出「昨天」
+// 和「前天」两个时间点来对表。
+func timeForms(t time.Time, now time.Time) []string {
+	l := t.Local()
+	switch {
+	case sameDay(l, now):
+		return []string{l.Format("15:04")}
+	case sameDay(l, now.AddDate(0, 0, -1)):
+		return []string{"昨天 " + l.Format("15:04"), "昨天"}
+	case sameDay(l, now.AddDate(0, 0, -2)):
+		return []string{"前天 " + l.Format("15:04"), "前天"}
+	default:
+		// `2006-1-2` 而不是 `2006-01-02`：用户给的样例是 `2026-4-1 15:23`。
+		// 月日不带前导零还有一个技术好处：`9-25` 也是它的子串，
+		// 于是最窄的那一档可以就是「把年份去掉」。
+		return []string{
+			l.Format("2006-1-2 15:04"),
+			l.Format("2006-1-2"),
+			l.Format("1-2"),
+		}
+	}
 }
 
 // shortTime 把一个时间压成一个很短的标签。
@@ -757,33 +903,62 @@ func (m Model) listRowStyled(th thread.Thread, first bool, width int) string {
 // 消息的头部。共用的理由和别处一样 —— 「什么时候」这件事只该有一条规则，
 // 各写一套必然漂成「列表说昨天、消息头说 09-28」。
 //
-// 由近及远地降精度：今天给时分、昨天给「昨天」、今年给月日、更早给年月。
-// 这是邮件客户端的老规矩，理由也简单 —— 越久远的邮件越不需要知道几点几分。
+// 由近及远地降精度，但**每一档都带时分**。用户的原话：
+//
+//	「不是显示"昨天"，而是还要显示时间。一般是"前天 15:30""15:55""2026-4-1 15:23"」
+//
+// 上一版是今天给时分、昨天只给「昨天」、更早只给月日 —— 一封信显示成
+// 「昨天」，读的人知道是哪天，却不知道是昨天上午还是深夜；显示成 `06-01`
+// 更是连年份都得回翻日历。时分是**最便宜的那条信息**，不该在第一档之后
+// 就被丢掉。
+//
+// 梯子：
+//
+//	今天   → `15:55`
+//	昨天   → `昨天 15:30`
+//	前天   → `前天 15:30`
+//	更早   → `2026-4-1 15:23`（带年份、不带前导零）
 //
 // ⚠️ 消息头那边**不能只写时分**：一条三天前的消息显示 `02:25`，读的人
 // 会以为它是今天凌晨发的。列表里那个位置本来就窄，看不出问题；消息头
-// 独立成行，这个谎就露出来了。
+// 独立成行，这个谎就露出来了。所以前三档各自都带一个**日子锚点**
+// （时分本身 / 「昨天」/「前天」/ 年月日），裸的时分只在今天出现。
 //
-// ⚠️ 长度**不是**固定的：`21:43` 是 5 列，`昨天` 只有 4 列（两个汉字）。
-// 列表里右边的对齐**不是**靠它等宽，而是靠 nameW 把这点差吸收掉
-// （见 listRowText：`nameW = width - markWidth - textWidth(timeStr) - 2`）——
-// 别照着「都 5 列」的假设去算宽度。
+// ⚠️ 长度**不固定**：`15:04` 5 列、`昨天 15:04` 10 列、`2026-4-1 15:23`
+// 15 列。所以**列表那边不能直接拿这个串去排版** —— 一列宽 15 的时间会
+// 把名字挤成 4 列。列表走 listTime（同一个梯子，按预算取一档）。
 func shortTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	l := t.Local()
-	now := time.Now()
-	switch {
-	case sameDay(l, now):
-		return l.Format("15:04")
-	case sameDay(l, now.AddDate(0, 0, -1)):
-		return "昨天"
-	case l.Year() == now.Year():
-		return l.Format("01-02")
-	default:
-		return l.Format("06-01")
+	return timeForms(t, time.Now())[0]
+}
+
+// listTime 是会话列表右侧那一列要写的时间：同一个梯子上**放得进 budget
+// 的那一档**。
+//
+// 为什么列表需要单独一档：那一列只有 25–30 列，标记占 2 格、名字最少要
+// 12 格，留给时间的只有十来列。`2026-4-1 15:23` 是 15 列 —— 直接摆进去
+// 名字就只剩 4 格（`HTM…`），这恰恰是用户说的「元素堆砌挤压」。
+//
+// 退到哪一档是有讲究的：**从右往左砍，先砍时分、再砍年份**。时分是这一
+// 档里最便宜的信息（同一天的邮件差几个小时没那么要紧），年份恰恰相反 ——
+// 少了它日期就成了一个悬在半空的 `9-25`。
+//
+// 最后一个兜底是 `forms` 的最后一档，**即使它仍然超预算也返回它**：
+// 返回值不承诺一定窄于 budget，宽度的事由调用方按 listTimeField 保证
+// （nameW 和 timeW 是一起算出来的，不是各算各的）。
+func listTime(t time.Time, budget int) string {
+	if t.IsZero() {
+		return ""
 	}
+	forms := timeForms(t, time.Now())
+	for _, f := range forms {
+		if textWidth(f) <= budget {
+			return f
+		}
+	}
+	return forms[len(forms)-1]
 }
 
 // sameDay 说两个时间是不是同一天（按本地时区）。
@@ -1116,10 +1291,23 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 	// **时间这一段的实际宽度**（写的是 textWidth(timeTxt)），所以换了
 	// 格式也不用动那些数字。
 	timeTxt := shortTime(msg.Date)
-	// 名字的样式和发件人**无关**：所有名字同一个样式，认人靠读名字本身，
-	// 「谁说的」靠对齐（自己发的靠右）。原先这里按地址取一个调色板颜色、
-	// 自己发的再用另一支蓝色，现在两样都撤了 —— 见 styleSender。
+	// 名字的样式**只区分"我"和对方**，不区分是哪一个对方。
+	//
+	// 「谁说的」靠读名字本身，「是不是我」靠对齐（自己发的靠右）—— 这两件
+	// 事都已经有更结实的表达。剩下的这份颜色只做一件事：**把对方的名字
+	// 和「我」拉开一档**。
+	//
+	// 为什么该拉开：「我」是这一屏里最不需要读的两个字 —— 每一屏都有，
+	// 而且永远在右边。对方的名字才是信息。两个都占着最亮的那一档，等于
+	// 把正文的注意力分给一个已知项；把「我」压到灰字之后，一屏里最亮的
+	// 名字就都是**别人**的名字了。
+	//
+	// 这也和列表那边一个道理（见 styleRowNameRead）：界面上的层级是靠
+	// 「谁比谁弱一档」划出来的，不是靠一个统一的最亮色。
 	nameStyle := styleSender
+	if mine {
+		nameStyle = styleSenderSelf
+	}
 	// 先按可用宽度截断**再**上色 —— 反过来的话 lipgloss 会把转义序列
 	// 算进宽度，右边的边界就歪了（styles.go 里那条硬约束）。显示名是
 	// 对方自己写的，长度没有上限，所以这一步不是多余的。
@@ -1795,6 +1983,21 @@ type statusSeg struct {
 }
 
 // ---- 解锁与配置向导 ----
+//
+// 这两个页面是**一次性**的：开机回答问题，答完就再也不出现。所以它们不
+// 参与主界面的分栏布局，而是独立成一屏，而且**摆在屏幕中间**。
+//
+// 为什么要居中：贴左上角的样子和主界面（左边列表、右边正文）一模一样，
+// 用户会以为界面已经渲染完了、只是内容还没出来。居中的块在视觉上明确
+// 表示"当前是一个需要你回答的问题"，答完才进主界面。
+//
+// 对齐只做**水平居中 + 偏上**（不是几何正中）：内容高度会随步骤变
+// （选服务商那一屏很高，填邮箱那一屏只有几行），几何正中会让整个块
+// 上上下下地跳；偏上一点，块的顶端移动得少，读起来稳。
+
+// blockTopDivisor 决定内容块顶部留白的比例 —— 高度的 1/3 处是常见的
+// "视觉中心"（几何正中的块看起来会偏低）。
+const blockTopDivisor = 3
 
 func (m Model) viewUnlock() string {
 	var b strings.Builder
@@ -1802,11 +2005,14 @@ func (m Model) viewUnlock() string {
 	b.WriteString("账号：" + m.cfg.Account.Email + "\n\n")
 	b.WriteString("输入主密码解锁本地凭据：\n\n")
 	b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+	if hint := m.revealHint(); hint != "" {
+		b.WriteString(styleMuted.Render(hint) + "\n")
+	}
 	b.WriteString(styleMuted.Render("Ctrl+R 重新配置账号 · Ctrl+C 退出"))
 	if m.status != "" {
 		b.WriteString("\n\n" + styleError.Render(m.status))
 	}
-	return b.String()
+	return centerScreen(b.String(), m.width, m.height)
 }
 
 func (m Model) viewSetup() string {
@@ -1817,14 +2023,25 @@ func (m Model) viewSetup() string {
 	case stepProvider:
 		b.WriteString("选择邮箱服务商：\n\n")
 		for i, p := range config.Providers {
+			label := p.Name
+			// 在列表里就把「这个选项选了也走不通」标出来。等用户按回车
+			// 被拒才说，等于让他白选一次。
+			if p.Auth == config.AuthOAuth2 {
+				label += "（需 OAuth2，本版本不支持）"
+			}
 			if i == m.setup.provider {
-				b.WriteString("  " + styleSelected.Render("▸ "+padRight(p.Name, 22)) + "\n")
+				b.WriteString("  " + styleSelected.Render("▸ "+label) + "\n")
 			} else {
-				b.WriteString("    " + padRight(p.Name, 22) + "\n")
+				b.WriteString("    " + label + "\n")
 			}
 		}
 		if p := m.currentProvider(); p != nil {
-			b.WriteString("\n" + renderCredentialHelp(p))
+			b.WriteString("\n" + renderProviderSettings(p))
+			if p.Auth == config.AuthOAuth2 {
+				b.WriteString("\n" + renderOAuthHelp(p))
+			} else {
+				b.WriteString("\n" + renderCredentialHelp(p))
+			}
 		}
 		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定 · Ctrl+C 退出"))
 
@@ -1865,6 +2082,9 @@ func (m Model) viewSetup() string {
 		}
 		b.WriteString(m.stepHeader(name+" 的凭据") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		if hint := m.revealHint(); hint != "" {
+			b.WriteString(styleMuted.Render("  "+hint) + "\n\n")
+		}
 		if p != nil && len(p.Guide) > 0 {
 			b.WriteString(renderCredentialHelp(p))
 		}
@@ -1872,6 +2092,9 @@ func (m Model) viewSetup() string {
 	case stepMaster:
 		b.WriteString(m.stepHeader("主密码") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		if hint := m.revealHint(); hint != "" {
+			b.WriteString(styleMuted.Render("  "+hint) + "\n\n")
+		}
 		b.WriteString(styleMuted.Render("  凭据会用这个密码加密后存在本地。") + "\n")
 		b.WriteString(styleMuted.Render("  它不会被发送到任何地方，忘了就只能重新配置。") + "\n")
 	}
@@ -1879,7 +2102,47 @@ func (m Model) viewSetup() string {
 	if m.setup.err != "" {
 		b.WriteString("\n" + styleError.Render(m.setup.err) + "\n")
 	}
-	return b.String()
+	return centerScreen(b.String(), m.width, m.height)
+}
+
+// centerScreen 把一个内容块摆到屏幕中间（水平居中、偏上三分之一）。
+//
+// 收的是**渲染好的字符串**（带 ANSI 也无妨），因为要居中就得按**显示
+// 宽度**算，而不是字节长度 —— 用 textWidth 量，和别处同一把尺子。
+//
+// 每行右端补空格补到整宽：不补的话，上一屏留下的字符会露在这一屏的
+// 行尾（新的一行更短，终端只覆盖写过的部分）。
+//
+// 尺寸还没拿到（width/height 是 0）时原样返回 —— 那种情况下"居中"
+// 没有意义，硬算会把内容推到一个凭空的宽度里。
+func centerScreen(content string, width, height int) string {
+	if width <= 0 || height <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+
+	padTop := (height - len(lines)) / blockTopDivisor
+	if padTop < 0 {
+		padTop = 0
+	}
+	out := make([]string, 0, len(lines)+padTop)
+	for i := 0; i < padTop; i++ {
+		out = append(out, strings.Repeat(" ", width))
+	}
+	for _, l := range lines {
+		out = append(out, centerLine(l, width))
+	}
+	return strings.Join(out, "\n")
+}
+
+// centerLine 把一行水平摆到宽度 width 的中间，并补足到整宽。
+func centerLine(line string, width int) string {
+	w := textWidth(line)
+	if w >= width {
+		return line
+	}
+	left := (width - w) / 2
+	return strings.Repeat(" ", left) + line + strings.Repeat(" ", width-w-left)
 }
 
 func (m Model) stepHeader(title string) string {
@@ -1892,6 +2155,58 @@ func (m Model) stepHeader(title string) string {
 }
 
 // ---- 渲染辅助 ----
+
+// renderProviderSettings 把当前预设**将要写进配置**的服务器地址摊开给用户看。
+//
+// 为什么要显示而不是藏起来：点一下回车之后，这些地址就固化进配置了，
+// 之后所有"连不上"的排查都得从它们开始。摆在眼前有两个用处 ——
+// 出了问题用户至少知道自己用的是哪台服务器；而且他能和服务商官方文档
+// 对一眼，看出我们填的有没有错。
+//
+// 收发两行**分开**写，加密方式各写各的。这不是排版洁癖：iCloud 就是
+// "收 993 隐式 / 发 587 STARTTLS" 的组合，挤成一行只写一个加密方式
+// 会把这件事糊掉，而它恰恰是最容易配错的地方。
+func renderProviderSettings(p *config.Provider) string {
+	if p == nil || p.ID == config.CustomProviderID {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("将写入的服务器") + "\n")
+	b.WriteString(styleMuted.Render("  收信  ") +
+		padRight(p.IMAPHost+":"+strconv.Itoa(p.IMAPPort), 28) +
+		styleMuted.Render(tlsShort(p.IMAPTLS)) + "\n")
+	b.WriteString(styleMuted.Render("  发信  ") +
+		padRight(p.SMTPHost+":"+strconv.Itoa(p.SMTPPort), 28) +
+		styleMuted.Render(tlsShort(p.SMTPTLS)) + "\n")
+	if p.SMTPNote != "" {
+		b.WriteString(styleMuted.Render("        "+p.SMTPNote) + "\n")
+	}
+	return b.String()
+}
+
+// renderOAuthHelp 渲染「只能用 OAuth2」那一段。
+//
+// 它和 renderCredentialHelp 是**互斥**的两条路：后者教你"去哪拿一个能填
+// 进密码栏的密钥"，前者告诉你"不存在这样的密钥"。区别写得这么显眼，是因为
+// 用户对 Outlook 的直觉就是"去生成一个应用密码就行了" —— 而那条路微软
+// 已经关掉了。不说清楚，他会一直找那个不存在的入口。
+func renderOAuthHelp(p *config.Provider) string {
+	if p == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(styleError.Render("这个服务商不能用密码登录") + "\n")
+	if p.OAuthURL != "" {
+		b.WriteString("  " + styleMuted.Render("技术说明：") +
+			styleLink.Render(hyperlink(p.OAuthURL, p.OAuthURL)) + "\n")
+	}
+	for i, g := range p.Guide {
+		b.WriteString(styleMuted.Render(fmt.Sprintf("  %d. %s", i+1, g)) + "\n")
+	}
+	return b.String()
+}
 
 // renderCredentialHelp 渲染「去哪拿凭据」这一段：直达链接 + 分步说明。
 //

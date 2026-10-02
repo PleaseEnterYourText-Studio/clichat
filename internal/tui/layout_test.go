@@ -1057,6 +1057,190 @@ func TestList_SelectedRowUsesBackgroundNotReverse(t *testing.T) {
 	}
 }
 
+// listRowText（纯文本）和 listRowStyled（上色）必须**逐字对齐**。
+//
+// 两条路径共用 listRowSplit 算出来的同一组定宽格子，这里把两边的结果去样式
+// 之后逐字节比一遍。这是唯一能挡住「改了配色顺手把宽度也改了」的判据 ——
+// 一旦有人在上色那一路上自己补一格空格（或者漏补一格），屏幕上就是选中 /
+// 未选中切换时文字左右跳一格，而两边各自的字都对，谁也看不出是宽度的错。
+//
+// ⚠️ 必须 forceColor：不上色的时候上色那一版退化成纯文本，这条判据就成了
+// 同义反复（恒真）。
+func TestList_StyledRowMatchesItsPlainText(t *testing.T) {
+	forceColor(t)
+	m, _ := newFeatureModel(t)
+	l := m.measureLayout()
+
+	inner := listRowInner(l.listW)
+	rows := m.listRows()
+	start, end := m.listWindow(rows, l.bodyH)
+	if end-start < 3 {
+		t.Fatalf("前提不成立：可见行只有 %d 行", end-start)
+	}
+
+	checked := 0
+	for _, r := range rows[start:end] {
+		if r.group != "" {
+			continue
+		}
+		th := m.visible[r.idx]
+		plain := m.listRowText(th, r.first, inner)
+		styled := plainText(m.listRowStyled(th, r.first, inner))
+		if plain != styled {
+			t.Errorf("第 %d 条会话（first=%v）两条路径不一致 —— 上色那一路多/少了格子：\n"+
+				"纯文本 %q（%d 列）\n去样式 %q（%d 列）",
+				r.idx, r.first, plain, textWidth(plain), styled, textWidth(styled))
+		}
+		checked++
+	}
+	if checked < 3 {
+		t.Fatalf("前提不成立：只量到 %d 行", checked)
+	}
+}
+
+// 名字列的宽度**只由栏宽决定**，和时间串写成什么样无关。
+//
+// 这是用户那句「元素堆砌挤压」的正面要求：一栏里每条会话的名字列一样宽，
+// 名字的右边缘才会对齐；时间列也一样宽，时间的右边缘才会对齐。
+//
+// ⚠️ 上一版是 `nameW = inner - markWidth - 2 - textWidth(timeStr)` —— 时间
+// 串多长，名字就少多长。时间定长（5 列或 4 列）时看不太出来；改成
+// 「前天 15:30」「2026-4-1 15:23」之后长度从 5 摇到 15，同一个列表里名字
+// 宽度条条不同：老信的名字被挤成 `HTM…`，今天的名字却有一整片余量。
+//
+// 这条判据把那个式子钉死：**同一个 width 下，四种时间档必须给出同一个
+// 名字列宽**。顺带守时间列 —— 它也必须定宽，否则右对齐无从谈起。
+func TestListRowSplit_NameColumnKeepsItsWidth(t *testing.T) {
+	m, _ := newFeatureModel(t)
+	if len(m.visible) == 0 {
+		t.Fatal("前提不成立：列表是空的")
+	}
+	inner := listRowInner(m.listWidth())
+
+	wantTimeW := listTimeField(inner)
+	if wantTimeW <= 0 {
+		t.Fatalf("前提不成立：inner=%d 时这一档不画时间列", inner)
+	}
+	wantNameW := inner - markWidth - 2 - wantTimeW
+	if wantNameW < 1 {
+		t.Fatalf("前提不成立：算出来的名字列只有 %d 列", wantNameW)
+	}
+
+	// 时间点从「今天中午」往外推，避免凌晨跑测试时跨过午夜落到前一天
+	// （间歇红 = 没有信息的判据）。
+	now := time.Now()
+	noon := time.Date(now.Year(), now.Month(), now.Day(), 12, 30, 0, 0, now.Location())
+
+	for _, c := range []struct {
+		name string
+		at   time.Time
+	}{
+		{"今天", noon},
+		{"昨天", noon.AddDate(0, 0, -1)},
+		{"更早", noon.AddDate(0, 0, -40)},
+		{"没有时间", time.Time{}},
+	} {
+		th := m.visible[0]
+		th.LastDate = c.at
+		cells := listRowSplit(th, inner)
+
+		if got := textWidth(cells.name); got != wantNameW {
+			t.Errorf("%s：名字列 %d 列，want %d 列 —— 名字的宽度被时间串的长短吃了\n%q",
+				c.name, got, wantNameW, cells.name)
+		}
+		if got := textWidth(cells.time); got != wantTimeW {
+			t.Errorf("%s：时间列 %d 列，want %d 列（时间串写的是 %q）",
+				c.name, got, wantTimeW, strings.TrimSpace(cells.time))
+		}
+	}
+}
+
+// 一栏里**每一条会话的右边缘都在同一列**。
+//
+// 上面那条量的是算出来的格子，这条量屏幕上真的画出来的那一行 —— 用户看到
+// 的参差在这里，不在格子函数里。行号不自己重算：走 listRows + listWindow，
+// 和 renderThreadList 数行数的口径一致（第 0 行是列表标题，之后一行一条）。
+func TestList_EveryRowEndsAtTheSameColumn(t *testing.T) {
+	forceColor(t)
+	m, _ := newFeatureModel(t)
+	l := m.measureLayout()
+	inner := listRowInner(l.listW)
+	want := listRowInset + inner
+
+	lines := strings.Split(m.renderThreadList(l.listW, l.bodyH), "\n")
+	rows := m.listRows()
+	start, end := m.listWindow(rows, l.bodyH)
+
+	checked := 0
+	for i := start; i < end; i++ {
+		if rows[i].group != "" || !rows[i].first {
+			continue
+		}
+		line := strings.TrimRight(plainText(lines[1+(i-start)]), " ")
+		if got := textWidth(line); got != want {
+			t.Errorf("第 %d 条会话那一行的右边缘在第 %d 列，want 第 %d 列 —— "+
+				"一栏里的右边缘是毛的\n%q", rows[i].idx, got, want, line)
+		}
+		checked++
+	}
+	if checked < 3 {
+		t.Fatalf("前提不成立：只量到 %d 条会话", checked)
+	}
+}
+
+// 一条会话的两行在屏幕上**共用同一条左边缘**（名字那一列）。
+//
+// 上一版副行缩的是写死的两个空格，而名字在 markWidth+1 = 3 列处 —— 副行比
+// 名字靠左一格。一格而已，但一栏里十条会话就有十条这样的错位，整栏的左
+// 边缘是毛的；而两行本是「一个块」，却各自站开了一格，这正是用户说的
+// 「元素堆砌挤压」的另一半。
+//
+// 量法：名字那一列**不按公式算**，而是在渲染出来的标题行里把名字文本
+// 找出来（`strings.Index`）—— 公式算的话，判据和被测代码就共用了同一个
+// 假设，「缩进改成 2 列」这种错两边会一起错、一起绿。
+func TestList_SubLineSharesTheNameColumn(t *testing.T) {
+	forceColor(t)
+	m, _ := newFeatureModel(t)
+	l := m.measureLayout()
+	inner := listRowInner(l.listW)
+
+	lines := strings.Split(m.renderThreadList(l.listW, l.bodyH), "\n")
+	rows := m.listRows()
+	start, end := m.listWindow(rows, l.bodyH)
+
+	checked := 0
+	for i := start; i+1 < end; i++ {
+		if rows[i].group != "" || !rows[i].first || rows[i+1].first ||
+			rows[i+1].idx != rows[i].idx {
+			continue
+		}
+		th := m.visible[rows[i].idx]
+		name := strings.TrimRight(listRowSplit(th, inner).name, " ")
+		titleLine := plainText(lines[1+(i-start)])
+
+		nameCol := strings.Index(titleLine, name)
+		if nameCol < 0 {
+			t.Fatalf("前提不成立：标题行 %q 里找不到名字 %q", titleLine, name)
+		}
+		// ⚠️ Index 给的是**字节**偏移，要的是**列**。标记那一格是 `▌`：
+		// 3 字节、1 列，直接拿来比会让这条判据在**正确的代码**上红（第一版
+		// 就是这么红的 —— 6 对 4）。位置一律换算成显示列再比。
+		nameCol = textWidth(titleLine[:nameCol])
+
+		sub := plainText(lines[1+(i+1-start)])
+		subCol := len(sub) - len(strings.TrimLeft(sub, " "))
+		if subCol != nameCol {
+			t.Errorf("第 %d 条会话：名字从第 %d 列起，副行却从第 %d 列起 —— "+
+				"两行本该是一个块，现在各自站开了一格\n标题 %q\n副行 %q",
+				rows[i].idx, nameCol, subCol, titleLine, sub)
+		}
+		checked++
+	}
+	if checked < 3 {
+		t.Fatalf("前提不成立：只量到 %d 对", checked)
+	}
+}
+
 // ---- 鼠标 ----
 
 // 列表栏里**每一行**都点一遍：点在标题行上要打开这条，点在主题行上要打开
@@ -1720,7 +1904,6 @@ func applyBgParam(cur, params string) string {
 	}
 	return cur
 }
-
 
 // selectedBg 是「选中」那一块的底色参数，顺便把「终端根本没颜色」这件事
 // 变成一条明确的失败。
