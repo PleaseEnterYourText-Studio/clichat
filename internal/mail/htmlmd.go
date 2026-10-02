@@ -1,10 +1,12 @@
 package mail
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
 
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
@@ -40,11 +42,17 @@ import (
 //     而 alt 正是服务商为这种情况准备的替代文字。
 //   - 正文里的特殊字符一律转义，避免 Markdown 把用户的原文当标记解析。
 //     比如正文里的 2*3 不会被渲染成斜体，user_id_name 也不会。
+//   - **横向版面能还原的就还原**：用空格当横向的度量，把原邮件里
+//     「缩进」和「一行几栏」这两件事搬到 Markdown 里（见下面
+//     「横向布局」那三节）。还原不了的不硬凑。
 //
 // # 不做的事
 //
-// 不还原 CSS 排版（终端里没有「左边距 40px」这回事），不下载图片，
-// 不做 URL 的安全性判断 —— 那是渲染层的事。
+// 不还原 CSS 排版里**表达不出来**的那部分 —— 字号、字体、颜色、圆角、
+// 浮动、绝对定位，终端里都没有对应物。横向留白只有一种表达方式（空格），
+// 所以只做缩进和分栏两种，其余一律放弃。
+//
+// 不下载图片，不做 URL 的安全性判断 —— 那是渲染层的事。
 func HTMLToMarkdown(src string) string {
 	doc, err := html.Parse(strings.NewReader(src))
 	if err != nil {
@@ -122,6 +130,12 @@ type blockBuilder struct {
 	pendSpace bool
 	// inTable 为真时 | 必须转义，否则会把表格的列切错。
 	inTable bool
+
+	// indent 是「当前这一层已经缩进到第几列」（见 stepIndent）。
+	//
+	// 它必须一路传下去，否则全局封顶算不准：封顶要的是**一行里所有祖先
+	// 加起来**的缩进，只看当前这一个元素的话，每层都觉得自己没超。
+	indent int
 }
 
 // sub 派生一个同上下文的子构造器，只换分隔符。
@@ -133,13 +147,18 @@ type blockBuilder struct {
 //   - noMark 是「这段文字的上层已经决定了不加标记」（标题的内容、按钮的
 //     标签、链接文字），同样要一路传下去，否则深一层又会包出 `**`，
 //     叠到外层就成了 `****`，或者漏进链接文字里当字面星号显示。
+//   - indent 是「当前已经缩进到第几列」。这个也必须继承 —— 全局封顶
+//     （maxIndentCols）算的是**一行里所有祖先加起来**的缩进，派生出来的
+//     子构造器如果从 0 重新开始，每层都会觉得自己没超。见 stepIndent。
 //
 // **不继承 starDepth。** 它记的是「光标附近已经有星号了」，但外层包**块级**
 // 子元素时 applyRange 会放弃加标记（标记无处可加），此时内层若也以为
 // 「已经在星号里」而闭嘴，整段就一处都不粗 —— 信息白丢。它只该在
 // 同一个构造器内部传递。
 func (b *blockBuilder) sub(sep string) *blockBuilder {
-	return &blockBuilder{sep: sep, base: b.base, inTable: b.inTable, noMark: b.noMark}
+	return &blockBuilder{
+		sep: sep, base: b.base, inTable: b.inTable, noMark: b.noMark, indent: b.indent,
+	}
 }
 
 // text 写入文本，按 HTML 规则折叠空白，并转义 Markdown 特殊字符。
@@ -203,6 +222,38 @@ func (b *blockBuilder) push(s string) {
 	if s != "" {
 		b.out = append(b.out, s)
 	}
+}
+
+// pushBlock 推入一整块，但**保留首行开头的空格**。
+//
+// 和 push 只差这一点，而这一点正是缩进的全部：缩进就是前导空格，push
+// 的 Trim(" \t\n") 会把首行那份一起吃掉，于是「缩进」只剩下了第二行
+// 往后的那几行 —— 一块的第一行永远顶格，看起来像漏了一处。
+//
+// 尾部空白照旧去掉（那是看不见的脏东西），开头的空行也去掉（块与块
+// 之间已经由 sep 管了）。
+func (b *blockBuilder) pushBlock(s string) {
+	b.flush()
+	s = strings.TrimRight(s, " \t\n")
+	s = strings.TrimLeft(s, "\n")
+	if s != "" {
+		b.out = append(b.out, s)
+	}
+}
+
+// hasListLine 判断一段成型的内容里有没有列表项。
+//
+// 生成端写出来的列表项只有两种形状（见 renderListAt）：`- ` 和 `1. `，
+// 各自可能带前导空格（嵌套层）。正文里真正的 `- ` 不会被误判 —— 行首的
+// 短横在写入时就被转义成了 `\-`（见 escapeMarkdownRune 的 atLineStart）。
+func hasListLine(s string) bool {
+	for _, ln := range strings.Split(s, "\n") {
+		t := strings.TrimLeft(ln, " ")
+		if strings.HasPrefix(t, "- ") || strings.HasPrefix(t, "1. ") {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *blockBuilder) String() string { return strings.Join(b.out, b.sep) }
@@ -276,7 +327,10 @@ func (b *blockBuilder) node(n *html.Node) {
 
 		case atom.Table:
 			b.flush()
-			b.push(b.renderTable(n))
+			// 用 pushBlock 而不是 push：布局表的行**可以**以空格开头 ——
+			// 页脚那种「左边一格是空的，右边那格被推到右边」的版面全靠
+			// 那几个前导空格，push 会把它们吃掉，右推就没了。
+			b.pushBlock(b.renderTable(n))
 
 		// --- 明确要丢掉的东西 ---
 		case atom.Style, atom.Script, atom.Title, atom.Meta, atom.Link,
@@ -308,11 +362,47 @@ func (b *blockBuilder) container(n *html.Node, sep string) {
 	if lv := b.headingLevel(n); lv > 0 {
 		b.flush()
 		if inner := renderInline(n); inner != "" {
+			// 标题**不**跟着缩进。渲染器会把标题行开头的空格丢掉
+			// （见 tui.heading），所以缩了也看不见；而在别处
+			// （严格按 CommonMark 的渲染器）四个空格会让 `#### 标题`
+			// 变成代码块 —— 白担风险，不如不缩。
 			b.push(strings.Repeat("#", lv) + " " + inner)
 		}
 		return
 	}
-	b.push(b.boldBlock(n, b.childrenBlocks(n, sep)))
+	next, step := b.stepIndent(n)
+	sub := b.sub(sep)
+	sub.indent = next
+	sub.blocks(n)
+	s := b.boldBlock(n, sub.String())
+	b.pushBlock(indentBlock(s, blockPad(step, s)))
+}
+
+// blockPad 决定这一块实际右移几列。
+//
+// 正常情况下就是 step 列。唯一要改的是**含列表的块**：Markdown 里列表的
+// 横向位置不是「任意几个空格」，而是「几个 2 空格」—— 渲染器按两个空格
+// 算一层（见 tui.bullet）。往里塞奇数个空格，`- 项` 就变成「带前导空格的
+// 普通段落」：标记不再被识别，整段列表塌掉。那不是缩进，那是把列表拆了。
+//
+// 所以奇数时**向下**取整：宁可这一块不缩，也不弄坏列表。取整只在含列表
+// 的块上做 —— 普通段落没有这个约束，1 列就是 1 列（16px 一格，见 pxPerCol）。
+func blockPad(step int, s string) int {
+	if step%2 != 0 && hasListLine(s) {
+		return step - 1
+	}
+	return step
+}
+
+// indentBlock 把一整块右移 pad 列。pad <= 0 时原样返回。
+//
+// 空行不加空格：加了会在正文里留下看不见的尾随空白，复制时会带走，
+// 而且块与块之间的空行本来就由 sep 负责，不需要它们来撑宽度。
+func indentBlock(s string, pad int) string {
+	if pad <= 0 || s == "" {
+		return s
+	}
+	return indentLines(s, strings.Repeat(" ", pad))
 }
 
 // boldBlock 给「整块自己声明了加粗」的段落包上 **：
@@ -981,6 +1071,567 @@ func prefixLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
+// ---- 横向布局：缩进 ----
+//
+// 这一节和下面那一节（分栏）合起来做同一件事：**把 HTML 邮件里横向的
+// 版面还原到 Markdown 里**。
+//
+// 终端里没有横向布局 —— 只有一行一行的字符。但**空格是横向的**，所以
+// 凡是用空格能表达的那部分版面（缩进、并列的两栏、右推），都能还原；
+// 表达不了的（左边距 40px 的等效、圆角、浮动）就放弃。这条边界写在这里，
+// 因为"还原 CSS 布局"这句话本身没有边界，不划一条就会一路做到把正文
+// 用空格推到屏幕中间去。
+
+const (
+	// maxIndentCols 是缩进的**全局**上限（一行里所有祖先加起来）。
+	//
+	// ⚠️ 全局封顶是必须的，不是保守：营销邮件的模板能把正文包上七八层
+	// 容器，每层都 `padding-left:20px` 的话，累加出来正文会被推到右半屏。
+	// 那不是还原布局，那是把版面弄坏。封顶之后前 6 列照样说明"这里有
+	// 层次"，只是不再加剧。
+	maxIndentCols = 6
+	// pxPerCol 是「多少 CSS 像素算一个终端列」。
+	//
+	// 16px ≈ 1em ≈ 一个半角字符。所以 16px 挪一格、40px 挪两格半（取整
+	// 三格）。这是**观感换算**，不是精确几何 —— 终端里本来就没有 px
+	// （见文件头「不做的事」）。
+	pxPerCol = 16
+)
+
+// stepIndent 算出「进这一层要多缩几列」，以及这一层的子块该按几列缩进。
+//
+// 第二个返回值用不着（子块继承的是 next），返回它只是为了让调用方不必
+// 自己再算一次 b.indent+step。
+func (b *blockBuilder) stepIndent(n *html.Node) (next, step int) {
+	step = indentCols(n)
+	if b.indent+step > maxIndentCols {
+		step = maxIndentCols - b.indent
+	}
+	if step < 0 {
+		step = 0
+	}
+	return b.indent + step, step
+}
+
+// indentCols 把一个元素声明的横向留白换算成终端列数。
+//
+// 只认**单边**的留白：`padding-left:40px`、`padding:0 0 0 20px`（左 ≠ 右）。
+// 左右对称的一律当 0 —— `padding:20px`、`padding:0 20px` 说的是「这个
+// 盒子四周留一圈」，也就是**页面边距**，不是层次。
+//
+// ⚠️ 这条区分不是抠字眼，是必须的：营销邮件里**几乎每个**外层容器都写着
+// `padding:20px` 这类对称留白，照单全收的话整封信会被推右两三格，而它
+// 表达的其实只是「正文别贴着窗口边」—— 终端窗口自己就是那圈边距，再照
+// 缩一层等于白扔宽度。真正有层次含义的是单边留白（模板里表示「这块是
+// 子内容」的标准写法）。
+//
+// padding-left 和 margin-left 取**较大**的那个，不相加：它们在 CSS 里
+// 确实会叠加，但同一个元素上两个都写基本是模板生成器的冗余。取 max 少
+// 一次「意外翻倍」；**真正的层次靠不同元素累加**（嵌套的容器各带单边
+// 留白），那一层累加不受这里影响。
+func indentCols(n *html.Node) int {
+	style := attr(n, "style")
+	best := 0
+	for _, key := range []string{"padding-left", "margin-left"} {
+		if c := lengthCols(styleValue(style, key)); c > best {
+			best = c
+		}
+	}
+	// 简写形式也要认，但只在**左 ≠ 右**时才认：`padding:0 0 0 20px`
+	// 是单边的（缩进），`padding:0 20px` 是对称的（页边距）。
+	for _, key := range []string{"padding", "margin"} {
+		if l, r := shorthandSides(styleValue(style, key)); l != r && l > best {
+			best = l
+		}
+	}
+	return best
+}
+
+// shorthandSides 从 `padding` / `margin` 的简写里取出**左**、**右**两边
+// 换算成的列数。
+//
+// CSS 的规则：1 个值管四边；2 个值是「上下 / 左右」；3 个值是
+// 「上 / 左右 / 下」；4 个值按「上 右 下 左」。
+func shorthandSides(v string) (left, right int) {
+	fields := strings.Fields(v)
+	switch len(fields) {
+	case 1:
+		return lengthCols(fields[0]), lengthCols(fields[0])
+	case 2, 3:
+		return lengthCols(fields[1]), lengthCols(fields[1])
+	case 4:
+		return lengthCols(fields[3]), lengthCols(fields[1])
+	default:
+		return 0, 0
+	}
+}
+
+// lengthCols 把一个 CSS 长度换算成终端列数。认不出来返回 0。
+//
+// ⚠️ 百分比**不认**：`padding-left:20%` 是「父容器宽度的 20%」，而转换器
+// 手里根本没有父容器的宽度 —— 终端多宽是**渲染时**才知道的，而正文是
+// 现在存下来的。猜一个绝对列数出来等于把「不知道」编成一个数字，那会让
+// 同一封信在宽窄不同的窗口里都错，只是错得不一样。
+func lengthCols(v string) int {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || strings.HasSuffix(v, "%") {
+		return 0
+	}
+	num, unit := splitLength(v)
+	if num <= 0 {
+		return 0
+	}
+	var cols float64
+	switch unit {
+	case "px":
+		cols = num / pxPerCol
+	case "em", "rem":
+		// 1em ≈ 一个字符宽 ≈ 1 列。
+		cols = num
+	case "pt":
+		// 1px = 1/96in，1pt = 1/72in → 16px = 12pt = 1 列。
+		cols = num / 12
+	default:
+		// 关键字（thin / medium / inherit…）和没单位的值（`padding-left:20`
+		// 在 HTML 属性里合法，在 CSS 里无效）都不猜。
+		return 0
+	}
+	got := int(math.Round(cols))
+	if got < 1 {
+		// 任何**非零**的留白至少要看得见一格：模板里 10px 这类小值很常见，
+		// 取整成 0 的话它们会整片消失，"层次"也就无从谈起。
+		got = 1
+	}
+	return got
+}
+
+// splitLength 把 "20px" / "1.5em" / "12pt" 拆成数值和单位。
+func splitLength(v string) (float64, string) {
+	i := 0
+	for i < len(v) && (v[i] == '.' || v[i] == '-' || v[i] == '+' || (v[i] >= '0' && v[i] <= '9')) {
+		i++
+	}
+	if i == 0 {
+		return 0, ""
+	}
+	f, err := strconv.ParseFloat(v[:i], 64)
+	if err != nil {
+		return 0, ""
+	}
+	return f, strings.TrimSpace(v[i:])
+}
+
+// ---- 横向布局：分栏 ----
+
+const (
+	// colGap 是并排两栏之间的间隔列数。
+	colGap = 3
+	// maxColumnCellCols 是「一个单元格短到可以并排」的上限。
+	maxColumnCellCols = 28
+	// maxColumnsTotalCols 是一行并排之后的**总宽度**上限。
+	//
+	// 48 是保守取的：本项目的双栏在 96 列下给正文 71 列，减去左右内缩还有
+	// 60 出头；48 能保证并排之后**不会**在常见的窗口里折行。折行是这里最
+	// 不能接受的后果 —— 两栏并排一旦折行，第二栏的开头会跑到下一行去，
+	// 看起来比堆叠更乱，等于把一个"还原"做成了一个 bug。
+	maxColumnsTotalCols = 48
+)
+
+// renderColumnRow 试着把一行布局表**并排**渲染出来。
+//
+// 这是 HTML 邮件最典型、也是丢失得最彻底的一样东西：
+//
+//	<table><tr><td>极客商城</td><td>新品  订单</td></tr></table>
+//
+// 上一版把一行里的单元格用空行堆起来（见 renderLayoutTable），屏幕上成了
+// 「极客商城」+ 空行 + 「新品 订单」—— 而原邮件的意图是**一行两栏**。
+//
+// 什么时候**不**并排（宁可退回堆叠）：
+//   - 只有一格，或者超过四格；
+//   - 任何一格自己就是多行的 —— 两段话并排，读者不知道该先读哪个；
+//   - 任何一格太长（> maxColumnCellCols），或者并排之后总宽超预算；
+//   - 整行都是空的。
+//
+// 返回 ok=false 时由调用方按堆叠处理。
+func (b *blockBuilder) renderColumnRow(row []*html.Node) (string, bool) {
+	if len(row) < 2 || len(row) > 4 {
+		return "", false
+	}
+
+	texts := make([]string, len(row))
+	widths := make([]int, len(row))
+	total := 0
+	for i, cell := range row {
+		texts[i] = strings.TrimSpace(b.cellBlocks(cell))
+		if strings.Contains(texts[i], "\n") {
+			return "", false
+		}
+		w := DisplayWidth(texts[i])
+		if w > maxColumnCellCols {
+			return "", false
+		}
+		widths[i] = w
+		total += w
+	}
+	if total == 0 {
+		return "", false
+	}
+	total += (len(row) - 1) * colGap
+	if total > maxColumnsTotalCols {
+		return "", false
+	}
+
+	// 声明了 width 的那些格子按声明比例分（这是原邮件真的写了的信息，
+	// 不读白不读）。没声明就按各自内容的宽度——那已经能还原大多数版面。
+	if declared := declaredColumns(row, widths); declared != nil {
+		widths = declared
+	}
+
+	var sb strings.Builder
+	for i, t := range texts {
+		if i > 0 {
+			sb.WriteString(strings.Repeat(" ", colGap))
+		}
+		sb.WriteString(padColumns(t, widths[i]))
+	}
+	// 最后一列的补齐是看不见的尾随空格，去掉 —— 它会被复制走，
+	// 也会让末列看起来多占了几格。
+	return strings.TrimRight(sb.String(), " "), true
+}
+
+// declaredColumns 按单元格上声明的 width 分配列宽。
+//
+// **只有当每一格都声明了**才用它：一半声明一半不声明时，那个没声明的格子
+// 该占多少无从得知，拿它自己内容的宽度去凑会把声明的比例带歪。
+//
+// 它最明显的用处是「把右边的东西推到最右」，而这在邮件页脚里到处都是：
+//
+//	<tr><td width="80%"></td><td width="20%">退订</td></tr>
+//
+// 空格子按比例分到 80% 的宽度，于是「退订」被推到右边 —— 这正是原邮件的
+// 版面。按内容宽度算的话那个空格子是 0 列，两个格子会挤在左边，
+// 版面和原文正好相反。
+//
+// 比例**不许把文字挤没**：算出来的份额比这一格自己的内容还窄时，取内容宽度。
+func declaredColumns(row []*html.Node, natural []int) []int {
+	weights := make([]float64, len(row))
+	sum := 0.0
+	for i, cell := range row {
+		w := widthWeight(attr(cell, "width"))
+		if w <= 0 {
+			return nil
+		}
+		weights[i] = w
+		sum += w
+	}
+	total := 0
+	for _, w := range natural {
+		total += w
+	}
+	if sum <= 0 || total <= 0 {
+		return nil
+	}
+	out := make([]int, len(row))
+	for i := range row {
+		share := int(math.Round(float64(total) * weights[i] / sum))
+		if share < natural[i] {
+			share = natural[i]
+		}
+		out[i] = share
+	}
+	return out
+}
+
+// widthWeight 读 <td width="…"> 的值当相对权重用。
+//
+// 认 `80%` 和 `120` / `120px` 两种写法。HTML 里 `width="120"` 是**像素**
+// （没有单位），和 `120px` 等价 —— 两者在这里都只当权重，不需要区分。
+func widthWeight(v string) float64 {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return 0
+	}
+	if rest, ok := strings.CutSuffix(v, "%"); ok {
+		f, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		if err != nil || f <= 0 {
+			return 0
+		}
+		return f
+	}
+	num, unit := splitLength(v)
+	if num <= 0 {
+		return 0
+	}
+	switch unit {
+	case "", "px":
+		return num
+	default:
+		return 0
+	}
+}
+
+// padColumns 把一格补到给定宽度（右补空格）。
+func padColumns(s string, width int) string {
+	if gap := width - DisplayWidth(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
+}
+
+// ---- 横向布局：量宽度 ----
+
+// CellWidth 是一个字符在终端里占的列数。
+//
+// ⚠️ **歧义宽度（Ambiguous）算 1 列**，这是刻意的，而且和渲染层
+// （internal/tui 的 cellWidth）必须一致：本转换器算出来的补空格宽度，
+// 是拿去让**渲染器**对齐的 —— 两边对「一个字符几列」的答案不一样，
+// 补出来的空格就正好错在那些字符上。中文邮件里 `「」` `——` `·` 这类
+// 歧义宽度字符满地都是，错一格就是整列歪掉。
+//
+// 渲染层那份已经不自己实现了，直接调这里（见 tui.cellWidth）。
+func CellWidth(r rune) int {
+	if runewidth.IsAmbiguousWidth(r) {
+		return 1
+	}
+	return runewidth.RuneWidth(r)
+}
+
+// DisplayWidth 估一行 Markdown 在终端里占几列。
+//
+// ⚠️ 不能用 len，也不能用 rune 数：这里要量的是**用户看到的那一行**，
+// 而 Markdown 的标记是不显示的 —— `**张先生**` 源文 10 个字符、屏幕上
+// 只有 6 列；`[新品](/a)` 源文 10 个字符、屏幕上只有 4 列（地址不显示）。
+// 用源文长度去补空格的话，**凡是含链接或加粗的列都会对不齐**，而分栏里的
+// 单元格几乎全是链接和加粗（导航栏、页脚正是这个功能主要的服务对象）——
+// 那等于这个功能白做。
+//
+// ⚠️ 认哪几种标记**必须跟着渲染器走**（见 tui.parseInline 那个 switch），
+// 不能按 CommonMark 规范来：规范认的 `_强调_` 渲染器不认，照着规范算就会
+// 把用户看得见的字符当成标记吃掉，那一列永远对不齐。这条有跨包的判据
+// 守着（tui 那边的 TestDisplayWidth_MatchesRenderedWidth），它比的是
+// 「这里算出来的列数」和「渲染器真的画出来几列」。
+//
+// 只认本转换器自己会产出的形状：加粗、斜体、删除线、行内代码、
+// `[文字](链接)`、反斜杠转义。表格竖线和标题井号不会出现在一行单元格里。
+func DisplayWidth(s string) int {
+	marks := emphasisMarks(s)
+	w := 0
+	for i := 0; i < len(s); {
+		if marks[i] {
+			i++
+			continue
+		}
+		switch s[i] {
+		case '\\':
+			// 转义：那个字符本身照常显示。
+			if i+1 < len(s) {
+				r, size := decodeRune(s[i+1:])
+				w += CellWidth(r)
+				i += 1 + size
+				continue
+			}
+			i++
+		case '`':
+			inner, size, ok := codeSpanContent(s[i:])
+			if !ok {
+				// 不成对：那一串反引号是字面字符，照常占列
+				// （渲染器也是这么做的，见 tui.parseInline 的兜底分支）。
+				w += size
+				i += size
+				continue
+			}
+			// 行内代码里的内容**原样显示**，不再当标记解析。
+			for _, r := range inner {
+				w += CellWidth(r)
+			}
+			i += size
+		case '[':
+			// 链接：只算文字，地址不显示。
+			// 文字里还可能有标记（[**立即购买**](url)），渲染器会递归解析，
+			// 所以这里也递归 —— 两边必须做同一件事。
+			label, rest, ok := linkParts(s[i:])
+			if !ok {
+				r, size := decodeRune(s[i:])
+				w += CellWidth(r)
+				i += size
+				continue
+			}
+			w += DisplayWidth(label)
+			i += len(s[i:]) - len(rest)
+		default:
+			r, size := decodeRune(s[i:])
+			w += CellWidth(r)
+			i += size
+		}
+	}
+	return w
+}
+
+// emphasisMarks 标出哪些字节属于**成对**的强调标记。
+//
+// 认哪几种是照着渲染器来的（见 tui.parseInline 的 switch）：它只认两个
+// 星号、两个波浪线和一个星号，**不认下划线** —— 所以这里也不认。认多了
+// 会把用户看得见的字符当成标记吃掉。（正文里的下划线本来也不会以标记身份
+// 出现：它被生成端转义成了 `\_`，见 escapeMarkdownRune。）
+//
+// 成对才吃，这是另一条要害：`2*3` 里那个星号是**字面字符**，屏幕上要看
+// 得到、要占一列。无脑把星号都当标记吃掉的话，两个格子就会差一格，而这
+// 种错在中文正文里到处都是（乘号、脚注星号）。生成端会把正文里的星号
+// 转义掉，所以正常情况下这里见到的都是真标记；但 DisplayWidth 也会被用
+// 在更零碎的片段上，不成对时按字面算是最安全的答案。
+//
+// 配对规则是贪心的：往后找**同一个字符、同样长度**的第一个游程当配对。
+// 本转换器产出的标记是平衡且不嵌套的（`<b><i>甲</i></b>` 那种会产出
+// 三个星号，生成端刻意避开了 —— 见 starDepth 的注释），所以「往后找
+// 第一个同长的」就够。渲染器不认的那种长度（三个星号、四个波浪线）
+// 一律按字面算：生成端不产出它们，硬认反而会和渲染器的答案分家。
+//
+// ⚠️ 已知边界：往后的寻找**不跨过链接/代码段的边界**。一个星号落在
+// `[文字](http://x/a*b)` 的地址里时，它不该去和正文里某个星号配对 ——
+// 地址根本不显示。跨过边界配错的话，正文里那个星号会被吞掉一格。
+func emphasisMarks(s string) []bool {
+	marks := make([]bool, len(s))
+	type run struct {
+		at, n int
+	}
+	for _, m := range []byte{'*', '~'} {
+		var runs []run
+		for i := 0; i < len(s); {
+			if s[i] != m {
+				i++
+				continue
+			}
+			n := markerRun(s[i:], m)
+			if markerFits(m, n) {
+				runs = append(runs, run{at: i, n: n})
+			}
+			i += n
+		}
+		used := make([]bool, len(runs))
+		for i := range runs {
+			if used[i] {
+				continue
+			}
+			for j := i + 1; j < len(runs); j++ {
+				if used[j] || runs[j].n != runs[i].n {
+					continue
+				}
+				if crossesSpanBoundary(s[runs[i].at+runs[i].n : runs[j].at]) {
+					// 中间隔着链接/代码，不配。
+					continue
+				}
+				used[i], used[j] = true, true
+				for k := 0; k < runs[i].n; k++ {
+					marks[runs[i].at+k] = true
+					marks[runs[j].at+k] = true
+				}
+				break
+			}
+		}
+	}
+	return marks
+}
+
+// markerFits 说这个游程是不是渲染器认的那种标记。
+//
+// 星号认一个和两个（斜体 / 粗体），波浪线只认两个（删除线）——
+// 渲染器里就这三条（见 tui.parseInline），多一个都不认。
+func markerFits(m byte, n int) bool {
+	if m == '~' {
+		return n == 2
+	}
+	return n == 1 || n == 2
+}
+
+// crossesSpanBoundary 说这一段里有没有链接地址或反引号 —— 有的话，
+// 两边的标记不该配成一对。
+func crossesSpanBoundary(s string) bool {
+	return strings.Contains(s, "](") || strings.Contains(s, "`")
+}
+
+func decodeRune(s string) (rune, int) {
+	for _, r := range s {
+		return r, len(string(r))
+	}
+	return 0, 0
+}
+
+// backtickRun 数开头连续的反引号个数。
+func backtickRun(s string) int {
+	n := 0
+	for n < len(s) && s[n] == '`' {
+		n++
+	}
+	return n
+}
+
+// codeSpanContent 从一段以反引号开头的内容里取出**行内代码的文字**，
+// 并返回这段源码的总长度；不成对时 ok=false。
+//
+// 两条规则都是照着渲染器来的（见 tui.findFence 和 tui.trimCodePad），
+// 不照着来就会把含反引号的代码段多算两列：
+//
+//   - 闭合围栏必须**恰好**是同样多个反引号，不能是更长一串的前缀；
+//   - 两侧为「内容里含反引号」留的那一个填充空格不算内容
+//     （生成端写的是「两反引号 空格 内容 空格 两反引号」，见 codeSpan）。
+func codeSpanContent(s string) (inner string, size int, ok bool) {
+	n := backtickRun(s)
+	if n == 0 {
+		return "", 0, false
+	}
+	closer := strings.Repeat("`", n)
+	rest := s[n:]
+	for i := 0; i+n <= len(rest); {
+		j := strings.Index(rest[i:], closer)
+		if j < 0 {
+			break
+		}
+		j += i
+		before := j == 0 || rest[j-1] != '`'
+		after := j+n >= len(rest) || rest[j+n] != '`'
+		if before && after {
+			return trimCodePad(rest[:j]), n + j + n, true
+		}
+		i = j + 1
+	}
+	// 不成对：开头那一串反引号按字面显示，由调用方照常计列。
+	return "", n, false
+}
+
+// trimCodePad 去掉行内代码两侧的填充空格（内容含反引号时才会留）。
+func trimCodePad(s string) string {
+	if len(s) >= 2 && strings.HasPrefix(s, " ") && strings.HasSuffix(s, " ") &&
+		strings.TrimSpace(s) != "" {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// markerRun 数开头连续的同一种强调标记（`**`、`~~`）。
+func markerRun(s string, m byte) int {
+	n := 0
+	for n < len(s) && s[n] == m {
+		n++
+	}
+	return n
+}
+
+// linkParts 从 `[文字](地址)` 里取出文字和剩下的部分。
+func linkParts(s string) (label, rest string, ok bool) {
+	if len(s) == 0 || s[0] != '[' {
+		return "", s, false
+	}
+	end := strings.IndexByte(s, ']')
+	if end < 0 || end+1 >= len(s) || s[end+1] != '(' {
+		return "", s, false
+	}
+	close := strings.IndexByte(s[end+2:], ')')
+	if close < 0 {
+		return "", s, false
+	}
+	return s[1:end], s[end+2+close+1:], true
+}
+
 // ---- 表格 ----
 
 // renderTable 渲染 <table>。
@@ -1037,9 +1688,17 @@ func (b *blockBuilder) renderTable(n *html.Node) string {
 // 把正文整个包起来。压成一行的话，标题、段落、列表、段内换行会全糊在
 // 同一行里，可读性直接归零。压成一行是「数据表单元格」的规矩
 // （Markdown 表格的一行就是一个单元格），不是布局表的。
+//
+// ⚠️ 但「铺平」不是全部：`<tr><td>导航</td><td>新品 订单</td></tr>` 这种
+// **一行几栏**的排版，铺平之后会变成上下两块，原邮件的横向关系就丢了。
+// 所以先让 renderColumnRow 试一次并排，它说不行才退回铺平（判据在那边）。
 func (b *blockBuilder) renderLayoutTable(rows [][]*html.Node) string {
 	var parts []string
 	for _, row := range rows {
+		if s, ok := b.renderColumnRow(row); ok {
+			parts = append(parts, s)
+			continue
+		}
 		var cells []string
 		for _, cell := range row {
 			if s := b.cellBlocks(cell); strings.TrimSpace(s) != "" {
@@ -1619,5 +2278,14 @@ func tidyMarkdown(s string) string {
 		blanks = 0
 		out = append(out, strings.TrimRight(ln, " \t"))
 	}
-	return strings.TrimSpace(strings.Join(out, "\n"))
+	// 收尾只去**尾部**空白。
+	//
+	// ⚠️ 不能再用 TrimSpace：它会把**首行的前导空格**一起吃掉，而缩进正是
+	// 靠前导空格表达的（见 indentBlock）。一整块缩进的内容（比如一个带
+	// 单边留白的签名区）过它一遍会变成「第一行顶格、后面几行缩进」——
+	// 只错第一行，看起来就像漏了一处，比不缩进还糟。
+	//
+	// 开头的空行不用管：上面的 blanks 逻辑只在 len(out) > 0 时才补空行，
+	// 所以 out 不可能以空行开头。
+	return strings.TrimRight(strings.Join(out, "\n"), " \t\n")
 }
