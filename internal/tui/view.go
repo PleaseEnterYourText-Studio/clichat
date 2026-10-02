@@ -491,10 +491,7 @@ func (m Model) viewSetup() string {
 			}
 		}
 		if p := m.currentProvider(); p != nil {
-			b.WriteString("\n" + styleTitle.Render("获取"+p.PasswordLabel+"：") + "\n")
-			for i, g := range p.Guide {
-				b.WriteString(styleMuted.Render(fmt.Sprintf("  %d. %s", i+1, g)) + "\n")
-			}
+			b.WriteString("\n" + renderCredentialHelp(p))
 		}
 		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定 · Ctrl+C 退出"))
 
@@ -511,10 +508,7 @@ func (m Model) viewSetup() string {
 		b.WriteString("第 2 步 · " + name + " 的凭据\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
 		if p != nil && len(p.Guide) > 0 {
-			b.WriteString(styleTitle.Render("去哪拿：") + "\n")
-			for i, g := range p.Guide {
-				b.WriteString(styleMuted.Render(fmt.Sprintf("  %d. %s", i+1, g)) + "\n")
-			}
+			b.WriteString(renderCredentialHelp(p))
 		}
 
 	case stepMaster:
@@ -531,6 +525,37 @@ func (m Model) viewSetup() string {
 }
 
 // ---- 渲染辅助 ----
+
+// renderCredentialHelp 渲染「去哪拿凭据」这一段：直达链接 + 分步说明。
+//
+// 链接用 OSC 8 包成可点击的，在支持的终端里直接点开就能去拿授权码。
+// 约束见 styles.go 里 hyperlink 的注释：样式不能带属性，否则序列会被切碎。
+//
+// 文字步骤同时保留作为退路：链接会失效（服务商改版），步骤不会。
+// 这是配置向导里最容易卡住的一步，把直达链接摆出来能省掉用户自己找入口。
+func renderCredentialHelp(p *config.Provider) string {
+	if p == nil {
+		return ""
+	}
+
+	var b strings.Builder
+
+	if p.OpenURL != "" {
+		b.WriteString(styleTitle.Render("直接去这里拿") + "\n")
+		b.WriteString("  " + styleLink.Render(hyperlink(p.OpenURL, p.OpenURL)) + "\n")
+		if p.HelpURL != "" {
+			b.WriteString("  " + styleMuted.Render("官方说明：") +
+				styleLink.Render(hyperlink(p.HelpURL, p.HelpURL)) + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(styleTitle.Render("获取"+p.PasswordLabel) + "\n")
+	for i, g := range p.Guide {
+		b.WriteString(styleMuted.Render(fmt.Sprintf("  %d. %s", i+1, g)) + "\n")
+	}
+	return b.String()
+}
 
 // fillPane 把行数补齐到 height，并给每行补足宽度，避免拼栏时错位。
 func fillPane(lines []string, width, height int) string {
