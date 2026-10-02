@@ -10,6 +10,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -87,8 +88,18 @@ func (a *App) Sync() (bool, error) {
 		// 服务端上没有这个文件夹不算故障，跳过就好 —— 各家对「已发送」
 		// 的叫法本来就不同（见 mail/folders.go 的别名表）。把它当错误
 		// 报上去，界面会整个标成"离线"，反而掩盖了真正同步成功的那些。
-		if err != nil && !errors.Is(err, mail.ErrNoSuchFolder) {
-			errs = append(errs, err)
+		if err != nil {
+			// 服务端上没有这个文件夹不算故障，跳过就好 —— 各家对「已发送」
+			// 的叫法本来就不同（见 mail/folders.go 的别名表）。把它当错误
+			// 报上去，界面会整个标成"离线"，反而掩盖了真正同步成功的那些。
+			if errors.Is(err, mail.ErrNoSuchFolder) {
+				log.Printf("同步 %s: 服务端没有这个文件夹，跳过", folder)
+			} else {
+				// 记下来。界面上只有一行会被截断的状态栏，靠它诊断等于没有。
+				// 这条日志是「同步没跑完 / 卡住了」这类问题唯一的线索来源。
+				log.Printf("同步 %s 失败: %v", folder, err)
+				errs = append(errs, err)
+			}
 		}
 		if c {
 			changed = true
@@ -121,6 +132,8 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	// 去重的，而 UIDVALIDITY 变化极罕见，全量重来一次比维护分文件夹的
 	// 精细失效逻辑更不容易出错。
 	if known && st.UIDValidity != f.UIDValidity {
+		log.Printf("同步 %s: UIDVALIDITY 变化 %d -> %d，清空本地索引重来",
+			folder, st.UIDValidity, f.UIDValidity)
 		a.index.Reset()
 		st = store.FolderState{}
 		known = false
@@ -146,7 +159,8 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		headers = a.withinInitialWindow(headers)
 	}
 
-	if a.index.Merge(headers) > 0 {
+	added := a.index.Merge(headers)
+	if added > 0 {
 		changed = true
 	}
 
@@ -160,6 +174,15 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		UIDValidity: f.UIDValidity,
 		LastUID:     last,
 	})
+
+	// 首拉要几十秒（实测 QQ 邮箱约 39ms/条），界面上只会显示「同步中…」。
+	// 用户很容易以为卡死了然后退出 —— 日志里至少能留下「跑到哪一步了」。
+	if !known {
+		log.Printf("同步 %s: 首次同步，拉取 UID %d 起，%d 条，游标推进到 %d",
+			folder, from, added, last)
+	} else if added > 0 {
+		log.Printf("同步 %s: 新增 %d 条，游标推进到 %d", folder, added, last)
+	}
 	return changed, nil
 }
 
@@ -511,8 +534,12 @@ func (a *App) Start(to []string, body string) (string, error) {
 func (a *App) send(out mail.Outgoing) (string, error) {
 	id, err := a.client.Send(out)
 	if err != nil {
+		// 只记条数，不记地址 —— 日志的约定是「只记事件，不记邮件内容」，
+		// 收件人地址属于内容。
+		log.Printf("发送失败（%d 个收件人）: %v", len(out.To)+len(out.Cc), err)
 		return "", err
 	}
+	log.Printf("发送成功: Message-ID=%s，%d 个收件人", id, len(out.To)+len(out.Cc))
 
 	a.cacheBody(id, out.Body)
 	a.index.Merge([]mail.Header{{
