@@ -23,6 +23,10 @@ import (
 // 上限压到 2、服务器上放 6 封，于是「打开全量模式」这件事有了可观测的
 // 后果：列表里真的会多出 4 行。没有这个落差的话，这个模式是不是真的
 // 生效就只能靠读配置项猜。
+//
+// ⚠️ 六封信刻意来自**六个不同的发件人**。会话是按参与人集合聚合的，
+// 同一个人的六封信始终只是一个会话 —— 那样列表行数在开关前后都是 1，
+// 这条判据就什么都测不出来了。
 func newClampedModel(t *testing.T, total int) (Model, *mail.Fake) {
 	t.Helper()
 
@@ -42,10 +46,11 @@ func newClampedModel(t *testing.T, total int) (Model, *mail.Fake) {
 	for i := 0; i < total; i++ {
 		fake.AddMessage("INBOX", mail.Header{
 			MessageID: fmt.Sprintf("<m%d@x>", i),
-			From:      "alice@example.com", FromName: "Alice",
-			To:      []string{"me@example.com"},
-			Subject: fmt.Sprintf("第 %d 封", i),
-			Date:    base.Add(time.Duration(i) * time.Minute),
+			From:      fmt.Sprintf("user%d@example.com", i),
+			FromName:  fmt.Sprintf("User %d", i),
+			To:        []string{"me@example.com"},
+			Subject:   fmt.Sprintf("第 %d 封", i),
+			Date:      base.Add(time.Duration(i) * time.Minute),
 		}, "正文")
 	}
 

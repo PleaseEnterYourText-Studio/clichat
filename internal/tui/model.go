@@ -100,14 +100,14 @@ type Model struct {
 	// helpReturn 记录帮助页是从哪个界面打开的，关掉时退回去。
 	helpReturn mode
 
-	// confirmKind 描述待确认的操作；pendingRoot 是它作用的会话根 ID。
+	// confirmKind 描述待确认的操作；pendingID 是它作用的会话 ID。
 	// 转发也复用它来记住目标会话。
 	confirmKind confirmKind
-	pendingRoot string
+	pendingID   string
 
-	activeRoot string
-	bodies     map[string]string
-	replyAll   bool
+	activeID string
+	bodies   map[string]app.Body
+	replyAll bool
 
 	// lastSentText 暂存发送失败的那条消息，供重发用。
 	lastSentText string
@@ -128,17 +128,24 @@ type Model struct {
 type syncResultMsg struct {
 	changed bool
 	err     error
+
+	// manual 表示这次同步是用户按了刷新（Ctrl+R），不是定时轮询。
+	//
+	// 手动刷新时即使没有新数据也要重读一次正文：用户按了键、界面却纹丝
+	// 不动，看着就是「刷新坏了」；何况上一轮的正文可能加载失败过，这里
+	// 是重试的机会。轮询不能这么干 —— 每 30 秒一次全量正文往返。
+	manual bool
 }
 
 type sendResultMsg struct {
-	// root 是这条消息所属会话的根 ID。新会话发完之后靠它把视图切过去。
-	root string
-	err  error
+	// id 是这条消息所属会话的 ID。新会话发完之后靠它把视图切过去。
+	id  string
+	err error
 }
 
 type bodiesResultMsg struct {
-	root   string
-	bodies map[string]string
+	id     string
+	bodies map[string]app.Body
 	err    error
 }
 
@@ -186,7 +193,7 @@ func New(cfg *config.Config) Model {
 	m := Model{
 		cfg:      cfg,
 		input:    in,
-		bodies:   map[string]string{},
+		bodies:   map[string]app.Body{},
 		replyAll: true,
 	}
 
@@ -213,7 +220,7 @@ func NewWithApp(cfg *config.Config, a *app.App) Model {
 		cfg:      cfg,
 		app:      a,
 		input:    in,
-		bodies:   map[string]string{},
+		bodies:   map[string]app.Body{},
 		replyAll: true,
 		mode:     modeList,
 		status:   "正在同步…",
@@ -241,6 +248,18 @@ func (m Model) syncCmd() tea.Cmd {
 	}
 }
 
+// refreshCmd 是用户主动触发的同步（会话里按 Ctrl+R）。
+//
+// 和 syncCmd 只差一个 manual 标记 —— 有了它，即使这一轮没有新邮件，
+// 当前会话的正文也会重读一遍（见 syncResultMsg.manual）。
+func (m Model) refreshCmd() tea.Cmd {
+	a := m.app
+	return func() tea.Msg {
+		changed, err := a.Sync()
+		return syncResultMsg{changed: changed, err: err, manual: true}
+	}
+}
+
 func (m Model) pollCmd() tea.Cmd {
 	d := m.cfg.PollInterval()
 	if d < minPollInterval {
@@ -249,12 +268,22 @@ func (m Model) pollCmd() tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return pollTickMsg(t) })
 }
 
-func (m Model) loadBodiesCmd(th thread.Thread) tea.Cmd {
+// loadBodiesByIDCmd 生成一个「读某个会话的正文」的命令。
+//
+// 会话只在**执行的那一刻**按 ID 去取，不在生成命令时取好塞进闭包 ——
+// 命令是异步跑的，从生成到执行之间，会话可能已经因为一次同步而变了
+// （多了新邮件）。拿着按下按键那一刻的旧快照去读，读出来的是旧正文，
+// 落地后反而把刚刷新的内容覆盖掉；而且看运气：并发的「同步」和「读正文」
+// 谁后完成谁赢。
+func (m Model) loadBodiesByIDCmd(id string) tea.Cmd {
 	a := m.app
-	root := th.Root
 	return func() tea.Msg {
+		th, ok := a.Thread(id)
+		if !ok {
+			return bodiesResultMsg{id: id}
+		}
 		bodies, err := a.Bodies(th)
-		return bodiesResultMsg{root: root, bodies: bodies, err: err}
+		return bodiesResultMsg{id: id, bodies: bodies, err: err}
 	}
 }
 
@@ -269,22 +298,22 @@ func (m Model) markReadCmd(th thread.Thread) tea.Cmd {
 
 func (m Model) replyCmd(text string) tea.Cmd {
 	a := m.app
-	root := m.activeRoot
+	id := m.activeID
 	replyAll := m.replyAll
 	return func() tea.Msg {
-		th, ok := a.Thread(root)
+		th, ok := a.Thread(id)
 		if !ok {
 			return sendResultMsg{err: errors.New("会话已经不存在了")}
 		}
-		return sendResultMsg{root: root, err: a.Reply(th, text, replyAll)}
+		return sendResultMsg{id: id, err: a.Reply(th, text, replyAll)}
 	}
 }
 
 func (m Model) startCmd(to []string, text string) tea.Cmd {
 	a := m.app
 	return func() tea.Msg {
-		root, err := a.Start(to, text)
-		return sendResultMsg{root: root, err: err}
+		id, err := a.Start(to, text)
+		return sendResultMsg{id: id, err: err}
 	}
 }
 
@@ -367,6 +396,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.ready = true
+		// 窗口一变，正文区的高度和宽度都变了 —— 能卷的行数跟着变。
+		// 不在这里收敛的话，上一次在大窗口里卷下去的 scroll 会原样留着，
+		// 缩小窗口就卷过了头，右栏直接空掉。这是「自适应窗口大小」那条
+		// 需求里最容易漏的一步：光把宽高存下来不算自适应。
+		//
+		// 帮助页同理（帮助内容的行数只取决于宽度），两处一起收。
+		m.clampChatScroll()
+		m.clampHelpScroll()
 		return m, nil
 
 	case pollTickMsg:
@@ -379,7 +416,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.lastSync = time.Now()
 		m.applySyncResult(msg)
-		return m, nil
+		// 同步之后，当前会话的正文也要跟着重载（什么时候该重载见
+		// reloadBodiesIfChanged 的说明）。
+		//
+		// 少了这一步，用户在会话里干等的时候，对方新来的那一封只会出现在
+		// 左边的列表里（未读标记、时间、主题都会变），右边那一屏却停在
+		// 上一轮的内容上 —— 看上去就是「刷新没用」。轮询路径原先只更新了
+		// 列表，这就是本轮修的那个 bug。
+		return m, m.reloadBodiesIfChanged(msg)
 
 	case sendResultMsg:
 		m.busy = false
@@ -392,23 +436,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		m.lastSentText = ""
 		m.newChatTo = nil
+		// 自己刚发出去的那条一定是最新的，滚到底让用户看见它已经被送出去。
+		// 留着上一条的 scroll 会让新消息落在视口外面，看起来像「没发出去」。
+		m.scroll = 0
 		if m.app != nil {
 			m.setThreads(m.app.Threads())
 		}
 		// 新会话在发出去之前不存在于列表里，发完才出现 —— 把视图切过去。
-		if msg.root != "" {
-			m.activeRoot = msg.root
+		if msg.id != "" {
+			m.activeID = msg.id
 		}
 		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
 
 	case bodiesResultMsg:
-		if msg.root != m.activeRoot {
+		if msg.id != m.activeID {
 			return m, nil // 用户已经切走了，这份结果作废
 		}
 		m.bodies = msg.bodies
 		if msg.err != nil {
 			m.status = "部分正文加载失败：" + shortErr(msg.err)
 		}
+		// 正文换了，能卷的行数也跟着变。上一轮如果卷得比较深、新正文又短
+		// 一些，scroll 就留在了界外 —— 收敛一次，免得用户从头按到底都
+		// 「没反应」（画面靠 tailWindow 兜住了，但这个余数很难察觉）。
+		m.clampChatScroll()
 		return m, nil
 
 	case refreshMsg:
@@ -429,11 +480,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// 会话被删掉之后要退回列表，否则会停在一个已经不存在的会话上，
 		// 标题空着、输入框还能打字，但发不出去。
-		if m.activeRoot != "" {
-			if _, ok := m.app.Thread(m.activeRoot); !ok {
+		if m.activeID != "" {
+			if _, ok := m.app.Thread(m.activeID); !ok {
 				m.mode = modeList
-				m.activeRoot = ""
-				m.bodies = map[string]string{}
+				m.activeID = ""
+				m.bodies = map[string]app.Body{}
 				m.input.Blur()
 			}
 		}
@@ -475,6 +526,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 	return m, nil
 }
@@ -589,13 +643,23 @@ func (m Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.helpScroll = m.maxHelpScroll()
 	}
 
-	if m.helpScroll > m.maxHelpScroll() {
-		m.helpScroll = m.maxHelpScroll()
+	m.clampHelpScroll()
+	return m, nil
+}
+
+// clampHelpScroll 把帮助页的滚动位置收进 [0, maxHelpScroll]。
+//
+// 和会话正文的 clampChatScroll 是同一件事的两个实例：帮助内容的行数只
+// 取决于宽度，所以窗口一变，「能滚多少」也跟着变，旧位置就可能越界。
+// 收敛逻辑写成方法而不是散在两处，是因为它要被三个地方调用 ——
+// 按键、滚轮、窗口尺寸变化。
+func (m *Model) clampHelpScroll() {
+	if max := m.maxHelpScroll(); m.helpScroll > max {
+		m.helpScroll = max
 	}
 	if m.helpScroll < 0 {
 		m.helpScroll = 0
 	}
-	return m, nil
 }
 
 // handleSearchKey 处理搜索输入。过滤是实时的 —— 每敲一个字就重算。
@@ -719,10 +783,10 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.allMailCmd(!m.app.AllMail())
 		}
 
-		// 顺序要紧：pendingThread 读的是 pendingRoot，必须趁清空之前问。
+		// 顺序要紧：pendingThread 读的是 pendingID，必须趁清空之前问。
 		th, ok := m.pendingThread()
 		m.confirmKind = confirmNone
-		m.pendingRoot = ""
+		m.pendingID = ""
 		m.mode = modeList
 		m.input.Blur()
 		if !ok {
@@ -736,7 +800,7 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n", "esc", "q":
 		m.confirmKind = confirmNone
-		m.pendingRoot = ""
+		m.pendingID = ""
 		m.mode = modeList
 		return m, nil
 	}
@@ -745,10 +809,10 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // pendingThread 返回模态操作（删除确认 / 转发）作用在哪个会话上。
 func (m Model) pendingThread() (thread.Thread, bool) {
-	if m.app == nil || m.pendingRoot == "" {
+	if m.app == nil || m.pendingID == "" {
 		return thread.Thread{}, false
 	}
-	return m.app.Thread(m.pendingRoot)
+	return m.app.Thread(m.pendingID)
 }
 
 func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -756,14 +820,10 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
-		}
-	case "down", "j":
-		if m.cursor < len(m.visible)-1 {
-			m.cursor++
-		}
+	case "up", "k", "ctrl+up":
+		m.moveCursor(-1)
+	case "down", "j", "ctrl+down":
+		m.moveCursor(1)
 	case "home", "g":
 		m.cursor = 0
 	case "end", "G":
@@ -854,7 +914,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "d":
 		if th, ok := m.currentThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.confirmKind = confirmDelete
 			m.mode = modeConfirm
 			return m, nil
@@ -862,7 +922,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "f":
 		if th, ok := m.currentThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.mode = modeForward
 			m.input.EchoMode = textinput.EchoNormal
 			m.input.Placeholder = "转发给（收件人邮箱地址）"
@@ -877,27 +937,67 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // openActive 打开光标所在的会话。
 //
 // solo 为 true 时把回复对象锁定成「只回发件人」—— 从列表按 R 进来的
-// 快捷路径，省掉进去之后再按一次 Tab。默认一律重置成 Reply-All，
-// 免得上一轮切过的状态悄悄带到下一个会话里。
+// 快捷路径，省掉进去之后再按一次 Tab。
 func (m Model) openActive(solo bool) (tea.Model, tea.Cmd) {
 	th, ok := m.currentThread()
 	if !ok {
 		return m, nil
 	}
+	return m.enterThread(th, solo, false)
+}
 
-	m.activeRoot = th.Root
+// switchThread 在会话列表里往上（dir<0）或往下（dir>0）跳一个会话，并
+// 直接打开它。
+//
+// 光标跟着一起走，所以 Ctrl+↑/↓ 和「在列表里挪一下再回车」落到的是同一个
+// 状态，不会出现「光标停在 A、打开的却是 B」这种对不上号的画面。
+func (m Model) switchThread(dir int) (tea.Model, tea.Cmd) {
+	if len(m.visible) == 0 {
+		return m, nil
+	}
+	next := m.cursor + dir
+	if next < 0 || next >= len(m.visible) {
+		// 到头就停住，不绕回另一头。绕回会让「按住 Ctrl+↓」变成一台
+		// 不会累的永动机，停住只是「没反应」—— 后者不会误伤。
+		return m, nil
+	}
+	m.cursor = next
+	return m.enterThread(m.visible[next], false, true)
+}
+
+// enterThread 把界面切到 th 这个会话：重置滚动、丢掉上一个会话的正文、
+// 重新拉正文并标已读。
+//
+// solo 决定回复对象（见 openActive）；keepDraft 决定要不要保留输入框里
+// 正在打的字。
+//
+// keepDraft 是给 Ctrl+↑/↓ 用的：用户打了一半才发现发错人（或者只是想去
+// 别的会话看一眼），换会话不该把草稿吃掉。而从列表里回车进来是「开一个
+// 新会话」的意思，草稿一律清掉 —— 两个不同的意图，所以是两个参数。
+func (m Model) enterThread(th thread.Thread, solo, keepDraft bool) (tea.Model, tea.Cmd) {
+	m.activeID = th.ID
 	m.mode = modeChat
+	// 换会话一定从底部看起。scroll 是「从这个会话底部往上卷多少行」，
+	// 留着上一个会话的值，新会话一进来就是一片空画面。
 	m.scroll = 0
-	m.bodies = map[string]string{}
+	m.bodies = map[string]app.Body{}
 	m.replyAll = !solo
+	// newChatTo 是「还没落地的新会话」的收件人。切到已有会话必须清掉，
+	// 否则回车会把消息发到那个还没建立起来的新会话去。
+	m.newChatTo = nil
+	// lastSentText 是发送失败后留给用户重发的副本。换了会话，上一轮失败
+	// 的那个对象已经不是当前会话了，留着只会把消息重发到错的地方。
+	m.lastSentText = ""
 	m.input.EchoMode = textinput.EchoNormal
 	m.input.Placeholder = "输入消息，回车发送"
-	m.input.SetValue("")
+	if !keepDraft {
+		m.input.SetValue("")
+	}
 	m.input.Focus()
 
 	return m, tea.Batch(
 		textinput.Blink,
-		m.loadBodiesCmd(th),
+		m.loadBodiesByIDCmd(th.ID),
 		m.markReadCmd(th),
 	)
 }
@@ -906,21 +1006,85 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+
+	// Esc 只退出「会话视图」，**不丢弃**当前会话。
+	//
+	// 这里原先顺手把 activeID 清空、bodies 也清掉，等于「按 Esc = 关掉
+	// 这个会话」；用户的原话是「怎么 esc 直接关闭当前会话了？只有在切换
+	// 会话时才更换」。Esc 的语义该是「退一层」，不是「扔掉东西」——
+	// 成熟客户端也都是这么定的：Discordo 的 composer 里 esc 只是取消
+	// 当前输入，Discord 里 esc 标记已读，**没有一个是「关闭频道」**。
+	//
+	// 保留 activeID 还有个直接好处：退回列表之后右栏仍然显示这个会话的
+	// 内容（renderChat 看的是 activeThread()，与 mode 无关），用户扫一眼
+	// 列表再按回车就回来了，不用重新找。
 	case "esc":
 		m.mode = modeList
-		m.activeRoot = ""
-		m.bodies = map[string]string{}
 		m.input.Blur()
 		return m, nil
+
 	case "tab":
 		m.replyAll = !m.replyAll
 		return m, nil
+
+	// 上下滚正文。
+	//
+	// PgUp/PgDn 一次一屏减一行：留一行重叠是标准做法，两屏完全错开的话
+	// 读者得自己找「刚才读到哪了」。↑/↓ 一次三行 —— 一屏二十来行，
+	// 三行一步既有明确反馈，又不至于像整屏那样容易翻过头。
+	//
+	// 这三个键都在 switch 里被拦下，不会落到下面的 input.Update：
+	// textinput 本来就不认 PgUp/PgDn，但它认 ↑/↓（要在打的字里挪光标），
+	// 所以下面那两只要先问一句「输入框是不是空的」。
 	case "pgup":
-		m.scroll += 5
+		m.scrollChat(m.chatPageStep())
+		return m, nil
 	case "pgdown":
-		if m.scroll > 0 {
-			m.scroll -= 5
+		m.scrollChat(-m.chatPageStep())
+		return m, nil
+
+	// 在会话之间直接跳，不用先退回列表。
+	//
+	// 这是「输入框有焦点时换不了会话」的答案：裸 ↑/↓ 归输入框（要在打的
+	// 字里挪光标），所以换会话必须走组合键。Discordo 用的是 alt+↑/↓，
+	// 同一个道理；这里取 ctrl+↑/↓，因为 Windows 终端下 ESC 与 Alt 的
+	// 歧义让 alt+方向键不可靠。
+	case "ctrl+up":
+		return m.switchThread(-1)
+	case "ctrl+down":
+		return m.switchThread(1)
+
+	// ↑/↓ 在输入框是空的时候拿来滚正文，非空就还给输入框。
+	//
+	// 不加这一条的话，会话视图里能滚的就只剩 PgUp/PgDn 和滚轮，而用户的
+	// 第一直觉是方向键 ——「chatView 完全无法滚动」有一半是这么来的。
+	// 输入框非空时不抢：那时候用户是在改字，↑/↓ 该归光标。
+	case "up":
+		if m.inputDraftEmpty() {
+			m.scrollChat(chatLineStep)
+			return m, nil
 		}
+	case "down":
+		if m.inputDraftEmpty() {
+			m.scrollChat(-chatLineStep)
+			return m, nil
+		}
+
+	// 会话里的刷新。
+	//
+	// 必须带 Ctrl：这里输入框有焦点，裸 r 会被当成正文的字符打进去
+	// （下面那段注释说的就是这个坑）。列表上的 r 还在，那是另一个界面。
+	//
+	// 只发一条命令（同步），正文的重载由 syncResultMsg 那条路自己接上。
+	// **别写成 tea.Batch(syncCmd, loadActiveBodiesCmd)**：两条命令并发跑，
+	// 读正文那条若在同步落地之前开始，读到的就是旧会话，完成得又晚的话
+	// 还会把新正文覆盖回去 —— 表现为「按了刷新，内容随机地不更新」。
+	case "ctrl+r":
+		if m.app == nil {
+			return m, nil
+		}
+		m.busy = true
+		return m, m.refreshCmd()
 
 	// 下面这几个都用 Ctrl 组合键：会话里输入框有焦点，单个字母会被
 	// 当成正文打进消息里。这是"聊天界面"和"列表界面"按键设计上最
@@ -938,17 +1102,22 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+u":
 		// 标记未读之后必须离开这个会话 —— 留在里面的话它马上又会被
 		// 标回已读（打开会话时会 MarkRead），用户会以为按键没生效。
+		//
+		// 这里是**真的**要离开，所以连 activeID 一起清掉，别和上面 Esc
+		// 那条混了：Esc 是「退出去看看别处」，Ctrl+U 是「把这个会话
+		// 放回未读」，后者留着 activeID 反而会让下次进列表时右栏还挂着
+		// 一个已经标成未读的会话。
 		if th, ok := m.activeThread(); ok {
 			m.busy = true
 			m.mode = modeList
-			m.activeRoot = ""
-			m.bodies = map[string]string{}
+			m.activeID = ""
+			m.bodies = map[string]app.Body{}
 			m.input.Blur()
 			return m, m.unreadCmd(th)
 		}
 	case "ctrl+d":
 		if th, ok := m.activeThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.confirmKind = confirmDelete
 			m.mode = modeConfirm
 			m.input.Blur()
@@ -963,8 +1132,8 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		m.lastSentText = text
 		m.busy = true
-		// activeRoot 为空说明这是刚新建、还没落地的会话。
-		if m.activeRoot == "" {
+		// activeID 为空说明这是刚新建、还没落地的会话。
+		if m.activeID == "" {
 			return m, m.startCmd(m.newChatTo, text)
 		}
 		return m, m.replyCmd(text)
@@ -994,8 +1163,8 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeChat
-		m.activeRoot = "" // 还没建立会话
-		m.bodies = map[string]string{}
+		m.activeID = "" // 还没建立会话
+		m.bodies = map[string]app.Body{}
 		m.input.Placeholder = "输入消息，回车发送"
 		m.input.SetValue("")
 		m.newChatTo = []string{addr}
@@ -1009,14 +1178,35 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) loadActiveBodiesCmd() tea.Cmd {
-	if m.app == nil || m.activeRoot == "" {
+	if m.app == nil || m.activeID == "" {
 		return nil
 	}
-	th, ok := m.app.Thread(m.activeRoot)
-	if !ok {
+	if _, ok := m.app.Thread(m.activeID); !ok {
 		return nil
 	}
-	return m.loadBodiesCmd(th)
+	return m.loadBodiesByIDCmd(m.activeID)
+}
+
+// reloadBodiesIfChanged 决定「这一轮同步之后，要不要重读当前会话的正文」。
+//
+// 四种情况分开看：
+//   - 同步出错 → 不读。索引可能只同步了一半，读出来的是一份残缺的正文。
+//   - 用户按了 Ctrl+R（manual）→ 读。按了键就得有动静，这也是重试正文
+//     加载失败的机会。
+//   - 轮询且确有新数据（changed）→ 读。这正是要修的那个 bug：不读的话，
+//     对方新来的那一封只出现在左边列表里，右边停在上一轮的内容上。
+//   - 轮询且没有新数据 → 不读。定时器每 30 秒响一次，每次都把整个会话的
+//     正文重拉一遍，等于把空转的轮询变成稳定的网络流量。
+//
+// 不在会话里时 loadActiveBodiesCmd 自己返回 nil，所以列表模式下这里是无操作。
+func (m Model) reloadBodiesIfChanged(msg syncResultMsg) tea.Cmd {
+	if msg.err != nil {
+		return nil
+	}
+	if !msg.changed && !msg.manual {
+		return nil
+	}
+	return m.loadActiveBodiesCmd()
 }
 
 // setThreads 换掉会话列表，并重算过滤结果与光标位置。
@@ -1062,12 +1252,155 @@ func (m *Model) clampCursor() {
 	}
 }
 
+// ---- 滚动 ----
+
+const (
+	// chatLineStep 是 ↑/↓ 一次滚多少行。
+	//
+	// 三行是个折中：一屏二十来行，滚一行几乎看不出动，滚一屏又太粗 ——
+	// 三行既有明确反馈，也还停得住。
+	chatLineStep = 3
+
+	// wheelStep 是鼠标滚轮一格滚多少行。
+	//
+	// 和 chatLineStep 取同一个值，让「按方向键」和「滚滚轮」手感一致 ——
+	// 差着数的话，用户在两种输入之间切换会觉得有一边是坏的。
+	wheelStep = chatLineStep
+)
+
+// chatPageStep 是 PgUp/PgDn 一次滚多少行：一屏减一行。
+//
+// 留一行重叠是标准做法 —— 两屏完全错开的话，读者要自己找「刚才读到
+// 哪了」。
+func (m Model) chatPageStep() int {
+	if n := chatViewHeight(m.bodyHeight()) - 1; n > 1 {
+		return n
+	}
+	return 1
+}
+
+// scrollChat 把正文往上卷（delta>0）或往下卷（delta<0）delta 行，并收敛。
+func (m *Model) scrollChat(delta int) {
+	m.scroll += delta
+	m.clampChatScroll()
+}
+
+// clampChatScroll 把 scroll 收进 [0, maxChatScroll]。
+//
+// scroll 是「从底部往上卷的行数」，所以两个方向都会越界：往下卷过头是
+// 负数（收成 0），往上卷过头会超过正文总行数（收成 maxChatScroll）。
+//
+// 这件事以前完全没人做，于是按住 PgUp 会让 scroll 无限累加 —— 视图早就
+// 到顶了还在加；窗口一变或者换个会话，残留的值就把正文顶出画面，表现
+// 为「右边一片空白」。这也正是「自适应窗口大小」那条需求里最容易漏的
+// 一步：光把宽高存下来不算自适应，得让滚动位置跟着新的尺寸重新落到
+// 合法的范围里。
+func (m *Model) clampChatScroll() {
+	if max := m.maxChatScroll(); m.scroll > max {
+		m.scroll = max
+	}
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+}
+
+// maxChatScroll 是正文往上最多能卷多少行（0 表示一屏就放得下）。
+func (m Model) maxChatScroll() int {
+	n := m.chatBodyLines()
+	if v := chatViewHeight(m.bodyHeight()); n > v {
+		return n - v
+	}
+	return 0
+}
+
+// chatBodyLines 是当前会话的正文渲染出来一共有多少行。
+//
+// 它和 renderChat 里那份是同一份计算，共用 renderChatBody —— 抽出来的
+// 理由是「最多能卷多少」和「画出来几行」必须用同一个宽度、同一把尺子，
+// 各自算一遍迟早会对不上；对不上的表现是「滚到底还差半行」，很难查。
+//
+// 代价是 O(消息数)：每按一次滚动键要多渲染一遍正文。可以接受 ——
+// renderChat 本身就是每帧 O(消息数)，这里只是把同一份活多干一次，
+// 而人工按键的频率远低于帧率。
+func (m Model) chatBodyLines() int {
+	th, ok := m.activeThread()
+	if !ok {
+		return 0
+	}
+	return len(m.renderChatBody(th, m.chatBodyWidth()))
+}
+
+// inputDraftEmpty 说输入框里是不是没有内容。
+//
+// 用 TrimSpace 而不是 == ""：敲了一串空格在会话视图里等同于没打字，
+// 这时候方向键该归滚动，不该在一个全是空格的框里空转。
+func (m Model) inputDraftEmpty() bool {
+	return strings.TrimSpace(m.input.Value()) == ""
+}
+
+// moveCursor 把列表光标上下挪一格，到边界就停住。
+func (m *Model) moveCursor(dir int) {
+	m.cursor += dir
+	m.clampCursor()
+}
+
+// handleMouse 处理鼠标事件。
+//
+// 只认滚轮。左键点击（点一条会话、点一个按钮）需要先把每一行对应回
+// 是哪条消息，那是另一件事 —— 半吊子的点击比没有点击更让人困惑。
+//
+// 「滚谁」按指针落在哪一栏定：双栏时在左栏挪光标（不打开，打开是回车
+// 或点击的事），在右栏滚正文；单栏只有一栏，按当前看的是列表还是会话
+// 来分。这正是「聚焦」在鼠标这一侧的正解 —— 指针在哪，滚轮就管哪，
+// 不用先按一个键把焦点挪过去。
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	var dir int
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		dir = 1
+	case tea.MouseButtonWheelDown:
+		dir = -1
+	default:
+		return m, nil
+	}
+
+	// 帮助页自己占满一屏、有自己的滚动位置，单独处理。
+	// 少了这一条的话，在帮助页上滚滚轮会去动底下那个列表的光标 ——
+	// 屏幕上看不见任何变化，用户只会觉得轮子坏了。
+	if m.mode == modeHelp {
+		m.helpScroll -= dir * wheelStep
+		m.clampHelpScroll()
+		return m, nil
+	}
+
+	switch {
+	case m.mode == modeChat || m.mode == modeNewChat:
+		// 在会话里。单栏时整幅都是会话；双栏时指针在左栏就挪光标 ——
+		// 「左边那一栏也归滚轮管」比「只要进了会话，滚轮就只滚正文」
+		// 更符合指针在哪滚哪的直觉。
+		if m.width >= singlePaneWidth && msg.X < m.listWidth() {
+			m.moveCursor(-dir)
+		} else {
+			m.scrollChat(dir * wheelStep)
+		}
+	case m.mode == modeList:
+		m.moveCursor(-dir)
+	}
+	// 其余模式（搜索、文件夹选择、确认框、配置向导、解锁）不接管滚轮：
+	// 它们要么是弹在最上面的一小条，要么在等一个明确的答复，
+	// 让滚轮去改背后那些状态只会造出「屏幕上没变、底下却变了」的怪事。
+	return m, nil
+}
+
 // activeThread 返回当前打开的会话。
 func (m Model) activeThread() (thread.Thread, bool) {
-	if m.app == nil || m.activeRoot == "" {
+	if m.app == nil || m.activeID == "" {
 		return thread.Thread{}, false
 	}
-	return m.app.Thread(m.activeRoot)
+	return m.app.Thread(m.activeID)
 }
 
 // ---- 连接 ----

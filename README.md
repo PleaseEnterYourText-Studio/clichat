@@ -24,10 +24,11 @@ took four messages over two hours ends up looking like a small pile of paperwork
 
 clichat just looks at it differently: **treat mail as messages.**
 
-- **Threads, not messages.** Replies are grouped by the `References` /
-  `In-Reply-To` headers that mail has always carried. No subject-line guessing,
-  because merging two unrelated discussions that happen to share a title is
-  worse than leaving them apart.
+- **Conversations, not messages.** A conversation is the set of people on the
+  other side, so it is what the conversation actually *is* — Alice writing to you
+  and you writing to Alice are one conversation, and a message to
+  `[Alice, Bob]` is another. No subject-line guessing: merging two unrelated
+  discussions that happen to share a title is worse than leaving them apart.
 - **One binary, no server.** IMAP and SMTP go straight from your machine to your
   provider. There is no clichat account, no relay, no third party in the middle.
 - **Your credentials stay yours.** The auth code is encrypted with a master
@@ -39,8 +40,9 @@ clichat just looks at it differently: **treat mail as messages.**
 
 ## Screenshots
 
-**Conversation view** — group threads are coloured per sender, your own messages
-sit on the right:
+**Conversation view** — the other side's rows sit on a grey band while yours are
+right-aligned; in group threads every sender is coloured. The `HTML` marker in a
+message head means that body was converted from an HTML mail:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
@@ -133,13 +135,37 @@ and the process list.
 
 **Reading**
 
-- Threads grouped by `References` / `In-Reply-To`, not by subject line
+- **A conversation is a set of participants.** The key is the set of addresses
+  on the other side, excluding you: mail Alice sent you and mail you sent Alice
+  land in the same conversation, while a message addressed to just
+  `[Alice, Bob]` is a separate one. That is what a chat means by a conversation —
+  it is *who*, not *which reply chain*. (Earlier versions chained
+  `References` / `In-Reply-To`; the moment someone else replied it fell apart
+  into a new thread, and long mail lists shattered.)
+- The list **titles a conversation with the other side's name** (participants,
+  for a group) and puts what you are actually talking about on the second line —
+  that is the subject of the newest message. A conversation spans many subjects,
+  so those are two different questions
+- **The other side's rows sit on a grey band**, while yours are right-aligned
+  with no background — after a few exchanges you no longer have to read names to
+  tell who is talking. The grey adapts to the terminal's lightness
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
-  addresses, and tables, lists and code blocks keep as much of their shape as
-  they can; quoted history trimmed — this is a chat view, and quoting is noise
-  in it
+  addresses, tables, lists and code blocks keep as much of their shape as
+  they can, and headings are recovered from **font size** while bold is read
+  from `font-weight` (real mail styles them, it does not tag them); quoted
+  history trimmed — this is a chat view, and quoting is noise in it. See [HTML
+  mail, turned into Markdown](#html-mail-turned-into-markdown) for how
+- …and that Markdown is rendered back into terminal styling — headings lose
+  their hashes and are colour-coded by level, list items get real numbers,
+  tables come out as aligned columns, images show their `alt` text, links stay
+  clickable, and horizontal rules span the whole chat pane. You read mail, not
+  markup
+- **Messages that came from HTML carry an `HTML` marker in the message head.**
+  The conversion is lossy (buttons, tables and font-size headings all get
+  re-flowed); the marker is there so "the layout differs from the original mail"
+  has an explanation instead of looking like a rendering bug
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -156,6 +182,11 @@ and the process list.
 **Keeping it working**
 
 - Cold start pulls only the last 90 days / 500 messages, whichever comes first
+- **Refresh**: when polling finds new mail, the open conversation's bodies
+  reload with it, so sitting in a chat never leaves you on last round's screen;
+  inside a conversation `Ctrl+R` syncs immediately and re-reads its bodies.
+  A poll that found nothing does *not* reload them — otherwise every 30-second
+  tick would turn into a full network round-trip
 - "All mail" mode (`a` in the list) rewinds the local cursor and pulls the whole
   history in one go. While it is on, the status bar keeps saying so — the first
   sync gets noticeably slower, and that should not be a surprise
@@ -170,6 +201,137 @@ and the process list.
 - Credentials: Argon2id + NaCl secretbox
 - Local index is plain JSON — no database
 - Everything on disk lives in one directory you can delete
+
+## HTML mail, turned into Markdown
+
+The mail you actually care about is HTML — and that HTML is not a document, it
+is a **layout**. A "Confirm subscription" button is an `<a>` wrapped in inline
+CSS: strip the tags and the words survive but the address does not, and the
+address was the only part that mattered. A marketing mail's *entire body* is
+often one padded `<table>`. Neither survives a regex.
+
+So clichat parses the HTML into a DOM (`golang.org/x/net/html`) and walks it,
+emitting Markdown. The rules it follows:
+
+- **Links and buttons both become `[text](url)`.** A button in mail is either a
+  styled `<a>`, or a `<button>` / `<input type=submit>`. Only the first carries
+  an `href`, so both go through one fallback chain: `href`, `formaction`,
+  `data-href`, `data-url`, `data-link`, and finally any URL inside `onclick`.
+  Find one and it becomes a link. Find none and the label is bolded instead — a
+  button with no target cannot be a link, but it should not read as body text
+  either.
+- **Image buttons use their `alt`.** `<a><img alt="View order"></a>` is how a
+  lot of transactional mail ships its buttons. A terminal cannot show the
+  image, and `alt` is exactly the text the sender wrote for when it cannot.
+- **A bare `<img>` becomes `![alt](src)`.** Same reasoning, minus the link: the
+  `alt` is all a terminal can show. With no `alt` and no `title` to fall back
+  on, it becomes a placeholder word rather than an empty label — an empty label
+  still leaves the `src` on screen, and that `src` is usually a tracking URL
+  carrying an identifier of yours.
+- **Emphasis is wrapped around the content, not the element.** `**hello **`
+  does not render as bold — the trailing space pushes the marker off — so
+  `<b>hello </b>world` has to come out as `**hello** world`, with the space
+  moved outside the markers.
+- **A `<table>` is read as either data or layout.** Header cells in the first
+  row, or an equal column count across rows, means data: a Markdown table.
+  Otherwise it is layout, and the cells are rendered as stacked blocks.
+  Flattening a layout table would collapse the entire mail into one line.
+- **Headings are recovered from font size, not just from `<h1>`-`<h6>`.** Real
+  mail barely uses heading tags — clients strip their built-in styling, so
+  senders write the size straight into the markup instead:
+  `<td style="font-size:28px;font-weight:bold">`. Trust only the tags and the
+  hierarchy of the whole mail collapses in conversion: title, section headings
+  and body all come out as the same-sized paragraphs. So we first estimate the
+  message's **body size** (weighted by how much text each size carries, counting
+  only the innermost declaration, with ties going to the smaller one), then map
+  markedly larger sizes onto `#`-`######` in bands. The test is deliberately
+  strict: the element must declare its own `font-size` (inherited does not
+  count), and its content must hold no block element, link, button or image —
+  buttons are the most title-like thing there is (big, bold, white on colour),
+  and only "it is an `<a>` inside" tells them apart.
+- **Bold is read from styles too, not just from `<b>`.** Same cause: templates
+  put `font-weight:bold` in `style`, and trusting only the tags flattens every
+  emphasis in the body. `bold`, `bolder` and `600`-`900` all count, as does the
+  old `<font weight="bold">`.
+- **Markers must never nest into a string the renderer cannot read.** A style
+  bold and a tag bold on top of each other would emit `**a**b****`, and
+  `<b><i>a</i></b>` would emit `***a***` — the renderer deliberately rejects
+  ambiguous runs of asterisks (it shows the line verbatim rather than guess), so
+  the generator has to flatten instead: once inside asterisks, no inner marker.
+  `~~` is exempt — it does not collide with asterisks, and `**a~~old~~**`
+  renders fine.
+- **Body text is escaped.** A message containing `2*3` or `[TODAY]` should not
+  come out italic, or open a link nobody wrote.
+- **Quoted history is dropped.** In a chat view, re-quoting the thread you just
+  read is noise — the thread already has it.
+
+It does not try to reproduce CSS. A terminal has no `margin-left: 40px`.
+
+### And then it renders it
+
+Emitting Markdown is only half the job. A terminal that prints `**note**` as
+`**note**` has just moved the problem somewhere else — and until recently that
+is exactly what happened here. The conversation view now renders the body back
+into something readable: `###` becomes a bold line, list items get their real
+numbers (`1.` `2.` `3.`, not three `1.`s — the generator writes `1.` for every
+item on purpose), `[text](url)` shows only the text and stays clickable, and
+`2*3`, escaped on the way in, comes back as `2*3`.
+
+**Headings also have to stay distinguishable.** A terminal has no font size, so
+the only dimensions left are **colour** and **bold**. Six levels would mean some
+of them look identical, which is a lie — so they fold into three tiers by
+structural role:
+
+| Level | On screen | Why |
+| --- | --- | --- |
+| `#` `##` | accent colour + bold | what the message is about |
+| `###` `####` | another colour + bold | what this section is about |
+| `#####` `######` | bold only | barely occurs in mail; no second colour |
+
+Only the parser knows which levels count as "large"; the renderer just turns
+that into style — the banding is Markdown's semantics, not the terminal's. The
+prominence lives in the top two bits of `attrs`, making it the one
+**multi-valued** attribute there (the rest are on/off; a heading level is
+genuinely a value).
+
+There is no Markdown library in the loop. The input is a **closed** set of
+syntax, because clichat is what wrote it in the first place: every `*`,
+backtick, `_`, `[`, `]` and `<` that came from the mail was escaped into
+`\<char>` on the way out. So an unescaped `*` is always one of ours, and the
+parser can be exact where a general-purpose one has to guess.
+
+**Closed means closed, and that is the part that broke.** Two things the
+generator had been emitting for a long time were never taught to the renderer:
+`![alt](src)` and Markdown tables. Neither failed loudly. They came out as
+markup — `![Operational](…)` rendered as `!perational` (the `!` survives, the
+image does not), a status table rendered as three lines of `| 组件 | 状态 |`,
+and `![](url)` put a whole tracking URL in the middle of the conversation.
+
+The lesson is in the test suite now. The renderer's test file ends with a
+**cross-package invariant**: real HTML goes through the *real* generator and
+then the *real* renderer, and the result is checked for both halves — no markup
+may reach the screen, and the text must still be there. Testing each side on
+its own is exactly how this got through; both suites were green while the
+seam between them was empty. Whenever the generator learns a new syntax, that
+test should be the thing that tells you the renderer has not.
+
+Two details that decide whether it looks right:
+
+- **Wrapping happens on plain text, before any colour is applied.** A colour
+  escape sequence is a pile of characters, and anything that measures width per
+  rune counts them as columns — so wrapping after colouring breaks lines in the
+  wrong place, and cuts sequences in half. Colour goes on last.
+- **Links get colour and nothing else.** Give a link's style an underline and
+  the renderer emits a separate sequence per character, which shreds the
+  clickable-link sequence: the link still *looks* right and simply stops
+  working. Clichat would rather have a clickable link than a decorated one.
+
+Tables get one extra rule: **they do not wrap.** Break a table row across lines
+and the columns stop lining up, at which point the table is worse than the
+plain text it replaced. So an over-wide table is truncated column by column —
+narrow columns like a status word are never squeezed for the sake of a wide
+one — and only at absurdly narrow widths does it give up on alignment entirely
+and lay the cells out as ordinary wrapped text.
 
 ## Keyboard Shortcuts
 
@@ -207,14 +369,22 @@ message — every action uses a `Ctrl` combination instead.
 |---|---|
 | `Enter` | Send |
 | `Tab` | Reply-all / reply-to-sender |
-| `PgUp` / `PgDn` | Scroll |
-| `Esc` | Back to list |
+| `Ctrl+R` | Refresh: sync once now, and re-read this conversation's bodies |
+| `↑` / `↓` | Scroll the conversation (when the input box is empty) |
+| `PgUp` / `PgDn` | Scroll a screen |
+| Wheel | Scrolls whatever the pointer is over: the list cursor on the left, the conversation on the right |
+| `Ctrl+↑` / `Ctrl+↓` | Previous / next conversation |
+| `Esc` | Back to list. The conversation stays open — `Enter` returns to it |
 | `Ctrl+Y` | Copy last message body |
 | `Ctrl+U` | Mark unread and go back |
 | `Ctrl+T` | Star / unstar |
 | `Ctrl+D` | Delete |
 | `F1` | Help |
 | `Ctrl+C` | Quit |
+
+A scroll bar appears on the right edge of the conversation once it is longer
+than one screen — which is also the answer to "is this thing scrollable at
+all?".
 
 ## FAQ
 
@@ -327,7 +497,7 @@ The layout, top-down by dependency:
 
 | Package | Responsibility |
 |---|---|
-| `internal/thread` | Pure threading algorithm (union-find). No IO, fully unit-tested |
+| `internal/thread` | Pure functions: group by participant set, order, count unread and stars. No IO, fully unit-tested |
 | `internal/mail` | IMAP fetch / SMTP send / MIME parsing, behind a `Client` interface |
 | `internal/store` | Header index, persisted as JSON |
 | `internal/config` | Config, provider presets, Argon2id + secretbox credential encryption |

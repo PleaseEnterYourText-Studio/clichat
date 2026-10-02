@@ -9,18 +9,21 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/app"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 )
 
 // 这一组测试守着配置向导里的可点击链接。
 //
 // 背景（踩过的坑）：链接用 OSC 8 包成可点击的，但 styleLink 一旦带上
-// Underline，bubbletea 就会给 URL 的每个字符单独套一串 SGR，把 OSC 8
-// 序列切碎 —— 表现是「看着完全正常，但点不动」。
+// Underline，URL 的每个字符都会被单独套一串 SGR，把 OSC 8 序列切碎 ——
+// 表现是「看着完全正常，但点不动」。
 //
-// 恶劣之处：**Go 层的单测抓不到它**，因为 View() 返回的字符串永远是完整的，
-// 是渲染器在后面切碎的。所以这里的测试只能守住「别给样式加属性」这个
-// 必要条件，真正的验证必须抓原始字节（见 memory 里记的 rawdump 方法）。
+// 曾经以为「Go 层的单测抓不到它，是 bubbletea 的渲染器在后面切碎的」。
+// 2026-10-02 实测纠正：逐字符输出是 lipgloss 的 Style.Render 干的，纯 Go 层，
+// 跟 bubbletea 无关（纯文本 styleLink.Underline(true).Render("点我") 同样逐字）。
+// 也就是说**下面是抓得住的**，TestStyleLink_MustNotCarryAttributes 就是那条判据。
+// 同时也测出元凶只有 Underline：Bold / Italic / Reverse 都安全。
 
 func TestHyperlink_WidthIgnoresEscapeSequence(t *testing.T) {
 	link := hyperlink("https://example.com/some/long/path", "example.com")
@@ -92,7 +95,7 @@ func TestSetupWizard_ShowsClickableLink(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})
@@ -116,7 +119,7 @@ func TestSetupWizard_LinkVisibleOnPasswordStep(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})

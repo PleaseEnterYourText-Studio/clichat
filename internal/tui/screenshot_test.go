@@ -8,6 +8,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/app"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
@@ -31,16 +33,20 @@ import (
 //
 // 第一步产出 docs/images/raw/*.ansi，第二步把它们渲染成 docs/images/*.png
 // （用 charmbracelet/freeze 出 SVG，再用 Edge 无头模式栅格化 —— 为什么
-// 要绕这一圈，见 tools/render-screenshots.py 顶部的说明）。
+// 要绕这一圈、以及色深那个坑，见 tools/render-screenshots.py 顶部的说明）。
 //
-// **每次重出，四张 PNG 都会变，即使画面内容没动。** 状态栏那一行的
-// 「上次同步 HH:MM:SS」来自 model.go 里的 time.Now()，它走的是生产代码
-// 路径，而这里驱动的就是生产代码 —— 于是时间戳跟着当下走，四张里每张
-// 都带着它。（消息日期是固定的，见 newSampleModel 里的 base；只有这个
-// 同步时间没固定。）要真正固定得给 Model 注入一个时钟，还没做。
+// **每次重出，01-chat / 02-list / 03-search 这三张会变，即使画面内容没动。**
+// 状态栏那一行的「上次同步 HH:MM:SS」来自 model.go 里的 time.Now()，它走的是
+// 生产代码路径，而这里驱动的就是生产代码 —— 于是时间戳跟着当下走，那三张
+// 都带着它。（消息日期是固定的，见 newSampleModel 里的 base；只有这个同步
+// 时间没固定。）要真正固定得给 Model 注入一个时钟，还没做。这三张本来就是
+// 会变的，**不要拿它们的字节去判断「有没有意外改动」** —— 要看图。
 //
-// 所以提交时别惊讶于 01-chat / 03-search 也进了 diff —— 那是几个数字，
-// 不是版式变了。（渲染本身是可复现的：ANSI 不变，PNG 就不变。）
+// 04-help 上没有任何时钟（帮助页没有状态栏），所以它的 ANSI 是逐字节稳定的：
+// 内容没动，它就不该变；它变了就一定是帮助页本身被改了。这是四张里唯一一张
+// 可以当「指纹」用的，剩下三张不行。
+//
+// （渲染本身是可复现的：ANSI 不变，PNG 就不变。）
 func TestGenerateScreenshots(t *testing.T) {
 	if os.Getenv("CLICHAT_SCREENSHOTS") != "1" {
 		t.Skip("需要 CLICHAT_SCREENSHOTS=1 才跑（见本文件顶部注释）")
@@ -48,6 +54,22 @@ func TestGenerateScreenshots(t *testing.T) {
 	if os.Getenv("CLICOLOR_FORCE") == "" {
 		t.Fatal("必须同时设 CLICOLOR_FORCE=1，否则 lipgloss 不输出颜色，截出来是黑白的")
 	}
+
+	// 挡位必须自己钉成 256 色，不能跟着环境判。
+	//
+	// CLICOLOR_FORCE=1 只保证「有颜色」，色深还是 termenv 按环境自动判的；
+	// 这里没有 TTY，它判成 16 色。16 色会把「对方消息的灰底」（自适应色
+	// 236）压成 \x1b[40m —— 而 **freeze 恰好不画这一个序列**，于是截图里
+	// 那层灰底根本不存在，README 反倒成了唯一看不见这个功能的地方。
+	//
+	// 这条不是猜的，用探针实测过：48;5;236 会被还原成背景矩形，48;2;r;g;b
+	// 也会，唯独 40 什么都不画。所以问题出在色深，不在 paintPeerRow。
+	//
+	// 顺带一提，256 色也更接近现代终端的真实观感（Windows Terminal /
+	// iTerm2 / VS Code 默认都是真彩），16 色才是 headless 环境的副产品。
+	prevProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prevProfile) })
 
 	// 输出到仓库根的 docs/images/raw/。测试的工作目录是包目录，
 	// 所以往上退两级。
@@ -91,8 +113,8 @@ func TestGenerateScreenshots(t *testing.T) {
 			width:  74,
 			height: 20,
 			drive: func(t *testing.T, m Model) Model {
-				// 搜「周」会命中三条（周五的产品评审 / 团队周报 / 周四下午），
-				// 既看得出在过滤，列表又不至于空荡荡。
+				// 搜「周」会命中四条（周五的产品评审 / 周末团建 / 第 40 周
+				// 团队周报 / 周四下午），既看得出在过滤，列表又不至于空荡荡。
 				m, _ = update(m, keyMsg("/"))
 				m, _ = update(m, keyMsg("周"))
 				return m
@@ -211,6 +233,79 @@ func newSampleModel(t *testing.T) Model {
 		From: "alice@example.com", FromName: "Alice", To: group,
 		Subject: "Re: 周五的产品评审", Date: base.Add(74 * time.Minute),
 	}, "行。那我把议程按这个顺序排一下，明天发出来。")
+	// 这条是一条**真 HTML 邮件** —— 走 AddHTMLMessage，正文由真实的生成器
+	// 在测试时转成 Markdown，不是手抄的 Markdown 字符串。
+	//
+	// 放它是为了让 01-chat 那张截图能**看出渲染**（这是聊天视图的主角，
+	// 也是最后一条、一定在可视区内）：标题的井号没了、列表补上了真实序号
+	// （生成器一律写「1.」，序号是渲染层补的）、链接只留文字、**强调**变成
+	// 粗体，而且消息头上带一个 HTML 标记。若哪天渲染器坏了，这张图会直接
+	// 变成一堆 Markdown 源码。
+	//
+	// 必须走 AddHTMLMessage 而不是 HTMLToMarkdown + AddMessage：后者在假
+	// 客户端里就把「这段正文来自 HTML」这个事实丢了，消息头上那个标记
+	// 永远拍不出来。
+	fake.AddHTMLMessage("INBOX", mail.Header{
+		MessageID: "<p13@x>", References: []string{"<p1@x>"},
+		From: "alice@example.com", FromName: "Alice", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(80 * time.Minute),
+	},
+		`<h3>评审议程（周五 15:00）</h3>`+
+			`<ol><li>上季度数据回顾</li><li>接口文档里剩下的 TBD</li><li>新版设计稿</li></ol>`+
+			`<p>会议链接：<a href="https://meeting.example.com/abc-def-ghi">meeting.example.com/abc-def-ghi</a></p>`+
+			`<p><strong>注意</strong>：资料在共享盘，看<strong>新版</strong>那份，旧版有几处数字是错的。</p>`)
+
+	// 这条的正文**在测试时由真实的生成器算出来**（AddHTMLMessage 对一段
+	// 真 HTML 的产出），不是手抄的字符串。
+	//
+	// 刻意的形状：一个用 font-size 表达的标题 + 一个数据表 + 单元格里带
+	// alt 的状态图标 —— 就是用户截图里那封服务状态邮件的样子。
+	//
+	// 标题那条尤其要紧：真实邮件几乎不用 <h1>-<h6>（邮件客户端会把标题
+	// 标签的样式 strip 掉），而是把字号写进 style。生成器得从字号反推
+	// 层级，否则整封信的所有标题都会塌成同样大小的普通段落 —— 这正是
+	// 用户报的「上下文严重丢失」。同样，改前数据表和图片渲染器都不认，
+	// 屏幕上会出现 `!perational` 和 `| 组件 | 状态 |` 这种半截源码。
+	//
+	// 让它全部跟着真生成器走，截图就不可能和实际管线脱节。
+	fake.AddHTMLMessage("INBOX", mail.Header{
+		MessageID: "<p14@x>", References: []string{"<p1@x>"},
+		From: "bob@example.com", FromName: "Bob", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(86 * time.Minute),
+	},
+		`<p style="font-size:22px;font-weight:bold">故障复盘</p>`+
+			`<p style="font-size:14px">涉及的三个组件，当前状态如下：</p>`+
+			`<table>`+
+			`<tr><th>组件</th><th>状态</th><th>影响</th></tr>`+
+			`<tr><td>API 接口</td>`+
+			`<td><img src="https://status.example.com/ok.svg" alt="Operational"></td>`+
+			`<td>无</td></tr>`+
+			`<tr><td>消息推送</td>`+
+			`<td><img src="https://status.example.com/ok.svg" alt="Operational"></td>`+
+			`<td>延缓 12 分钟</td></tr>`+
+			`<tr><td>数据同步</td>`+
+			`<td><img src="https://status.example.com/warn.svg" alt="Degraded"></td>`+
+			`<td>延缓 40 分钟</td></tr>`+
+			`</table>`+
+			`<p>现在都恢复了，细节在共享盘。</p>`)
+
+	// 会话的最后一条由**自己**发出。
+	//
+	// 这一条是给截图凑构图的，两个作用：
+	//
+	//   - IM 的聊天窗本来就该两头都有。全是对方的话，看着像一封长邮件
+	//     被排版成了聊天，而不是聊天。
+	//   - 自己没有灰底、靠右对齐，正好和上面铺满灰底的对方消息形成对照。
+	//     「谁在说」一眼就能分开，靠的正是这个 —— 没有对照，那层灰底在
+	//     图里就只是一块不明所以的底色。
+	//
+	// 位置放在最后是必须的：正文区只显示末尾一屏（tailWindow），要让它在
+	// 截图里看得见，它就得在末尾。
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p15@x>", References: []string{"<p1@x>"},
+		From: "me@example.com", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(92 * time.Minute), Seen: true,
+	}, "收到，我这边也正常。评审的材料我周五上午发出来。")
 
 	// —— 1:1，两条未读 ——
 	fake.AddMessage("INBOX", mail.Header{

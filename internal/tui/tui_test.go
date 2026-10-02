@@ -24,6 +24,18 @@ func update(m Model, msg tea.Msg) (Model, tea.Cmd) {
 }
 
 // keyMsg 把按键名转成 tea.KeyMsg。
+//
+// ctrl+<字母> 走真实的 KeyCtrl<X> 类型，而不是把 "ctrl+r" 当字面字符串
+// 塞进 KeyRunes —— 后者只是碰巧 String() 也叫 "ctrl+r"，看着能过，
+// 但它模拟的是「用户打了 ctrl+r 这六个字符」，不是按下组合键。
+//
+// ⚠️ 同理，pgup / pgdown / ctrl+up / ctrl+down 必须走下面这张显式表。
+//
+// 这里踩过一次坑：这几个名字以前没在表里，于是落进最后的兜底分支被造成
+// KeyRunes{[]rune("pgup")} —— 它的 String() 碰巧也是 "pgup"，一条测
+// 「PgUp 能滚动」的判据看着是绿的，可那个按键在真实终端里**从来没人按过**
+// （真 KeyPgUp 走的是 \x1b[5~，是键盘上的 PgUp 键）。
+// TestKeyMsg_ProducesRealKeys 守着这条，别再让它退化。
 func keyMsg(s string) tea.KeyMsg {
 	switch s {
 	case "enter":
@@ -36,9 +48,26 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
-	default:
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	case "home":
+		return tea.KeyMsg{Type: tea.KeyHome}
+	case "end":
+		return tea.KeyMsg{Type: tea.KeyEnd}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
+	case "ctrl+up":
+		return tea.KeyMsg{Type: tea.KeyCtrlUp}
+	case "ctrl+down":
+		return tea.KeyMsg{Type: tea.KeyCtrlDown}
 	}
+	if len(s) == 6 && strings.HasPrefix(s, "ctrl+") {
+		if c := s[5]; c >= 'a' && c <= 'z' {
+			// Ctrl+A 是 0x01，往下顺推 —— 和 bubbletea 的 KeyCtrlX 编码一致。
+			return tea.KeyMsg{Type: tea.KeyType(c - 'a' + 1)}
+		}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
 
 // newMockModel 造一个跑在内存假数据上的模型。
@@ -87,12 +116,12 @@ func syncOnce(t *testing.T, m Model) Model {
 // loadBodies 直接调 app.Bodies 并把结果喂给模型。
 func loadBodies(t *testing.T, m Model) Model {
 	t.Helper()
-	th, ok := m.app.Thread(m.activeRoot)
+	th, ok := m.app.Thread(m.activeID)
 	if !ok {
 		return m
 	}
 	bodies, err := m.app.Bodies(th)
-	m, _ = update(m, bodiesResultMsg{root: th.Root, bodies: bodies, err: err})
+	m, _ = update(m, bodiesResultMsg{id: th.ID, bodies: bodies, err: err})
 	return m
 }
 
@@ -104,9 +133,11 @@ func TestModel_ListsThreads(t *testing.T) {
 		t.Fatalf("want 1 thread, got %d", got)
 	}
 	view := m.View()
-	if !strings.Contains(view, "alice") {
+	// 会话标题是「和谁」—— 对方的名字（有显示名就用显示名）。
+	if !strings.Contains(view, "Alice") {
 		t.Errorf("会话列表里没看到对方名字:\n%s", view)
 	}
+	// 副行是「现在在聊什么」—— 会话里最新一条的主题。
 	if !strings.Contains(view, "会议") {
 		t.Errorf("会话列表里没看到主题:\n%s", view)
 	}
@@ -190,17 +221,41 @@ func TestModel_TabTogglesReplyAll(t *testing.T) {
 	}
 }
 
+// Esc 只是「退出会话视图」，**不关掉**当前会话。
+//
+// 这条断言曾经是反的（原先要求 Esc 清空 activeID）—— 用户的原话是
+// 「怎么 esc 直接关闭当前会话了？只有在切换会话时才更换」。改成「退一层」
+// 之后会话要留着，再按回车立刻回来，而且退回列表时右栏还显示着它的内容。
+//
+// 真正需要「离开并丢掉」的是 Ctrl+U（标记未读），那条在 scroll_test.go
+// 里单独守着 —— 两个键的语义必须分开，别再合回一个。
 func TestModel_EscReturnsToList(t *testing.T) {
 	m, _ := newMockModel(t)
 	m = syncOnce(t, m)
 	m, _ = update(m, keyMsg("enter"))
+	m = loadBodies(t, m)
+
+	opened := m.activeID
+	if opened == "" {
+		t.Fatal("回车之后应该有一个打开着的会话")
+	}
+
 	m, _ = update(m, keyMsg("esc"))
 
 	if m.mode != modeList {
 		t.Fatalf("Esc 之后 mode = %v, want modeList", m.mode)
 	}
-	if m.activeRoot != "" {
-		t.Error("Esc 之后应清空当前会话")
+	if m.activeID != opened {
+		t.Errorf("Esc 不该丢下当前会话：activeID = %q，原来是 %q", m.activeID, opened)
+	}
+	if len(m.bodies) == 0 {
+		t.Error("Esc 不该清掉正文 —— 退回列表时右栏还要显示它")
+	}
+
+	// 再按一次回车应该回到同一个会话。
+	m, _ = update(m, keyMsg("enter"))
+	if m.mode != modeChat || m.activeID != opened {
+		t.Errorf("回车没有回到原来的会话：mode=%v activeID=%q", m.mode, m.activeID)
 	}
 }
 
@@ -260,7 +315,7 @@ func TestModel_SetupWizardStartsWithProviders(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -292,7 +347,7 @@ func TestModel_UnlockRejectsShortMasterPassword(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m.setup.step = stepMaster
@@ -309,7 +364,7 @@ func TestModel_UnlockRejectsShortMasterPassword(t *testing.T) {
 	}
 }
 
-func TestTruncateAndWrapUseDisplayWidth(t *testing.T) {
+func TestTruncateUsesDisplayWidth(t *testing.T) {
 	// 中文一个字占两列，按 rune 数截断会把行撑宽。
 	if got := truncate("中文字符串", 5); lipgloss.Width(got) > 5 {
 		t.Errorf("truncate 结果超宽: %q (宽 %d)", got, lipgloss.Width(got))
@@ -317,10 +372,32 @@ func TestTruncateAndWrapUseDisplayWidth(t *testing.T) {
 	if got := truncate("abcdefgh", 5); got != "abcd…" {
 		t.Errorf("truncate = %q, want %q", got, "abcd…")
 	}
+}
 
-	for _, line := range wrapLines("中文混排 english words 一起折行", 10) {
-		if w := lipgloss.Width(line); w > 10 {
-			t.Errorf("wrapLines 产出超宽行 %q (宽 %d)", line, w)
+// 纯文本上，这两把尺子必须给出同一个答案。
+//
+// textWidth（styles.go）给折行和截断用，lipgloss.Width 给 padLeft / padRight
+// 用。两者一旦不一致，就会「算着刚好、画出来歪掉」—— 而 East Asian Ambiguous
+// 字符正是它们分叉的地方：go-runewidth 认 locale（本机中文 locale 下把 • —— …
+// ① 算成 2 列），lipgloss 走字素簇、不认 locale（都算 1 列）。
+//
+// 所以这条判据其实是在钉「两边都用同一把尺子」这件事，而不是某个数字。
+func TestTextWidthMatchesLipglossOnPlainText(t *testing.T) {
+	for _, s := range []string{
+		"",
+		"abc",
+		"中文字符串",
+		"• 列表项",
+		"—— 分隔 ——",
+		"省略…号",
+		"①②③",
+		"emoji 😀 混排",
+		"hello wonderful world",
+		"·中间点· 和 → 箭头",
+	} {
+		if got, want := textWidth(s), lipgloss.Width(s); got != want {
+			t.Errorf("%q：textWidth=%d，lipgloss.Width=%d —— 两把尺子不一致，"+
+				"折行和补白会互相拆台", s, got, want)
 		}
 	}
 }

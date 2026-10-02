@@ -113,6 +113,11 @@ func TestHelp_DocumentsCoreActions(t *testing.T) {
 
 func TestHelp_OpensAndCloses(t *testing.T) {
 	m, _ := newFeatureModel(t)
+	// 帮助页比一屏长，是分页滚动的 —— 用默认的 30 行去断言「每组都在
+	// 画面上」，其实是在赌内容刚好排得下。这一组判据要查的是「分组存在
+	// 且渲染出来了」，那就把视口放大到整页装得下，而不是让内容去迁就
+	// 视口高度（加一个快捷键就假红一次）。
+	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 80})
 
 	m, _ = update(m, keyMsg("?"))
 	if m.mode != modeHelp {
@@ -210,10 +215,10 @@ func TestSearch_FiltersLiveAndEscClears(t *testing.T) {
 	if len(m.visible) != 1 {
 		t.Fatalf("搜 bob 之后剩 %d 个, want 1", len(m.visible))
 	}
-	// 判据绑事实不绑文案：列表里渲染的是地址短名（bob），不是显示名（Bob），
-	// 所以断言的是「剩下的是哪个会话」+ 主题渲染出来了。
-	if m.visible[0].Root != "<b@x>" {
-		t.Errorf("过滤出来的不是 bob 那个会话: %q", m.visible[0].Root)
+	// 判据绑事实不绑文案：断言的是「剩下的是哪个会话」+ 主题渲染出来了，
+	// 不去比对标题那行文字（对方名字怎么显示是另一条判据的事）。
+	if m.visible[0].ID != "bob@example.com" {
+		t.Errorf("过滤出来的不是 bob 那个会话: %q", m.visible[0].ID)
 	}
 	if !strings.Contains(m.View(), "周末爬山") {
 		t.Errorf("过滤结果没渲染出来:\n%s", m.View())
@@ -301,7 +306,7 @@ func TestFolderPicker_LinesFitWidth(t *testing.T) {
 func TestDelete_ConfirmThenGone(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	before := len(m.visible)
-	target := m.visible[0].Root
+	target := m.visible[0].ID
 
 	m, _ = update(m, keyMsg("d"))
 	if m.mode != modeConfirm {
@@ -321,7 +326,7 @@ func TestDelete_ConfirmThenGone(t *testing.T) {
 		t.Errorf("删除后可见会话 %d, want %d", len(m.visible), before-1)
 	}
 	for _, th := range m.visible {
-		if th.Root == target {
+		if th.ID == target {
 			t.Error("被删的会话还在列表里")
 		}
 	}
@@ -331,7 +336,7 @@ func TestDelete_ConfirmThenGone(t *testing.T) {
 func TestDelete_CancelChangesNothing(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	before := len(m.visible)
-	target := m.visible[0].Root
+	target := m.visible[0].ID
 
 	m, _ = update(m, keyMsg("d"))
 	m, _ = update(m, keyMsg("n"))
@@ -344,7 +349,7 @@ func TestDelete_CancelChangesNothing(t *testing.T) {
 	}
 	found := false
 	for _, th := range m.visible {
-		if th.Root == target {
+		if th.ID == target {
 			found = true
 		}
 	}
@@ -357,7 +362,7 @@ func TestDelete_CancelChangesNothing(t *testing.T) {
 
 func TestStar_TogglesAndShowsMarker(t *testing.T) {
 	m, _ := newFeatureModel(t)
-	target := m.visible[0].Root
+	target := m.visible[0].ID
 
 	if m.visible[0].IsStarred() {
 		t.Fatal("前提不成立：一开始不该有星标")
@@ -414,8 +419,9 @@ func TestNextUnread_JumpsToUnread(t *testing.T) {
 
 // ---- 过滤算法本身 ----
 
-func mkThread(root string, folder string, subject string, participants ...string) thread.Thread {
-	th := thread.Thread{Root: root, Subject: subject, Participants: participants}
+// mkThread 手搓一个会话。root 同时当 ID 和唯一那条消息的 Message-ID。
+func mkThread(root string, folder string, subject string, peers ...string) thread.Thread {
+	th := thread.Thread{ID: root, Subject: subject, Peers: peers}
 	th.Messages = []thread.Header{{MessageID: root, Folder: folder, Subject: subject}}
 	return th
 }
@@ -455,17 +461,17 @@ func TestFilterThreads(t *testing.T) {
 func TestFilterThreads_NoFilterReturnsInput(t *testing.T) {
 	list := []thread.Thread{mkThread("<1>", "INBOX", "x", "a@b.c")}
 	got := filterThreads(list, "", "   ")
-	if len(got) != 1 || got[0].Root != "<1>" {
+	if len(got) != 1 || got[0].ID != "<1>" {
 		t.Errorf("不过滤时不该改变内容: %v", got)
 	}
 }
 
 func TestFirstUnread(t *testing.T) {
 	list := []thread.Thread{
-		{Root: "<1>"},
-		{Root: "<2>", Unread: 1},
-		{Root: "<3>"},
-		{Root: "<4>", Unread: 2},
+		{ID: "<1>"},
+		{ID: "<2>", Unread: 1},
+		{ID: "<3>"},
+		{ID: "<4>", Unread: 2},
 	}
 
 	if got := firstUnread(list, 0, 1); got != 1 {
@@ -484,7 +490,7 @@ func TestFirstUnread(t *testing.T) {
 		t.Errorf("起点即未读时应返回 3, got %d", got)
 	}
 	// 全已读时返回 -1，让调用方决定要不要绕回。
-	allRead := []thread.Thread{{Root: "<1>"}, {Root: "<2>"}}
+	allRead := []thread.Thread{{ID: "<1>"}, {ID: "<2>"}}
 	if got := firstUnread(allRead, 0, 1); got != -1 {
 		t.Errorf("全已读应该返回 -1, got %d", got)
 	}

@@ -47,13 +47,14 @@ func threadInFolder(th thread.Thread, folder string) bool {
 // threadMatches 判断会话是否命中搜索词。query 必须已经是小写。
 //
 // 匹配范围刻意放宽到参与者地址和显示名：这个界面里最常见的诉求是
-// 「找那个人」，只搜主题会漏掉一大半。
+// 「找那个人」，只搜主题会漏掉一大半。会话标题本身就是对方的名字，
+// 搜不到人比搜不到主题难受得多。
 func threadMatches(th thread.Thread, query string) bool {
 	if strings.Contains(strings.ToLower(th.Subject), query) {
 		return true
 	}
-	for _, p := range th.Participants {
-		// Participants 里的地址在聚合时已经小写化过了。
+	for _, p := range th.Peers {
+		// Peers 里的地址在聚合时已经小写化过了。
 		if strings.Contains(p, query) {
 			return true
 		}
