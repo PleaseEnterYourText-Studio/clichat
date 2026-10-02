@@ -199,6 +199,62 @@ func TestZen_HomeInputSendsToCurrentThread(t *testing.T) {
 	}
 }
 
+// 首页和会话屏的输入框必须是聚焦的，列表上必须失焦。
+//
+// 这条抓过一个真 bug（用户原话「f2 后 tab 有 bug」）：输入框的焦点原先一直
+// **继承**着进 Zen 之前的状态 —— 从 Normal 会话进 Zen 恰好是聚焦的（那边本来
+// 就在打字），所以一路没暴露；从 Normal **列表**进 Zen 就是失焦的，首页上敲
+// 什么都没反应。而且失焦的输入框**看不出来**：提示符和占位文字照画不误，
+// 只能靠「按了没反应」发现。
+//
+// 下面这条特意从 **Normal 列表**出发 —— 之前所有测试都先开一个会话，
+// 正好绕开了出问题的那条路。
+func TestZen_InputFocusFollowsScreen(t *testing.T) {
+	m := newSampleModel(t)
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	if m.input.Focused() {
+		t.Fatal("前提不成立：Normal 列表上输入框本该是失焦的")
+	}
+
+	m, _ = update(m, keyMsg("f2"))
+	if !m.input.Focused() {
+		t.Error("Zen 首页的输入框必须聚焦 —— 否则首页上打不了字")
+	}
+
+	m, _ = update(m, keyMsg("tab"))
+	if m.input.Focused() {
+		t.Error("Zen 列表上没有输入，输入框该失焦")
+	}
+
+	// 回首页要重新聚焦。这就是用户报的那条路：F2 → Tab → Esc。
+	m, _ = update(m, keyMsg("esc"))
+	if !m.input.Focused() {
+		t.Error("从列表回首页后输入框必须重新聚焦")
+	}
+
+	// 出 Zen 回到 Normal 列表，输入框也该是失焦的。
+	m, _ = update(m, keyMsg("f2"))
+	if m.input.Focused() {
+		t.Error("退回 Normal 列表后输入框不该还聚焦着")
+	}
+}
+
+// 首页能真的把字打进去 —— 上面那条只验焦点，这条验端到端。
+func TestZen_HomeAcceptsTyping(t *testing.T) {
+	m := newSampleModel(t)
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ = update(m, keyMsg("f2"))
+
+	// 逐字敲进去，走真实的 textinput 更新路径。
+	for _, r := range "你好" {
+		m, _ = update(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if got := m.input.Value(); got != "你好" {
+		t.Errorf("首页输入框收到的是 %q，want %q —— 焦点没设对", got, "你好")
+	}
+}
+
 // 字标各行的宽度必须和 lipgloss 那把尺子一致。
 //
 // 字标里全是 █ ╗ ╔ ╚ ═ ║ 这类 East Asian Ambiguous 字符。本仓库的

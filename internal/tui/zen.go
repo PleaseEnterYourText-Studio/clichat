@@ -130,6 +130,25 @@ func (m Model) zenInChat() bool {
 	return m.layout == layoutZen && m.zenScreen == zenChat
 }
 
+// setZenFocus 按当前 Zen 屏决定输入框要不要焦点。
+//
+// 首页和会话屏上用户是要打字的，必须聚焦；列表上没有输入，失焦。
+//
+// ⚠️ 这条是补一个**实测出来的 bug**：输入框的焦点原先一直「继承」着进 Zen
+// 之前的状态 —— 从 Normal 会话进 Zen 恰好是聚焦的（那边本来就在打字），所以
+// 一路没暴露；从 Normal **列表**进 Zen 就是失焦的，首页上打字毫无反应。
+//
+// 表现就是用户报的「f2 后 tab 有 bug」：F2 → Tab（去列表）→ Esc（回首页），
+// 输入框彻底哑了，敲什么都没用。而且失焦的输入框**看不出来**（提示符和占位
+// 文字都照画），所以只能靠按了没反应才发现。
+func (m *Model) setZenFocus() {
+	if m.zenScreen == zenList {
+		m.input.Blur()
+		return
+	}
+	m.input.Focus()
+}
+
 // applyInputStyle 按当前布局设置输入框的提示符与占位文字。
 //
 // 集中在一处：进 Zen、在 Zen 里换屏、从 Zen 里打开一个会话（enterThread 会
@@ -154,6 +173,14 @@ func (m *Model) toggleZen() {
 		m.layout = layoutNormal
 		m.zenShowHint = false
 		m.applyInputStyle()
+		// 出 Zen 时把焦点还原成「Normal 世界该有的样子」：会话里要聚焦，
+		// 列表里不该有。不还原的话，从 Zen 首页退回 Normal 列表会留下一个
+		// 隐形的聚焦输入框。
+		if m.mode == modeChat || m.mode == modeNewChat {
+			m.input.Focus()
+		} else {
+			m.input.Blur()
+		}
 		m.syncInputWidth()
 		m.clampChatScroll()
 		return
@@ -164,6 +191,7 @@ func (m *Model) toggleZen() {
 	// 进来先亮一下怎么用，用户按第一个键就收掉。
 	m.zenShowHint = true
 	m.applyInputStyle()
+	m.setZenFocus()
 	m.syncInputWidth()
 	m.clampChatScroll()
 }
@@ -172,6 +200,7 @@ func (m *Model) toggleZen() {
 func (m *Model) goZen(s zenScreen) {
 	m.zenScreen = s
 	m.applyInputStyle()
+	m.setZenFocus()
 	m.syncInputWidth()
 	m.clampChatScroll()
 }
