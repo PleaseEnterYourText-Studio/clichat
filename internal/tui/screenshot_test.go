@@ -93,8 +93,8 @@ func TestGenerateScreenshots(t *testing.T) {
 			width:  74,
 			height: 20,
 			drive: func(t *testing.T, m Model) Model {
-				// 搜「周」会命中三条（周五的产品评审 / 团队周报 / 周四下午），
-				// 既看得出在过滤，列表又不至于空荡荡。
+				// 搜「周」会命中四条（周五的产品评审 / 周末团建 / 第 40 周
+				// 团队周报 / 周四下午），既看得出在过滤，列表又不至于空荡荡。
 				m, _ = update(m, keyMsg("/"))
 				m, _ = update(m, keyMsg("周"))
 				return m
@@ -229,6 +229,33 @@ func newSampleModel(t *testing.T) Model {
 			"1. 上季度数据回顾\n1. 接口文档里剩下的 TBD\n1. 新版设计稿\n\n"+
 			"会议链接：[meeting.example.com/abc-def-ghi](https://meeting.example.com/abc-def-ghi)\n\n"+
 			"**注意**：资料在共享盘，看**新版**那份，旧版有几处数字是错的。")
+
+	// 这条的正文**在测试时由真实的生成器算出来**（HTMLToMarkdown 对一段
+	// 真 HTML 的产出），不是手抄的字符串。
+	//
+	// 刻意的形状：一个数据表 + 单元格里带 alt 的状态图标 —— 就是用户
+	// 截图里那封 DeepSeek 服务状态邮件的样子。改前这两样渲染器都不认，
+	// 屏幕上会出现 `!perational` 和 `| 组件 | 状态 |` 这种半截源码。
+	// 让它跟着真生成器走，截图就不可能和实际管线脱节。
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p14@x>", References: []string{"<p1@x>"},
+		From: "bob@example.com", FromName: "Bob", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(86 * time.Minute),
+	}, mail.HTMLToMarkdown(
+		`<p>上周的故障复盘我整理了一下：</p>`+
+			`<table>`+
+			`<tr><th>组件</th><th>状态</th><th>影响</th></tr>`+
+			`<tr><td>API 接口</td>`+
+			`<td><img src="https://status.example.com/ok.svg" alt="Operational"></td>`+
+			`<td>无</td></tr>`+
+			`<tr><td>消息推送</td>`+
+			`<td><img src="https://status.example.com/ok.svg" alt="Operational"></td>`+
+			`<td>延缓 12 分钟</td></tr>`+
+			`<tr><td>数据同步</td>`+
+			`<td><img src="https://status.example.com/warn.svg" alt="Degraded"></td>`+
+			`<td>延缓 40 分钟</td></tr>`+
+			`</table>`+
+			`<p>现在都恢复了，细节在共享盘。</p>`))
 
 	// —— 1:1，两条未读 ——
 	fake.AddMessage("INBOX", mail.Header{

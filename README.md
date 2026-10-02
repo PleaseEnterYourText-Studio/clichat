@@ -142,8 +142,8 @@ and the process list.
   in it. See [HTML mail, turned into
   Markdown](#html-mail-turned-into-markdown) for how
 - …and that Markdown is rendered back into terminal styling — headings lose
-  their hashes, list items get real numbers, links stay clickable. You read
-  mail, not markup
+  their hashes, list items get real numbers, tables come out as aligned columns,
+  images show their `alt` text, links stay clickable. You read mail, not markup
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -196,6 +196,11 @@ emitting Markdown. The rules it follows:
 - **Image buttons use their `alt`.** `<a><img alt="View order"></a>` is how a
   lot of transactional mail ships its buttons. A terminal cannot show the
   image, and `alt` is exactly the text the sender wrote for when it cannot.
+- **A bare `<img>` becomes `![alt](src)`.** Same reasoning, minus the link: the
+  `alt` is all a terminal can show. With no `alt` and no `title` to fall back
+  on, it becomes a placeholder word rather than an empty label — an empty label
+  still leaves the `src` on screen, and that `src` is usually a tracking URL
+  carrying an identifier of yours.
 - **Emphasis is wrapped around the content, not the element.** `**hello **`
   does not render as bold — the trailing space pushes the marker off — so
   `<b>hello </b>world` has to come out as `**hello** world`, with the space
@@ -227,6 +232,21 @@ backtick, `_`, `[`, `]` and `<` that came from the mail was escaped into
 `\<char>` on the way out. So an unescaped `*` is always one of ours, and the
 parser can be exact where a general-purpose one has to guess.
 
+**Closed means closed, and that is the part that broke.** Two things the
+generator had been emitting for a long time were never taught to the renderer:
+`![alt](src)` and Markdown tables. Neither failed loudly. They came out as
+markup — `![Operational](…)` rendered as `!perational` (the `!` survives, the
+image does not), a status table rendered as three lines of `| 组件 | 状态 |`,
+and `![](url)` put a whole tracking URL in the middle of the conversation.
+
+The lesson is in the test suite now. The renderer's test file ends with a
+**cross-package invariant**: real HTML goes through the *real* generator and
+then the *real* renderer, and the result is checked for both halves — no markup
+may reach the screen, and the text must still be there. Testing each side on
+its own is exactly how this got through; both suites were green while the
+seam between them was empty. Whenever the generator learns a new syntax, that
+test should be the thing that tells you the renderer has not.
+
 Two details that decide whether it looks right:
 
 - **Wrapping happens on plain text, before any colour is applied.** A colour
@@ -237,6 +257,13 @@ Two details that decide whether it looks right:
   the renderer emits a separate sequence per character, which shreds the
   clickable-link sequence: the link still *looks* right and simply stops
   working. Clichat would rather have a clickable link than a decorated one.
+
+Tables get one extra rule: **they do not wrap.** Break a table row across lines
+and the columns stop lining up, at which point the table is worse than the
+plain text it replaced. So an over-wide table is truncated column by column —
+narrow columns like a status word are never squeezed for the sake of a wide
+one — and only at absurdly narrow widths does it give up on alignment entirely
+and lay the cells out as ordinary wrapped text.
 
 ## Keyboard Shortcuts
 

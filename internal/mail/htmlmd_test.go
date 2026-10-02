@@ -41,6 +41,24 @@ func TestHTMLToMarkdown_Links(t *testing.T) {
 			"[图片](https://ex.com/x)",
 		},
 		{
+			// 空链接 + aria-label：不认这个属性就只能把整条地址显出来，
+			// 而发件人明明写好了「查看订单」。
+			"空链接回退到 aria-label",
+			`<a href="https://ex.com/x" aria-label="查看订单"></a>`,
+			"[查看订单](https://ex.com/x)",
+		},
+		{
+			"空链接回退到 title",
+			`<a href="https://ex.com/x" title="查看订单"></a>`,
+			"[查看订单](https://ex.com/x)",
+		},
+		{
+			// 链接文字优先于 aria-label —— 正文里看得见的那句话更该显示。
+			"链接文字优先于 aria-label",
+			`<a href="https://ex.com/x" aria-label="查看订单">订单详情</a>`,
+			"[订单详情](https://ex.com/x)",
+		},
+		{
 			// 空的 "#" 点了没反应，不该做成链接。
 			"锚点占位",
 			`<a href="#">展开全文</a>`,
@@ -173,6 +191,47 @@ func TestHTMLToMarkdown_Buttons(t *testing.T) {
 			"隐藏型 input 丢掉",
 			`<p>甲<input type="hidden" value="csrf123">乙</p>`,
 			"甲乙",
+		},
+		{
+			// 标签文字里的标记字符只能转义**一层**。renderInline 的产出
+			// 已经转义过了，再 EscapeMarkdown 一遍就会多出反斜杠，
+			// 屏幕上显示成 a\*b。
+			"按钮文字里的标记字符只转义一层",
+			`<button>去支付*现在</button>`,
+			`**去支付\*现在**`,
+		},
+		{
+			"按钮文字里带标记且是链接",
+			`<button data-href="https://ex.com/go">去支付*现在</button>`,
+			`[去支付\*现在](https://ex.com/go)`,
+		},
+		{
+			// aria-label 是发件人写给读屏软件的按钮名，本地就有。
+			// 只写 aria-label、正文一个字都没有的按钮很常见 ——
+			// 不认它的话整个按钮会从正文里消失。
+			"button 只有 aria-label",
+			`<button aria-label="确认订阅"></button>`,
+			"**确认订阅**",
+		},
+		{
+			"button 的 aria-label 加地址",
+			`<button aria-label="确认订阅" data-href="https://ex.com/s"></button>`,
+			"[确认订阅](https://ex.com/s)",
+		},
+		{
+			"button 只有 title",
+			`<button title="确认订阅"></button>`,
+			"**确认订阅**",
+		},
+		{
+			"button 的文字优先于 aria-label",
+			`<button aria-label="确认订阅">立即确认</button>`,
+			"**立即确认**",
+		},
+		{
+			"submit 只有 aria-label",
+			`<input type="submit" aria-label="提交订单">`,
+			"**提交订单**",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -480,13 +539,30 @@ func TestHTMLToMarkdown_Images(t *testing.T) {
 		want string
 	}{
 		{"带 alt", `<img src="https://ex.com/a.png" alt="折线图">`, "![折线图](https://ex.com/a.png)"},
-		{"无 alt", `<img src="https://ex.com/a.png">`, "![](https://ex.com/a.png)"},
+		// 没有 alt / title 时用占位文字，**不能**留空标签：留空就写出
+		// ![](src)，图没了、地址还在 —— 那串地址通常带用户标识。
+		{"无 alt", `<img src="https://ex.com/a.png">`, "![图片](https://ex.com/a.png)"},
 		{"回退到 title", `<img src="https://ex.com/a.png" title="说明">`, "![说明](https://ex.com/a.png)"},
+		// aria-label 优先于 title：它是专门为「图看不见时」写的名字。
+		{"回退到 aria-label", `<img src="https://ex.com/a.png" aria-label="折线图">`, "![折线图](https://ex.com/a.png)"},
+		{"alt 优先于 aria-label", `<img src="https://ex.com/a.png" alt="甲" aria-label="乙">`, "![甲](https://ex.com/a.png)"},
 		{"无 src 丢掉", `<img alt="空图">`, ""},
 		{
 			"alt 里的方括号要转义",
 			`<img src="https://ex.com/a.png" alt="图[1]">`,
 			`![图\[1\]](https://ex.com/a.png)`,
+		},
+		{
+			// 图自己没标签、外面那个链接上有 —— 文字是给读屏软件准备的，
+			// 正好就是「这个按钮叫什么」。
+			"图片按钮回退到外层的 aria-label",
+			`<a href="https://ex.com/o" aria-label="查看订单"><img src="https://ex.com/b.png"></a>`,
+			"[查看订单](https://ex.com/o)",
+		},
+		{
+			"图自己的标签优先于外层",
+			`<a href="https://ex.com/o" aria-label="查看订单"><img src="https://ex.com/b.png" alt="看图"></a>`,
+			"[看图](https://ex.com/o)",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

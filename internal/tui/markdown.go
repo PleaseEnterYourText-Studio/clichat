@@ -15,10 +15,13 @@ import (
 // internal/mail/htmlmd.go）。所以语法集合是**封闭且已知**的：
 //
 //	**粗体**  *斜体*  ~~删除线~~  `行内代码`
-//	[文字](链接)  <自动链接>
+//	[文字](链接)  ![替代文字](图片地址)  <自动链接>
 //	# 标题（1-6 级）  ---  分隔线
 //	> 引用
 //	- 列表项 / 1. 列表项（嵌套用两空格缩进）
+//	| 表头 | 表头 |
+//	| --- | --- |
+//	| 单元格 | 单元格 |
 //	``` 围栏代码块 ```
 //
 // 这一点是整套做法的地基：生成器会把正文里出现的 \ ` * _ [ ] < 一律
@@ -26,6 +29,17 @@ import (
 // 写的标记，转义的才是用户的字面文字**。解析因此可以是确定性的，不需要
 // 通用解析器那种「* 后面不能跟空格才算强调」的模糊启发式 —— 那种启发式
 // 在中文和邮件排版里经常猜错。
+//
+// # ⚠️ 这里的语法集合必须和生成端**相等**
+//
+// 「封闭已知」是个承诺：生成端写得出什么，这里就得认得出什么。承诺一旦
+// 打破，表现不是报错，而是**标记原样铺进聊天流** —— 用户看到的是
+// `!perational`、`| 接口 | 正常 |` 这种半截源码，比不渲染还难读。
+//
+// 2026-10-02 就是这么翻的车：生成端写 ![](src) 和表格已经很久了，渲染端
+// 两个都不认。所以新增生成端语法时，**同一个改动里**要在这里补上对应分支，
+// 两边各加一条判据。守着这条的是 markdown_test.go 里那组「生成端产出 →
+// 渲染端不留标记」的用例。
 //
 // # 为什么不用现成的库
 //
@@ -88,12 +102,18 @@ const (
 	blockQuote
 	blockBullet
 	blockRule
+	// blockTableHead 是表格的表头行。分隔行（| --- | --- |）不单独成行 ——
+	// 它存在的意义只是告诉解析器「上一行是表头」，然后就被丢掉。
+	blockTableHead
+	// blockTableRow 是表格的数据行。表格**按整块**渲染（见 renderTableBlock），
+	// 所以要靠连续的 kind 把它的行圈出来。
+	blockTableRow
 )
 
 // mdLine 是解析出来的一行（还没折行）。
 type mdLine struct {
 	kind  blockKind
-	level int // 标题级别（1-6）
+	level int // 标题级别（1-6）；表格里不用
 
 	// prefix 是第一行的纯文本前缀（"• "、"1. "、"> "）。它是**纯文本**，
 	// 所以折行时它的宽度会一起算进去，上色不会影响折行位置。
@@ -101,9 +121,24 @@ type mdLine struct {
 	prefixAttrs attrs
 
 	spans []span
+
+	// cells 只在表格行上有值，每格是一段行内内容。
+	//
+	// 单元格里可以有行内标记：生成端走的是 cellText → blockBuilder，
+	// 加粗、链接都留得下来（见 htmlmd.go）。所以这里存的是解析好的
+	// 片段而不是纯文本，渲染时照样要过 styleSpan。
+	cells [][]span
 }
 
 // ---- 入口 ----
+
+// imageFallback 是替代文字为空时渲染器自己的兜底。
+//
+// 生成端已经用 imagePlaceholder 兜过一层（见 htmlmd.go 的 imageLabel），
+// 所以这个分支正常走不到。留着是因为渲染器的输入不止「刚生成的正文」——
+// 存量邮件里就存着改前生成的 ![](src)。真走到这里还没兜住的话，一整条
+// 地址（常带用户标识）会直接铺进聊天流，那比少显示一个词糟得多。
+const imageFallback = "图片"
 
 // renderMarkdown 把邮件正文渲染成终端里的若干行。
 //
@@ -114,21 +149,39 @@ func renderMarkdown(src string, width int) []string {
 		width = 1
 	}
 
+	lines := parseMarkdown(src)
 	var out []string
-	for _, ln := range parseMarkdown(src) {
+	for i := 0; i < len(lines); {
+		ln := lines[i]
+
+		// 表格要整块拿到手才能对齐：列宽是所有行的最大值。所以先按连续
+		// 的 kind 把这一块圈出来，单独走 renderTableBlock。
+		if ln.kind == blockTableHead {
+			j := i + 1
+			for j < len(lines) && lines[j].kind == blockTableRow {
+				j++
+			}
+			out = append(out, renderTableBlock(lines[i:j], width)...)
+			i = j
+			continue
+		}
+
 		if ln.kind == blockRule {
 			// 分隔线画成一条实心横线，比原样的 "---" 更像分隔线。
 			// 限长 40 列：横贯整个屏幕在聊天视图里太吵。
 			out = append(out, styleMDRule.Render(strings.Repeat("─", min(width, 40))))
+			i++
 			continue
 		}
 		if ln.kind == blockPara && len(ln.spans) == 0 {
 			out = append(out, "")
+			i++
 			continue
 		}
 		for _, row := range wrapLine(ln, width) {
 			out = append(out, renderRow(row))
 		}
+		i++
 	}
 	return out
 }
@@ -136,6 +189,9 @@ func renderMarkdown(src string, width int) []string {
 // ---- 解析 ----
 
 // parseMarkdown 把正文按行解析成块。
+//
+// 用下标遍历而不是 range：表格是**多行**结构，识别表头时要往后看一行
+// （分隔行），认下来之后还要一次吃掉后续的数据行。
 func parseMarkdown(src string) []mdLine {
 	var out []mdLine
 	lines := strings.Split(src, "\n")
@@ -143,7 +199,9 @@ func parseMarkdown(src string) []mdLine {
 	fence := 0 // 围栏代码块的反引号个数，0 表示不在代码块里
 	ol := 0    // 连续有序列表项的计数，遇到别的东西归零
 
-	for _, raw := range lines {
+	for i := 0; i < len(lines); i++ {
+		raw := lines[i]
+
 		// 围栏代码块：里面的内容原样保留，不做任何行内解析 ——
 		// 代码里的 * 和 [ 是代码，不是标记。
 		if n, ok := fenceRun(raw); ok {
@@ -214,6 +272,25 @@ func parseMarkdown(src string) []mdLine {
 				prefix: strings.Repeat("  ", indent) + marker,
 				spans:  parseInline(rest, 0),
 			})
+			continue
+		}
+
+		// 表格：本行是 | … |，且**下一行是分隔行**才认。
+		//
+		// 只靠「以 | 开头」认不行 —— 正文里孤零零一行带竖线的句子就会
+		// 被误判成表格。分隔行是生成端一定会写的（见 htmlmd.go 的
+		// renderTable），拿它当凭据最稳。分隔行本身没有渲染价值，吃掉。
+		if isTableRow(trimmed) && i+1 < len(lines) && isTableSep(lines[i+1]) {
+			out = append(out, mdLine{kind: blockTableHead, cells: tableCells(trimmed)})
+			j := i + 2
+			for ; j < len(lines) && isTableRow(strings.TrimSpace(lines[j])); j++ {
+				out = append(out, mdLine{
+					kind:  blockTableRow,
+					cells: tableCells(strings.TrimSpace(lines[j])),
+				})
+			}
+			i = j - 1
+			ol = 0
 			continue
 		}
 
@@ -316,6 +393,81 @@ func bullet(s string) (level int, marker, rest string, ok bool) {
 	return 0, "", "", false
 }
 
+// ---- 表格 ----
+
+// isTableRow 判断一行是不是表格行（以 | 开头、以 | 结尾）。
+//
+// 两边都要有竖线：生成端写的正是 `| a | b |` 这种带边框的形式（见
+// htmlmd.go 的 renderTable），中间那种不带边框的写法它不产出，不认也罢。
+func isTableRow(s string) bool {
+	return len(s) >= 2 && strings.HasPrefix(s, "|") && strings.HasSuffix(s, "|")
+}
+
+// isTableSep 判断一行是不是表头下面的分隔行（| --- | --- |）。
+//
+// 允许冒号（对齐标记 :---:），虽然生成端只写 "---"。至少要有一个短横，
+// 否则 `| | |` 这种空行也会被当成分隔行。
+func isTableSep(s string) bool {
+	t := strings.TrimSpace(s)
+	if !isTableRow(t) {
+		return false
+	}
+	dash := false
+	for _, r := range t {
+		switch r {
+		case '-':
+			dash = true
+		case '|', ':', ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return dash
+}
+
+// tableCells 把一行表格拆成若干个解析好的单元格。
+//
+// 拆列要按**未转义**的 | 切：单元格里的 | 被生成端转义成了 \|（见
+// escapeMarkdownRune 的 inTable），那是内容，不是列界。
+func tableCells(line string) [][]span {
+	raw := splitTableRow(line)
+	out := make([][]span, 0, len(raw))
+	for _, c := range raw {
+		out = append(out, parseInline(c, 0))
+	}
+	return out
+}
+
+// splitTableRow 按未转义的 | 拆出一行的各列，去掉首尾边框。
+//
+// 保留单元格里的 \| 转义不还原 —— 交给 parseInline，它认得 \ 转义。
+func splitTableRow(s string) []string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "|")
+	s = strings.TrimSuffix(s, "|")
+
+	var out []string
+	var cur strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			// 反斜杠连同它后面的字符一起留下，别在这一层还原 ——
+			// 生成端把 \ 本身也转义成 \\，先还原会把两种情况弄混。
+			cur.WriteByte(s[i])
+			cur.WriteByte(s[i+1])
+			i++
+			continue
+		}
+		if s[i] == '|' {
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(s[i])
+	}
+	out = append(out, strings.TrimSpace(cur.String()))
+	return out
+}
+
 // ---- 行内解析 ----
 
 // parseInline 解析一段行内 Markdown。
@@ -389,6 +541,26 @@ func parseInline(s string, base attrs) []span {
 			emit("[", base, "")
 			i++
 
+		case strings.HasPrefix(s[i:], "!["):
+			// 图片。终端里画不出图，替代文字（alt / title）就是这张图
+			// **唯一**能留下的信息，所以直接把它当文字显示，不加标记 ——
+			// 和 anchor 里图片按钮的做法一致（那里也是只显示 alt，
+			// 见 htmlmd.go）。
+			//
+			// 改之前没有这个分支：![Operational](ok.svg) 会走成
+			// 「普通字符 ! + 链接 [Operational](ok.svg)」，显示成
+			// !Operational —— 用户看到的半截源码就是这个。
+			if label, _, next, ok := imageAt(s, i); ok {
+				if label == "" {
+					label = imageFallback // 见常量处说明：绝不能把地址漏出去
+				}
+				emit(label, base, "")
+				i = next
+				continue
+			}
+			emit("!", base, "")
+			i++
+
 		case s[i] == '<':
 			if url, next, ok := autolinkAt(s, i); ok {
 				emit(url, attrLink, url)
@@ -416,9 +588,12 @@ func parseInline(s string, base attrs) []span {
 // 注意 `(` 和 `)` 不在内 —— 它们只在 [文字](链接) 的上下文里才有意义，
 // 而那个上下文由 `[` 触发。把它们也算成标记开头，只会让正文里普通的
 // 括号把字符串切得七零八落。
+//
+// `!` 得算：图片是 ![。虽然单独一个感叹号不是标记，但把它算进来只是让
+// 普通文本多切一段（emit 会把同样式的相邻段并回去），代价远小于漏掉图片。
 func isMarkerByte(c byte) bool {
 	switch c {
-	case '\\', '*', '~', '`', '[', '<':
+	case '\\', '*', '~', '`', '[', '<', '!':
 		return true
 	}
 	return false
@@ -532,6 +707,55 @@ func linkAt(s string, i int) (text, url string, next int, ok bool) {
 		return "", "", 0, false
 	}
 	return text, url, end + 1, true
+}
+
+// imageAt 解析 ![替代文字](图片地址)。
+//
+// 形状和 linkAt 一样，差别只有两个：
+//   - 替代文字**允许为空**（![ ](src) 合法，生成端也真的会写），空与否
+//     由调用方决定怎么兜底；
+//   - 返回的地址用不上，这里只是要正确跳过它 —— 终端画不出图。
+//
+// 闭合的 ] 取第一个就行：生成端把标签里的 ] 转义成了 \]（EscapeMarkdown），
+// 未转义的 ] 一定是结尾。地址里的 ( ) 没被转义，所以要深度配平着找。
+func imageAt(s string, i int) (label, url string, next int, ok bool) {
+	// s[i:] 以 "![" 开头
+	closeIdx := strings.IndexByte(s[i+2:], ']')
+	if closeIdx < 0 {
+		return "", "", 0, false
+	}
+	closeIdx += i + 2
+	if closeIdx+1 >= len(s) || s[closeIdx+1] != '(' {
+		return "", "", 0, false
+	}
+
+	depth := 0
+	end := -1
+	for j := closeIdx + 2; j < len(s); j++ {
+		switch s[j] {
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				end = j
+			} else {
+				depth--
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return "", "", 0, false
+	}
+
+	url = s[closeIdx+2 : end]
+	if url == "" {
+		// 没有地址就不是图片语法，交给调用方按普通字符处理。
+		return "", "", 0, false
+	}
+	return s[i+2 : closeIdx], url, end + 1, true
 }
 
 // autolinkAt 解析 <自动链接>。
@@ -687,6 +911,214 @@ func renderRow(spans []span) string {
 		b.WriteString(styleSpan(s))
 	}
 	return b.String()
+}
+
+// spansWidth 量一段片段的显示宽度。
+//
+// 直接对**未上色的文本**求和，不能用 lipgloss.Width(renderRow(...))：
+// 后者要认识 SGR 和 OSC 8 才算得对，而 OSC 8（超链接）lipgloss 的宽度
+// 算法并不一定认。文本宽度是折行和对齐的**唯一**依据，这里必须是自己
+// 说了算的。
+func spansWidth(spans []span) int {
+	w := 0
+	for _, s := range spans {
+		w += textWidth(s.text)
+	}
+	return w
+}
+
+// boldSpans 给整段加粗，返回新切片（不改调用方的那份）。
+//
+// 不在这里特判链接：链接「只上前景色、忽略其它属性」这条规矩**集中在
+// styleSpan 里**，那里是唯一的出口。在这儿再挡一次看着更保险，其实
+// 是不可观测的死代码（叠上 attrBold 也被 styleSpan 抹掉），而「看着
+// 像在守着什么」的死代码比没有更糟。守着这条的是
+// TestRenderMarkdown_BoldAroundLinkDoesNotBoldTheLinkText。
+func boldSpans(spans []span) []span {
+	out := make([]span, len(spans))
+	copy(out, spans)
+	for i := range out {
+		out[i].attrs |= attrBold
+	}
+	return out
+}
+
+// truncateSpans 把一段片段截到 width 列以内，截断处补省略号。
+//
+// 得自己写：styles.go 里的 truncate 吃的是「纯文本 + 已经上好的色」，
+// 而这里手里是片段。先截片段、再上色，顺序不能反 —— 反过来就会把转义
+// 序列拦腰剪断。
+func truncateSpans(spans []span, width int) []span {
+	if spansWidth(spans) <= width {
+		return spans
+	}
+	if width <= 0 {
+		return nil
+	}
+
+	var out []span
+	used := 0
+	for _, s := range spans {
+		room := width - used
+		if room <= 0 {
+			break
+		}
+		if textWidth(s.text) <= room {
+			out = append(out, s)
+			used += textWidth(s.text)
+			continue
+		}
+		// 这一段放不下，逐字吃到剩最后一列，再补省略号。
+		var b strings.Builder
+		w := 0
+		for _, r := range s.text {
+			rw := cellWidth(r)
+			if w+rw > room-1 {
+				break
+			}
+			b.WriteRune(r)
+			w += rw
+		}
+		if b.Len() > 0 {
+			out = append(out, span{text: b.String(), attrs: s.attrs, url: s.url})
+		}
+		return append(out, span{text: "…", attrs: s.attrs})
+	}
+	return out
+}
+
+// 表格列之间的空隙宽度。两列："| 名称 | 状态 |" 渲染成 "名称  状态"。
+const tableGap = 2
+
+// 列被压到多窄就不再压了。再窄下去每格只剩两三个字，认不出内容。
+const tableMinCol = 4
+
+// renderTableBlock 把整张表渲染成对齐的若干行。
+//
+//   - 表头加粗，下面压一条细横线；
+//   - 列宽取该列所有行的最大显示宽度，右补空格对齐；
+//   - **不折行，超宽就截断**：表格一旦折行，列就对不上了，那还不如
+//     把每一行老老实实截短。窄列（状态、序号）通常短，按渲染宽度把
+//     最宽的那列逐步收回，短列不会被无谓地截。
+//
+// rows[0] 是表头，其余是数据行。
+func renderTableBlock(rows []mdLine, width int) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	cols := 0
+	for _, r := range rows {
+		if len(r.cells) > cols {
+			cols = len(r.cells)
+		}
+	}
+	if cols == 0 {
+		return nil
+	}
+
+	// 列宽：每列所有单元格的最大宽度。
+	w := make([]int, cols)
+	for _, r := range rows {
+		for j, c := range r.cells {
+			if n := spansWidth(c); n > w[j] {
+				w[j] = n
+			}
+		}
+	}
+
+	// 超出可用宽度就从最宽的那列开始收，收到最小宽度为止。
+	avail := width - tableGap*(cols-1)
+	for sumInts(w) > avail {
+		k := 0
+		for j := range w {
+			if w[j] > w[k] {
+				k = j
+			}
+		}
+		if w[k] <= tableMinCol {
+			break
+		}
+		w[k]--
+	}
+
+	// 连最小列宽都塞不下（终端极窄）时，对齐已经没有意义了 —— 退回
+	// 「一格一格铺开」，交给普通折行。表格是为「看对齐」而存在的；
+	// 塞不下的时候，对它的要求只剩「一格都别丢」这一条。
+	if sumInts(w) > avail {
+		return wrapTableAsParagraphs(rows, width)
+	}
+
+	var out []string
+	for i, r := range rows {
+		cells := r.cells
+		if i == 0 {
+			// 表头：加粗，并补一条分隔线。
+			cells = make([][]span, cols)
+			for j := range cells {
+				if j < len(r.cells) {
+					cells[j] = boldSpans(r.cells[j])
+				}
+			}
+		}
+
+		var b strings.Builder
+		for j := 0; j < cols; j++ {
+			if j > 0 {
+				b.WriteString(strings.Repeat(" ", tableGap))
+			}
+			var cell []span
+			if j < len(cells) {
+				cell = truncateSpans(cells[j], w[j])
+			}
+			b.WriteString(renderRow(cell))
+			b.WriteString(strings.Repeat(" ", w[j]-spansWidth(cell)))
+		}
+		out = append(out, strings.TrimRight(b.String(), " "))
+
+		if i == 0 {
+			// 表头下面那条线，用和分隔线同一个灰。
+			var rule strings.Builder
+			for j := 0; j < cols; j++ {
+				if j > 0 {
+					rule.WriteString(strings.Repeat(" ", tableGap))
+				}
+				rule.WriteString(strings.Repeat("─", w[j]))
+			}
+			out = append(out, styleMDRule.Render(strings.TrimRight(rule.String(), " ")))
+		}
+	}
+	return out
+}
+
+// sumInts 求一串整数的和。
+func sumInts(xs []int) int {
+	n := 0
+	for _, x := range xs {
+		n += x
+	}
+	return n
+}
+
+// wrapTableAsParagraphs 是极窄终端的降级：把每一行铺成一段，交给普通折行。
+//
+// 丢了对齐，但一格内容都不丢，而且**必定**能折进给定宽度 —— 表格渲染
+// 那条路给不了这个保证（列宽最多收到 tableMinCol，再窄就收不动了）。
+func wrapTableAsParagraphs(rows []mdLine, width int) []string {
+	var out []string
+	for _, r := range rows {
+		var spans []span
+		for j, c := range r.cells {
+			if j > 0 {
+				spans = append(spans, span{text: "  ·  "})
+			}
+			spans = append(spans, c...)
+		}
+		for _, row := range wrapLine(mdLine{spans: spans}, width) {
+			out = append(out, renderRow(row))
+		}
+	}
+	return out
 }
 
 // styleSpan 给一段文本上色。

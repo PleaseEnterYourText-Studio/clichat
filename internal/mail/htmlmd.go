@@ -421,7 +421,12 @@ func splitSurroundingSpace(s string) (lead, core, trail string) {
 
 // ---- 链接与按钮 ----
 
-// imagePlaceholder 是「图挂了、alt 和 title 也空着」时给链接用的占位文字。
+// imagePlaceholder 是图片没有 alt 也没有 title 时的占位文字。
+//
+// 它是**生成端**的兜底，两条图片路径共用：包在链接里的图片按钮（anchor）
+// 和裸露的图片（renderImage）。留空的话产出的 Markdown 会变成
+// ![图片](https://…) → 改前是 ![](https://…)，标签是空的、地址还在，
+// 任何读取这份 Markdown 的地方都会看到一长串带用户标识的 URL。
 const imagePlaceholder = "图片"
 
 // anchor 把 <a> 转成 Markdown 链接。
@@ -448,11 +453,17 @@ func (b *blockBuilder) anchor(n *html.Node) {
 	// 写成 [![查看订单](btn.png)](href) 那种嵌套的话，在终端里等于
 	// 把链接藏起来了，用户看不到「这里能点」。
 	if img := soleImage(n); img != nil {
+		// 链接文字取图片的标签。imageLabel 保证不会返回空串 ——
+		// 链接文字是用户唯一能看出「这里能点」的线索，宁可写个占位，
+		// 也别留空。
 		label := imageLabel(img)
-		if label == "" {
-			// alt 和 title 都空着。链接文字是用户唯一能看出「能点」的
-			// 线索，宁可写个占位，也别留空。
-			label = imagePlaceholder
+		if label == imagePlaceholder {
+			// 图自己没标签，看看外面那个链接上有没有。
+			// `<a aria-label="查看订单"><img src="btn.png"></a>` 是常见写法：
+			// 文字是给读屏软件准备的，正好是我们要的那句话。
+			if s := labelAttr(n); s != "" {
+				label = s
+			}
 		}
 		b.raw("[" + EscapeMarkdown(label) + "](" + href + ")")
 		return
@@ -467,8 +478,13 @@ func (b *blockBuilder) anchor(n *html.Node) {
 	b.applyRange(start, func(lead, core, trail string) string {
 		switch {
 		case core == "":
-			// 链接里没文字（空 <a> 或只有空白）：把地址本身显出来。
-			// 总比整条链接消失好。
+			// 链接里没文字（空 <a> 或只有空白）。先看 aria-label / title：
+			// 那通常是发件人写给读屏软件的按钮名（「查看订单」），比整条
+			// 地址可读得多，而且本地就有。
+			if s := labelAttr(n); s != "" {
+				return lead + "[" + EscapeMarkdown(s) + "](" + href + ")" + trail
+			}
+			// 都没有就把地址本身显出来。总比整条链接消失好。
 			return lead + "[" + href + "](" + href + ")" + trail
 
 		case text == href && autolinkSafe(href):
@@ -536,9 +552,18 @@ func renderImage(n *html.Node) string {
 // 能当链接用（formaction / data-href / onclick 里的 URL），有就转成链接，
 // 没有就加粗 —— 加粗至少能让它在正文里显出来「这里本来是个按钮」。
 func renderButtonish(n *html.Node) string {
+	// 标签有两个来源，**转义状态不同**，所以不能算完再统一转义一遍：
+	//   - renderInline 的产出**已经**转义过（它走的是 blockBuilder.text）
+	//   - value / aria-label / title 是原始属性值，还没转义
+	// 原先两种情况都丢给 EscapeMarkdown，于是文字里本来就有 * 的按钮会多出
+	// 一层反斜杠：`<button>a*b</button>` 显示成 a\*b 而不是 a*b。
 	text := strings.TrimSpace(renderInline(n))
 	if text == "" {
-		text = strings.TrimSpace(attr(n, "value"))
+		label := strings.TrimSpace(attr(n, "value"))
+		if label == "" {
+			label = labelAttr(n)
+		}
+		text = EscapeMarkdown(label)
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -546,9 +571,9 @@ func renderButtonish(n *html.Node) string {
 	}
 
 	if url := linkURL(n); url != "" {
-		return "[" + EscapeMarkdown(text) + "](" + url + ")"
+		return "[" + text + "](" + url + ")"
 	}
-	return wrapInline(EscapeMarkdown(text), "**")
+	return wrapInline(text, "**")
 }
 
 // renderInput 处理 <input>。
@@ -567,6 +592,9 @@ func renderInput(n *html.Node) string {
 	text := strings.TrimSpace(attr(n, "value"))
 	if text == "" {
 		text = strings.TrimSpace(attr(n, "alt"))
+	}
+	if text == "" {
+		text = labelAttr(n)
 	}
 	if text == "" {
 		return ""
@@ -1005,12 +1033,34 @@ func isTrackingPixel(n *html.Node) bool {
 	return false
 }
 
-// imageLabel 取一张图的文字标签：alt 优先，其次 title，都没有就是空串。
+// imageLabel 取一张图的文字标签：alt 优先，其次 aria-label / title，
+// 都没有就是占位文字。
+//
+// 终端里显示不了图，这个标签是这张图**唯一**能留下的信息。返回空串的话
+// renderImage 会写出 ![](src) —— 图没了，地址却留了下来。
 func imageLabel(img *html.Node) string {
 	if s := strings.TrimSpace(attr(img, "alt")); s != "" {
 		return s
 	}
-	return strings.TrimSpace(attr(img, "title"))
+	if s := labelAttr(img); s != "" {
+		return s
+	}
+	return imagePlaceholder
+}
+
+// labelAttr 取元素上「给人读的标签」：aria-label 优先，其次 title。
+//
+// 这一段刻意只用**本地就在手上**的信息。邮件模板为了「图挂了也读得出来、
+// 读屏软件也读得出来」，常把按钮文字写在 aria-label 里；有些模板甚至只写
+// aria-label，正文一个字都没有。同一件事还有第三种做法 —— 去抓目标网页的
+// <title> —— 那要发网络请求、会通知对方「我读了这封信」（正是
+// isTrackingPixel 在挡的那种事）、还会被短链重定向绕开。同样的信息
+// 本地就有，没有理由上网拿。
+func labelAttr(n *html.Node) string {
+	if s := strings.TrimSpace(attr(n, "aria-label")); s != "" {
+		return s
+	}
+	return strings.TrimSpace(attr(n, "title"))
 }
 
 // soleImage 判断 n 的子树里是否只有一个有意义的节点，且它是 <img>。
