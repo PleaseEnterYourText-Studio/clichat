@@ -3,6 +3,8 @@ package mail
 import (
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-imap"
 )
 
 // 这个测试守着两个容易写错、写错代价又很大的点：
@@ -228,5 +230,97 @@ func TestHeaders_WorksWhenServerOmitsUIDNext(t *testing.T) {
 	if len(headers) != 3 {
 		t.Errorf("UIDNEXT 未知时应该仍然拉到 3 封，实际 %d 封 —— "+
 			"这正是 126 收件箱空着的病根", len(headers))
+	}
+}
+
+// Message-ID 必须能**从原始头里拿到**，不能只靠 ENVELOPE。
+//
+// 实测（2026-10-03，网易 126 的真实收件箱 196 封）：**13 封的 ENVELOPE 里
+// 没有 Message-ID，而原始头里有**。丢了这个字段，下游全线出问题，而且全都
+// 表现为「逻辑不通」：
+//
+//   - store.Merge 靠 Message-ID 去重，没有它就每次同步都追加一份 —— 实测
+//     那 13 封被追加成了 86 条：索引 311 条，而服务端只有 243 封；
+//   - 会话聚合靠 Message-ID + References 串线，没有它同一件事在列表里裂成
+//     十几条；
+//   - app.send 的「乐观副本」靠 Message-ID 和服务端副本对上，对不上就永远
+//     停在 UID == 0：正文拉不到、删也删不掉。
+//
+// ⚠️ 这条判据**不连网**，而且是刻意这么写的：进程内那个假服务端（go-imap 的
+// memory 后端）**造不出**「ENVELOPE 缺 Message-ID」这种取舍，所以这一类 bug
+// 在端到端测试里永远不会出现（同 fetchRange 那条注释里说的道理）。
+func TestApplyRawHeaders_MessageIDComesFromTheHeader(t *testing.T) {
+	raw := "Subject: 甲\r\n" +
+		"Message-ID: <real@example.com>\r\n" +
+		"In-Reply-To: <parent@example.com>\r\n" +
+		"References: <root@example.com> <parent@example.com>\r\n" +
+		"\r\n"
+
+	// ENVELOPE 给的是空的 —— 就是 126 那 13 封的样子。
+	h := Header{}
+	applyRawHeaders(&h, raw)
+
+	if h.MessageID != "<real@example.com>" {
+		t.Errorf("Message-ID = %q，想要原始头里那个（ENVELOPE 没有时不能是空）", h.MessageID)
+	}
+	if h.InReplyTo != "<parent@example.com>" {
+		t.Errorf("In-Reply-To = %q，想要原始头里那个", h.InReplyTo)
+	}
+	if len(h.References) != 2 {
+		t.Errorf("References = %v，想要两条", h.References)
+	}
+}
+
+// 两边都有、且**不一致**时，以原始头为准。
+//
+// 原始头就是这封信真正写着的东西；ENVELOPE 是服务端重排出来的摘要。反过来
+// 的话，去重和串线都建立在服务端的取舍上 —— 而它已经被证明会漏。
+func TestApplyRawHeaders_RawHeaderWinsOverEnvelope(t *testing.T) {
+	h := Header{
+		MessageID: "<from-envelope@example.com>",
+		InReplyTo: "<env-parent@example.com>",
+	}
+	applyRawHeaders(&h, "Message-ID: <from-header@example.com>\r\n\r\n")
+
+	if h.MessageID != "<from-header@example.com>" {
+		t.Errorf("Message-ID = %q，想要原始头那个", h.MessageID)
+	}
+	// In-Reply-To 原始头里没有 → 保留 ENVELOPE 的值（兜底那条路不能断）。
+	if h.InReplyTo != "<env-parent@example.com>" {
+		t.Errorf("In-Reply-To = %q，想要 ENVELOPE 那个（原始头里没有）", h.InReplyTo)
+	}
+}
+
+// 整条链路：headerFromMessage 真的把原始头喂给了 applyRawHeaders。
+//
+// 单独一条是因为「算了但没接上」是本仓库最常见的错（见 layout_test.go 里
+// 那句「直接调只能证明那个函数算得对，证明不了列表真的用了它」）。
+//
+// ⚠️ Body 那张表的键必须是**响应形态**（Peek=false）：GetBody 会先
+// `section.resp()` 把 Peek 清掉再去查表，用请求形态的键永远查不到 —— 而那
+// 会让这条判据假绿（拿不到原始头，于是只剩 ENVELOPE 的值）。
+func TestHeaderFromMessage_WiresTheRawHeaderIn(t *testing.T) {
+	req := headerSection()
+	respForm := &imap.BodySectionName{
+		BodyPartName: imap.BodyPartName{
+			Specifier: imap.HeaderSpecifier,
+			Fields:    []string{"References", "Message-ID", "In-Reply-To"},
+		},
+	}
+	raw := "Message-ID: <from-header@example.com>\r\n\r\n"
+
+	msg := &imap.Message{
+		Uid:      7,
+		Flags:    []string{imap.SeenFlag},
+		Envelope: &imap.Envelope{Subject: "甲"}, // 刻意不带 MessageId
+		Body:     map[*imap.BodySectionName]imap.Literal{respForm: strings.NewReader(raw)},
+	}
+
+	got := headerFromMessage(msg, "INBOX", req)
+	if got.MessageID != "<from-header@example.com>" {
+		t.Fatalf("Message-ID = %q —— 原始头没接上（或 Body 表的键不是响应形态）", got.MessageID)
+	}
+	if got.Subject != "甲" || got.UID != 7 || !got.Seen {
+		t.Errorf("ENVELOPE 那条路上的字段丢了: %+v", got)
 	}
 }

@@ -241,11 +241,44 @@ func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySecti
 
 	if r := msg.GetBody(section); r != nil {
 		if raw, err := io.ReadAll(io.LimitReader(r, maxHeaderBytes)); err == nil {
-			h.References = ParseReferences(headerValue(string(raw), "References"))
+			applyRawHeaders(&h, string(raw))
 		}
 	}
 
 	return h
+}
+
+// applyRawHeaders 用**原始头部块**里的值补上 / 覆盖 Header 里由 ENVELOPE
+// 填过的字段。
+//
+// # ⚠️ Message-ID 和 In-Reply-To 以原始头为准，ENVELOPE 只是兜底
+//
+// ENVELOPE 是服务端**重排**过的结构，对畸形/非 ASCII 的头有它自己的取舍。
+// 实测（2026-10-03，网易 126 的真实收件箱 196 封）：**13 封的 ENVELOPE 里
+// 没有 Message-ID，而原始头里有**。
+//
+// 后果极重，而且全都表现为「逻辑不通」：
+//
+//   - `store.Merge` 靠 Message-ID 去重，没有它就**每次同步都追加一份** ——
+//     实测那 13 封被追加成了 86 条：索引 311 条，而服务端只有 243 封。
+//   - 会话聚合靠 Message-ID + References 串线，没有它同一个人的同一件事
+//     会在列表里裂成十几条单条会话。
+//   - `app.send` 的「乐观副本」靠 Message-ID 和服务端副本对上；对不上就
+//     永远停在 UID == 0 —— 正文拉不到、删也删不掉，界面上是一条点不开的
+//     幽灵。
+//
+// 代价是零：这段原始头**本来就要取**（References 一直在取），只是多要了
+// 两个字段（见 headerSection）。
+//
+// References 只从原始头取 —— ENVELOPE 里根本没有这一项。
+func applyRawHeaders(h *Header, raw string) {
+	h.References = ParseReferences(headerValue(raw, "References"))
+	if v := strings.TrimSpace(headerValue(raw, "Message-ID")); v != "" {
+		h.MessageID = v
+	}
+	if v := strings.TrimSpace(headerValue(raw, "In-Reply-To")); v != "" {
+		h.InReplyTo = v
+	}
 }
 
 // Bodies 批量拉取一个文件夹里若干封邮件的正文。
@@ -508,7 +541,12 @@ func headerSection() *imap.BodySectionName {
 		// 直接在 BodySectionName 字面量里初始化。
 		BodyPartName: imap.BodyPartName{
 			Specifier: imap.HeaderSpecifier,
-			Fields:    []string{"References"},
+			// References 用来串会话；Message-ID / In-Reply-To 用来**去重**。
+			//
+			// ⚠️ 这两个不能只靠 ENVELOPE 拿，见 headerFromMessage 的注释：
+			// 实测 126 的收件箱里 196 封有 13 封的 ENVELOPE 没有 Message-ID。
+			// 多要两个字段的代价接近零 —— 这一段头**本来就要取**。
+			Fields: []string{"References", "Message-ID", "In-Reply-To"},
 		},
 		Peek: true,
 	}
