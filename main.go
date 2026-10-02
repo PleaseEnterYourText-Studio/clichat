@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/mail"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/tui"
 )
 
@@ -34,6 +35,9 @@ func main() {
 	// 真实终端都会应答那对查询，不影响使用。只有极简终端、或某些
 	// tmux / SSH 转发场景可能不应答，那种情况下会卡在启动画面。
 	lipgloss.SetHasDarkBackground(true)
+
+	// IMAP 的 ID 命令要向服务端上报版本号，跟 -version 打印的保持一致。
+	mail.SetClientIDVersion(version)
 
 	var (
 		showVersion = flag.Bool("version", false, "打印版本号后退出")

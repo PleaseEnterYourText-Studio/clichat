@@ -96,6 +96,14 @@ func (c *liveClient) ensureLocked() error {
 		return fmt.Errorf("%w: %v", ErrAuth, err)
 	}
 
+	// 登录成功后必须立刻自报家门。网易系（163 / 126）不发这条 ID 的话，
+	// 下一条 EXAMINE 就会被拒成 "Unsafe Login"，而 LOGIN 本身是成功的 ——
+	// 详见 sendClientID 的注释。
+	if err := sendClientID(conn); err != nil {
+		_ = conn.Logout()
+		return err
+	}
+
 	c.conn = conn
 	return nil
 }
