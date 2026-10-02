@@ -1,0 +1,13 @@
+# 工具元数据（不属于项目源码）
+.workbuddy-ai/
+
+# 构建产物
+/clichat
+/clichat.exe
+/clichat-mac
+/clichat-linux
+/dist/
+
+# Go
+*.test
+*.out
