@@ -253,6 +253,34 @@ func (f *Fake) SetFlag(folder string, uids []uint32, flag string, add bool) erro
 	return nil
 }
 
+// UIDs 返回文件夹里当前存在的全部 UID（升序）。
+func (f *Fake) UIDs(folder string) ([]uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	fl := f.folder(folder)
+	out := make([]uint32, 0, len(fl.messages))
+	for uid := range fl.messages {
+		out = append(out, uid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// DeleteOnServer 把一封邮件**从服务端彻底删掉**（不是移到垃圾箱）。
+//
+// 存在的理由是造出「本地索引和服务端不一致」这个状态：增量同步只往后拉，
+// 服务端少了东西本地不会自己知道。没有这个动作，「删除检测」那条路在
+// 测试里永远走不到 —— 而它恰恰是这段代码唯一的用武之地。
+//
+// 不分配 UID、不写任何本地状态：它就是「别人在别的设备上删了」这件事。
+func (f *Fake) DeleteOnServer(folder string, uid uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	delete(f.folder(folder).messages, uid)
+}
+
 // Move 把一批邮件挪到另一个文件夹，并给它们分配新的 UID。
 //
 // 「换文件夹就换 UID」是照真实服务端的行为模仿的。这一点必须模仿到位：

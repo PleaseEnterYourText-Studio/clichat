@@ -23,6 +23,17 @@ type FolderState struct {
 	UIDValidity uint32 `json:"uid_validity"`
 	// LastUID 是我们已经同步过的最大 UID。
 	LastUID uint32 `json:"last_uid"`
+	// Messages 是上一次看到的**服务端**总封数。
+	//
+	// 它不是同步状态的一部分，而是「服务端那边有没有少东西」的信号：
+	// 增量同步只往后拉（from = LastUID+1），服务端删掉一封本地永远不知道。
+	// 封数下降说明服务端上确实少了东西，此时才值得花一次对账
+	// （列出全部 UID，见 app.syncFolder）—— 那一次要传回整个文件夹的
+	// UID 表，不能每轮都做。
+	//
+	// 0 表示「还没观察过」，此时不做对账。从旧版本升上来的索引就是这个
+	// 样子：第一轮先把真实封数记下来，之后才谈得上「下降了」。
+	Messages uint32 `json:"messages"`
 }
 
 // Index 是本地 header 索引。
@@ -226,6 +237,44 @@ func (ix *Index) Remove(messageIDs []string) int {
 	removed := 0
 	for _, h := range ix.Headers {
 		if h.MessageID != "" && drop[h.MessageID] {
+			removed++
+			continue
+		}
+		kept = append(kept, h)
+	}
+	ix.Headers = kept
+	ix.rebuildPos()
+	return removed
+}
+
+// RemoveMissing 删掉 folder 里 UID **不在 alive 中**的条目，返回删掉的条数。
+//
+// alive 是服务端现在实际存在的 UID 表（见 mail.Client.UIDs）。它和 Remove
+// 是两件事：Remove 是「我刚把这几封移走了」，这个是「服务端说这几封没了」。
+//
+// ⚠️ **UID == 0 的条目不参与对账。** 那是本地刚发出、还没同步回来的乐观
+// 副本（见 app.send），它在服务端上本来就还没有 UID —— 按「不在 alive 里」
+// 删掉，用户刚发出去的那封信会从列表里凭空消失，而且没有任何错误提示。
+//
+// ⚠️ 只在**同一个文件夹内**比。UID 只在文件夹内唯一，拿收件箱的 UID 表去
+// 对已发送的条目会把两个文件夹全删光。条目上的 Folder 就是当初写进去的
+// 那个规范名（见 headerFromMessage），所以这里比的是同一个坐标系。
+//
+// alive 为空表示服务端上这个文件夹**真的空了**，此时该文件夹的非零 UID
+// 条目全部删掉 —— 那是合法状态（用户把信全删了），不是故障。
+func (ix *Index) RemoveMissing(folder string, alive []uint32) int {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	keep := make(map[uint32]bool, len(alive))
+	for _, u := range alive {
+		keep[u] = true
+	}
+
+	kept := ix.Headers[:0]
+	removed := 0
+	for _, h := range ix.Headers {
+		if h.Folder == folder && h.UID != 0 && !keep[h.UID] {
 			removed++
 			continue
 		}

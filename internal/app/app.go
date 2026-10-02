@@ -33,6 +33,12 @@ type App struct {
 
 	bodyMu sync.Mutex
 	bodies map[string]Body // Message-ID -> 正文
+
+	// cache 是正文的磁盘缓存，可以为 nil（不落盘）。
+	//
+	// 它是**可选**的：nil 时一切照旧，只是重启后要重新下载。这样测试
+	// 默认不碰磁盘（见 New），而落盘那条路自己有专门的判据。
+	cache *store.BodyCache
 }
 
 // Body 是一封邮件的正文，连同它是怎么来的。
@@ -47,7 +53,10 @@ type Body struct {
 	HTML bool
 }
 
-// New 组装一个 App。
+// New 组装一个 App（不带正文磁盘缓存）。
+//
+// 不带缓存时行为完全一样，只是重启后要重新下载正文。测试默认走这条 ——
+// 落盘那条路有自己的判据（见 load_cost_test.go 的「重启」那两条）。
 func New(cfg *config.Config, client mail.Client, index *store.Index) *App {
 	a := &App{
 		cfg:    cfg,
@@ -57,6 +66,17 @@ func New(cfg *config.Config, client mail.Client, index *store.Index) *App {
 		bodies: map[string]Body{},
 	}
 	a.reaggregate()
+	return a
+}
+
+// NewWithCache 组装一个带正文磁盘缓存的 App。
+//
+// 缓存的作用是让**重启之后**「刚看过的会话」和「列表副行」不用回源 ——
+// 正文原本只在内存里（见 App.bodies），一关就没了，于是每次启动都要把
+// 眼前那一屏重新下载一遍，而它们和上次退出时一模一样。
+func NewWithCache(cfg *config.Config, client mail.Client, index *store.Index, cache *store.BodyCache) *App {
+	a := New(cfg, client, index)
+	a.cache = cache
 	return a
 }
 
@@ -193,6 +213,14 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	// 冷启动变成整份历史拉下来，用户会突然等很久。
 	firstSync := !known || st.LastUID == 0
 
+	// prevCount 是上一轮看到的服务端封数（0 表示还没观察过）。
+	//
+	// 取在 UIDVALIDITY 那个分支**之后**：那一支会把 st 整个重置成零值，
+	// 而「刚重置过」正是最不该对账的时候 —— 索引刚被清空，没有幽灵可删，
+	// 对账只会白花一条 UID SEARCH（那一次要传回整个文件夹的 UID 表）。
+	// 取在这里，那种情况自然落到 0，也就是「还没观察过」，不必再写一个条件。
+	prevCount := st.Messages
+
 	var from uint32
 	if firstSync {
 		// 首次同步不拉全部历史：按封数先划一道线。
@@ -224,9 +252,43 @@ func (a *App) syncFolder(folder string) (bool, error) {
 			last = h.UID
 		}
 	}
+
+	// ---- 删除检测 ----
+	//
+	// 增量同步是**只增不减**的：from = LastUID+1 只看得见新邮件，服务端
+	// 删掉一封（在手机上删、被服务端规则移走、在别处归档）本地永远不知道，
+	// 列表上于是留一条打不开的幽灵。
+	//
+	// 治本是「列出全部 UID 和服务端对账」，但那一次要传回整个文件夹的 UID
+	// 表（五千封三十来 KB），而同步是分钟级的 —— 每轮都做等于持续几十倍的
+	// 额外流量。所以只在**封数下降**时对账：那正是「服务端少了东西」的信号，
+	// 没变化时一条命令都不发。
+	//
+	// 代价说清楚：同一轮里删一封又到一封（净变化为零）不会当场发现，要等
+	// 下一次封数下降才补上。那是**延迟，不是漏检** —— 对账是权威的，一旦
+	// 跑起来就按服务端的现状把本地摆平，不会只修一半。
+	//
+	// 对账失败时不更新 Messages（见下面 serverCount），好让下一轮重试：
+	// 更新了的话这个信号就被用掉了，而本地还留着幽灵，得等下一次封数下降
+	// 才再有机会 —— 那可能很久以后。
+	serverCount := f.Messages
+	if prevCount > 0 && f.Messages < prevCount {
+		removed, err := a.reconcileDeleted(folder)
+		switch {
+		case err != nil:
+			log.Printf("同步 %s: 封数 %d -> %d（少了东西）但对账失败，"+
+				"下一轮重试: %v", folder, prevCount, f.Messages, err)
+			serverCount = prevCount
+		case removed > 0:
+			log.Printf("同步 %s: 服务端上少了 %d 封，本地跟着删掉", folder, removed)
+			changed = true
+		}
+	}
+
 	a.index.SetFolderState(folder, store.FolderState{
 		UIDValidity: f.UIDValidity,
 		LastUID:     last,
+		Messages:    serverCount,
 	})
 
 	// 首拉要几十秒（实测 QQ 邮箱约 39ms/条），界面上只会显示「同步中…」。
@@ -253,6 +315,19 @@ func (a *App) syncFolder(folder string) (bool, error) {
 			folder, f.Messages, from, firstSync, a.cfg.Sync.InitialDays)
 	}
 	return changed, nil
+}
+
+// reconcileDeleted 拿服务端的现状和本地对账，把「服务端上已经没有了的」
+// 条目从索引里删掉，返回删掉的条数。
+//
+// 它是**权威**的：只要跑起来就按服务端的 UID 表把本地摆平，不做增量猜测。
+// 所以调用方要克制 —— 一次要传回整个文件夹的 UID 表（见 mail.Client.UIDs）。
+func (a *App) reconcileDeleted(folder string) (int, error) {
+	alive, err := a.client.UIDs(folder)
+	if err != nil {
+		return 0, err
+	}
+	return a.index.RemoveMissing(folder, alive), nil
 }
 
 // withinInitialWindow 按天数再裁一道。
@@ -412,19 +487,51 @@ func (a *App) loadBodies(msgs []thread.Header) (map[string]Body, []error) {
 	return out, errs
 }
 
+// cachedBody 取一封正文，先看内存，再翻磁盘缓存。
+//
+// 两层是有分工的：磁盘那份省掉的是**一次网络往返**（重启后第一次打开
+// 会话就靠它），内存那份省掉的只是解析。命中的磁盘条目会顺手提进内存，
+// 所以同一个会话翻来翻去只有第一次要读盘。
+//
+// ⚠️ 调 cache.Get 时不持 bodyMu：那把锁只保护 bodies 这张表。先放开再调，
+// 免得两把锁的获取顺序在将来某次改动里被颠倒过来（那是最难查的一类死锁）。
 func (a *App) cachedBody(id string) (Body, bool) {
 	a.bodyMu.Lock()
-	defer a.bodyMu.Unlock()
-
 	b, ok := a.bodies[id]
-	return b, ok
+	cache := a.cache
+	a.bodyMu.Unlock()
+	if ok {
+		return b, true
+	}
+	if cache == nil {
+		return Body{}, false
+	}
+
+	cb, ok := cache.Get(id)
+	if !ok {
+		return Body{}, false
+	}
+	b = Body{Text: cb.Text, HTML: cb.HTML}
+
+	a.bodyMu.Lock()
+	a.bodies[id] = b
+	a.bodyMu.Unlock()
+	return b, true
 }
 
+// cacheBody 把一封正文放进内存缓存，并顺手落进磁盘缓存。
+//
+// ⚠️ 只有**真拉到的**正文会走到这里。调用方填的「（正文加载失败）」那句
+// 提示走的是另一条路（见 Bodies），绝不能落盘 —— 否则它会跨重启活着，
+// 而用户看到的是一封永远加载不出来的邮件。
 func (a *App) cacheBody(id string, b Body) {
 	a.bodyMu.Lock()
-	defer a.bodyMu.Unlock()
-
 	a.bodies[id] = b
+	a.bodyMu.Unlock()
+
+	if a.cache != nil {
+		a.cache.Put(id, store.CachedBody{Text: b.Text, HTML: b.HTML})
+	}
 }
 
 // MarkRead 把一个会话标为已读，服务端和本地索引一起改。
@@ -788,9 +895,17 @@ func replyTarget(th thread.Thread, self string) string {
 	return ""
 }
 
-// Close 断开连接并落盘索引。
+// Close 断开连接，并把索引和正文缓存落盘。
+//
+// 顺序是先断连接、再写两份文件：写盘不依赖连接，而连接断得越早越好。
+// 两份文件各自独立，一份失败不影响另一份 —— 错误合并上报。
 func (a *App) Close() error {
 	err := a.client.Close()
+	if a.cache != nil {
+		if cacheErr := a.cache.Save(); cacheErr != nil {
+			err = errors.Join(err, cacheErr)
+		}
+	}
 	if saveErr := a.index.Save(); saveErr != nil {
 		err = errors.Join(err, saveErr)
 	}

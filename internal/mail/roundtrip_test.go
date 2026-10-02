@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,13 @@ type mailServer struct {
 
 	mu     sync.Mutex
 	counts map[string]int
+
+	// raw 是客户端发出的命令行原文，按顺序（见 record）。
+	//
+	// 有些判据要钉的不是「发了几条」而是「发的是什么」：列全部 UID 必须带
+	// `1:*` 那个检索键，而空条件会被发成一条**没有任何检索键**的 SEARCH。
+	// 两种写法都只发 1 条、都返回全部 UID，光数条数看不出区别。
+	raw []string
 
 	// pairs 是在途的（前端，后端）连接对。
 	//
@@ -205,6 +213,12 @@ func (ms *mailServer) record(line string) {
 	if len(f) < 2 || f[1] != strings.ToUpper(f[1]) {
 		return
 	}
+	// 原文也留一份。有些判据要钉的不是「发了几条」而是「发的是什么」——
+	// 比如「列全部 UID」必须带 `1:*` 那个检索键，而空条件的 SEARCH 会发成
+	// 一条**没有任何检索键**的命令。两种写法都只发 1 条、都返回全部 UID，
+	// 光数条数看不出区别（见 TestUIDs_CostsOneSearchRegardlessOfMessageCount）。
+	ms.raw = append(ms.raw, line)
+
 	key := f[1]
 	// UID FETCH 和 UID STORE 是两回事，分开数。
 	if key == "UID" && len(f) > 2 {
@@ -218,6 +232,40 @@ func (ms *mailServer) reset() {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	ms.counts = map[string]int{}
+	ms.raw = nil
+}
+
+// searchKeys 返回最后一条 `UID SEARCH` 命令的**检索键**（去掉 CHARSET 那一对）。
+//
+// 判据要钉的是「检索键里有 `1:*`」，不是整条命令的原文：go-imap 会自己
+// 在检索键前面补一个 `CHARSET UTF-8`（见 commands.Search.Command），
+// 把原文整串写进断言等于把上游的实现细节钉住 —— 上游哪天不再带 CHARSET，
+// 这里就会假红，而那是**假红和假绿一样贵**的那种红。
+func (ms *mailServer) searchKeys() []string {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	for _, l := range ms.raw {
+		f := strings.Fields(l)
+		if len(f) < 3 || f[1] != "UID" || f[2] != "SEARCH" {
+			continue
+		}
+		keys := f[3:]
+		if len(keys) >= 2 && keys[0] == "CHARSET" {
+			keys = keys[2:]
+		}
+		return keys
+	}
+	return nil
+}
+
+// rawLines 返回客户端发过的命令行原文（副本），用于红条里说清「实际发了什么」。
+func (ms *mailServer) rawLines() []string {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	out := make([]string, len(ms.raw))
+	copy(out, ms.raw)
+	return out
 }
 
 // count 返回某条命令发出的次数。
@@ -578,5 +626,90 @@ func TestConn_ServerDropCostsOneCallThenRecovers(t *testing.T) {
 	// 这条专门盯「选中记忆跟着旧连接一起活了下来」那个坑。
 	if _, err := c.Bodies("INBOX", uidsOf(got)); err != nil {
 		t.Fatalf("重连后拉正文失败: %v", err)
+	}
+}
+
+// TestUIDs_CostsOneSearchRegardlessOfMessageCount：列全部 UID 是**一条**
+// 命令，和文件夹里有多少封无关。
+//
+// 这条判据钉两件事：
+//
+//   - **代价是常数。** 它是对账的入口，而「对账」看起来很像「逐封去问
+//     服务端这一封还在不在」—— 那样写 5000 封的收件箱就是 5000 次往返。
+//   - **`1:*` 那个条件不能省。** 空的 SearchCriteria 会被序列化成一条
+//     没有任何检索键的 `SEARCH`，RFC 3501 要求至少有一个键，服务端回 BAD，
+//     这里会直接报错。
+//
+// 还有一条最危险的失败方向要一起钉住：**拿到的 UID 表少一个，那一封
+// 还活着的邮件就会被当成删掉了**。所以这里要求它和头部拉到的 UID 完全一致。
+func TestUIDs_CostsOneSearchRegardlessOfMessageCount(t *testing.T) {
+	ms := startMailServer(t)
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		ms.add(t, "INBOX", rawMail(fmt.Sprintf("第%d封", i), "alice@example.com",
+			fmt.Sprintf("msg-%d@example.com", i)), true)
+	}
+
+	c := ms.client(t)
+	headers, err := c.Headers("INBOX", 1, 0)
+	if err != nil {
+		t.Fatalf("拉头部失败: %v", err)
+	}
+	want := uidsOf(headers)
+	if len(want) < n {
+		t.Fatalf("前提不成立：头部只有 %d 条", len(want))
+	}
+
+	ms.reset()
+	got, err := c.UIDs("INBOX")
+	if err != nil {
+		t.Fatalf("列 UID 失败: %v", err)
+	}
+
+	t.Logf("%d 封 → 命令 %d 条：%s", len(got), ms.total(), ms.dump())
+
+	if !slices.Equal(got, want) {
+		t.Errorf("UID 表和服务端上实际有的对不上：\n got %v\nwant %v", got, want)
+	}
+	if n := ms.count("UID SEARCH"); n != 1 {
+		t.Errorf("UID SEARCH 发了 %d 条，要 1 条", n)
+	}
+	if n := ms.total(); n > 2 {
+		t.Errorf("命令总数 %d，最多 2（EXAMINE + UID SEARCH）: %s", n, ms.dump())
+	}
+
+	// 检索键必须带 `1:*`。
+	//
+	// 这一条不能靠「返回的 UID 对不对」来钉：空条件的 SEARCH 和 `1:*`
+	// 在**结果上完全一样**（都是全部邮件），只是前者在 RFC 3501 §6.4.4 里
+	// 不合法（检索键至少要有一个）。go-imap 的客户端在条件为空时会把命令
+	// 发成一条没有任何检索键的 `SEARCH`（见 commands.Search.Command：参数
+	// 直接来自 Criteria.Format()），而这个假服务端容忍了它 —— 真服务端
+	// 未必。所以只能直接看发出去的命令原文。
+	if keys := ms.searchKeys(); !slices.Contains(keys, "1:*") {
+		t.Errorf("检索键里没有 `1:*`（实际是 %v）—— 空的 SEARCH 不合 RFC 3501，"+
+			"真服务端可能回 BAD\n实际发出：%v", keys, ms.rawLines())
+	}
+}
+
+// 空文件夹返回空表，不是错误 —— 用户把信全删了是合法状态。
+//
+// 这条分清楚很重要：调用方拿空表去对账会删掉本地那些条目，那是**对的**。
+// 但要是这里改成「空表就报错」，调用方就会把「文件夹空了」当成故障，
+// 于是本地永远清不掉。
+//
+// 用 Sent：memory.New 会给 INBOX 预置一封欢迎信，那里不是空的（见
+// TestBodies_CostsOneFetchRegardlessOfMessageCount 里那句「预置了一封」）。
+func TestUIDs_EmptyFolderIsNotAnError(t *testing.T) {
+	ms := startMailServer(t)
+
+	c := ms.client(t)
+	got, err := c.UIDs("Sent")
+	if err != nil {
+		t.Fatalf("空文件夹报错了: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("空文件夹列出了 %d 个 UID: %v", len(got), got)
 	}
 }

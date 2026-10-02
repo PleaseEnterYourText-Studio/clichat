@@ -59,6 +59,18 @@ func newTestAppAt(t *testing.T, client mail.Client, dir string) *App {
 	return New(cfg, client, ix)
 }
 
+// newTestAppWithCacheAt 和 newTestAppAt 一样，但挂上正文的磁盘缓存。
+//
+// 缓存单独走一个 helper：默认那条路（newTestAppAt）**不碰磁盘**，
+// 而落盘只有「重启之后还免不免费」这类判据才需要 —— 让所有判据都去写
+// 一个 bodies.json，既慢又会把「缓存坏了」这类问题混进无关的红条里。
+func newTestAppWithCacheAt(t *testing.T, client mail.Client, dir string) *App {
+	t.Helper()
+	a := newTestAppAt(t, client, dir)
+	a.cache = store.OpenBodyCache(filepath.Join(dir, "bodies.json"), store.DefaultBodyCacheBytes)
+	return a
+}
+
 func TestApp_InitialSyncAggregatesThreads(t *testing.T) {
 	fake := mail.NewFake()
 	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)

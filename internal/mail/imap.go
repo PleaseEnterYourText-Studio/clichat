@@ -145,6 +145,41 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	return out, nil
 }
 
+// UIDs 返回文件夹里当前存在的全部 UID（升序）。
+//
+// 用 `UID SEARCH 1:*` 而不是 `UID FETCH 1:* (UID)`：两者都能拿到 UID 表，
+// 但 SEARCH 的响应是纯 UID 列表，没有 FETCH 那一层结构，解析更省也更稳。
+//
+// ⚠️ 条件里那个 `1:*` 不能省。空的 SearchCriteria 会被序列化成一条**没有
+// 任何检索键**的 `SEARCH` 命令，而 RFC 3501 要求至少有一个键 —— 有些服务端
+// 直接回 BAD。`1:*` 是「全部邮件」的标准写法。
+//
+// 复用当前选中的文件夹（fresh=false），靠的是和 Headers 同一条不变量：
+// 紧挨着之前总有一次 Folder（见 Headers 的注释）。调用方是 app.syncFolder，
+// 它正是 Folder(folder) → Headers(folder) → UIDs(folder) 这个顺序。
+func (c *liveClient) UIDs(folder string) ([]uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, _, err := c.selectLocked(folder, true, false); err != nil {
+		return nil, err
+	}
+
+	seqset := new(imap.SeqSet)
+	seqset.AddRange(1, 0) // 0 的 Stop 会被渲染成 `*`，也就是 1:*
+
+	out, err := c.conn.UidSearch(&imap.SearchCriteria{SeqNum: seqset})
+	if err != nil {
+		c.markSuspectLocked()
+		return nil, fmt.Errorf("列出 %s 的 UID 失败: %w", folder, err)
+	}
+	// 命令成功跑完 = 连接刚被证实是活的。
+	c.markAliveLocked()
+
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
 // fetchRange 算出一次头部拉取要用的 UID 区间。
 //
 // to 为 0 表示「到最新」：能拿 SELECT 给的 UIDNEXT 算准上界就算，

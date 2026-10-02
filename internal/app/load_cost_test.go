@@ -1,7 +1,9 @@
 package app
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,5 +242,130 @@ func TestLastBodyTexts_BatchesAcrossThreads(t *testing.T) {
 	}
 	if counter.uids != n {
 		t.Errorf("批量里带了 %d 个 UID，想要 %d", counter.uids, n)
+	}
+}
+
+// ---- 正文落盘（重启之后不用重新下载） ----
+
+// failingBodiesClient 让所有批量取正文都失败，用来走「填提示」那条路。
+type failingBodiesClient struct {
+	mail.Client
+}
+
+func (c *failingBodiesClient) Bodies(folder string, uids []uint32) (map[uint32]mail.Message, error) {
+	return nil, errors.New("模拟传输失败")
+}
+
+// 重启之后，刚看过的正文不用重新下载。
+//
+// 正文原本只在内存里（App.bodies），一关就没了 —— 于是每次启动都要把
+// 眼前那一屏重新下载一遍，而它们和上次退出时一模一样。
+//
+// 这条判据钉的是**重启**这件事本身：同一个目录、同一份索引、同一个假邮箱，
+// 只是换了一个进程（新的 App）。用两次 t.TempDir() 造两个 App 量的其实是
+// 「另起一炉」，跟真实重启不是一回事。
+func TestBodies_SurviveRestartWithoutRefetching(t *testing.T) {
+	fake := seedThread(3)
+	dir := t.TempDir()
+
+	// 第一次运行：同步 + 打开会话（正文落进缓存），然后正常退出。
+	first := newTestAppWithCacheAt(t, fake, dir)
+	th := openSoleThread(t, first)
+	if _, err := first.Bodies(th); err != nil {
+		t.Fatalf("Bodies: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 重启。
+	counted := &countingClient{Client: fake}
+	second := newTestAppWithCacheAt(t, counted, dir)
+	th2 := openSoleThread(t, second)
+	counted.reset()
+
+	bodies, err := second.Bodies(th2)
+	if err != nil {
+		t.Fatalf("Bodies: %v", err)
+	}
+	if n := len(counted.batches); n != 0 {
+		t.Errorf("重启后打开同一个会话发了 %d 次批量请求，要 0 次 —— 正文没有落盘",
+			n)
+	}
+	if len(bodies) != 3 {
+		t.Errorf("拿到 %d 封正文，想要 3", len(bodies))
+	}
+	if got := bodies["<m0@x>"].Text; got != "第0封的正文" {
+		t.Errorf("正文是 %q", got)
+	}
+}
+
+// 列表副行走的是同一个缓存，所以重启后也不该回源。
+//
+// 单独一条是因为它走的是**另一条入口**（LastBodyTexts 而不是 Bodies）。
+// 只守着 Bodies 的话，把 LastBodyTexts 里的缓存判断删掉照样全绿 ——
+// 而列表副行恰恰是「每次启动都要重来一遍」里最显眼的那一处。
+func TestLastBodyTexts_SurviveRestartWithoutRefetching(t *testing.T) {
+	fake := seedThread(3)
+	dir := t.TempDir()
+
+	first := newTestAppWithCacheAt(t, fake, dir)
+	th := openSoleThread(t, first)
+	last := th.Messages[len(th.Messages)-1]
+	if got := first.LastBodyTexts([]thread.Header{last}); len(got) != 1 {
+		t.Fatalf("第一次拿到 %d 条摘要，想要 1", len(got))
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	counted := &countingClient{Client: fake}
+	second := newTestAppWithCacheAt(t, counted, dir)
+	th2 := openSoleThread(t, second)
+	last2 := th2.Messages[len(th2.Messages)-1]
+	counted.reset()
+
+	got := second.LastBodyTexts([]thread.Header{last2})
+	if len(counted.batches) != 0 {
+		t.Errorf("重启后拉摘要发了 %d 次批量请求，要 0 次", len(counted.batches))
+	}
+	if len(got) != 1 {
+		t.Errorf("拿到 %d 条摘要，想要 1 —— 缓存命中了却没有内容", len(got))
+	}
+}
+
+// 拉失败时填的那句提示**绝不能落盘**。
+//
+// 落了盘它就会跨重启活着：用户看到的是一封永远加载不出来的邮件，而且
+// 重启也治不好 —— 因为重启读的正是那份缓存。这条判据的形态是**反着量**的
+// （重启后必须**重新发一次**请求），和上面那条正好互补。
+func TestBodies_FailurePlaceholderIsNeverPersisted(t *testing.T) {
+	fake := seedThread(1)
+	dir := t.TempDir()
+
+	first := newTestAppWithCacheAt(t, &failingBodiesClient{Client: fake}, dir)
+	th := openSoleThread(t, first)
+	bodies, err := first.Bodies(th)
+	if err == nil {
+		t.Fatal("前提不成立：拉正文没报错，这条判据量的是失败路径")
+	}
+	if !strings.Contains(bodies["<m0@x>"].Text, "加载失败") {
+		t.Fatalf("前提不成立：失败时没填提示，拿到的是 %q", bodies["<m0@x>"].Text)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 重启后这一条必须回到「没问过」的状态。
+	counted := &countingClient{Client: fake}
+	second := newTestAppWithCacheAt(t, counted, dir)
+	th2 := openSoleThread(t, second)
+	counted.reset()
+
+	if _, err := second.Bodies(th2); err != nil {
+		t.Fatalf("Bodies: %v", err)
+	}
+	if n := len(counted.batches); n != 1 {
+		t.Errorf("重启后发了 %d 次批量请求，要 1 次 —— 「加载失败」那句提示被当成正文缓存下来了", n)
 	}
 }
