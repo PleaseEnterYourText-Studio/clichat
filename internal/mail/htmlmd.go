@@ -136,6 +136,13 @@ type blockBuilder struct {
 	// 它必须一路传下去，否则全局封顶算不准：封顶要的是**一行里所有祖先
 	// 加起来**的缩进，只看当前这一个元素的话，每层都觉得自己没超。
 	indent int
+
+	// depth 是当前的递归深度，超过 maxNestingDepth 就停止往下走。
+	//
+	// 和 indent 一样必须跟着 sub() 传下去：派生出来的子构造器如果从 0
+	// 重新开始数，封顶就成了「每层各自封顶」，深到能炸栈的那种嵌套照样
+	// 拦不住 —— 而它正是这个字段存在的唯一理由。
+	depth int
 }
 
 // sub 派生一个同上下文的子构造器，只换分隔符。
@@ -157,7 +164,8 @@ type blockBuilder struct {
 // 同一个构造器内部传递。
 func (b *blockBuilder) sub(sep string) *blockBuilder {
 	return &blockBuilder{
-		sep: sep, base: b.base, inTable: b.inTable, noMark: b.noMark, indent: b.indent,
+		sep: sep, base: b.base, inTable: b.inTable, noMark: b.noMark,
+		indent: b.indent, depth: b.depth,
 	}
 }
 
@@ -266,7 +274,28 @@ func (b *blockBuilder) blocks(n *html.Node) {
 	b.flush()
 }
 
+// maxNestingDepth 是渲染递归的深度上限。
+//
+// 这不是「优化」，是**兜底**：转换器吃的是**不可信的 HTML**，而递归一旦
+// 失控，后果是 **stack overflow —— fatal error，recover 抓不到**：整个
+// 进程会把 goroutine dump 打到终端再退出。对用户就是「打开这封邮件，
+// 程序刷屏退出」。
+//
+// 2026-10-03 真的这么炸过一次（`<center>` 触发的互相递归，见 node 的
+// default）。根因已经修掉了，这一层是防**下一处**：以后谁再写出无界递归，
+// 表现是「这封信深层的部分没渲染出来」（日志里有一条），而不是客户端
+// 被一封邮件杀掉。这两者的代价差着量级。
+//
+// 40 给得足够宽：正常邮件的嵌套深度是个位数，实测真实邮件最深不到 20。
+const maxNestingDepth = 40
+
 func (b *blockBuilder) node(n *html.Node) {
+	b.depth++
+	defer func() { b.depth-- }()
+	if b.depth > maxNestingDepth {
+		return
+	}
+
 	switch n.Type {
 	case html.TextNode:
 		b.text(n.Data)
@@ -344,6 +373,22 @@ func (b *blockBuilder) node(n *html.Node) {
 		default:
 			// 行内元素（a / strong / span / img …）出现在块级位置：
 			// 它自己就构成一块，交给行内渲染。
+			//
+			// ⚠️ **必须先判它到底是不是行内。** 这里原来无条件转给
+			// inlineNode，而 inlineNode 的 default 又无条件转回 node ——
+			// 两个 default 互相指，凡是**两边白名单都不认**的元素
+			// （`<center>` `<dl>` `<select>` `<textarea>` `<legend>`
+			// `<marquee>` `<math>` …）就会在**同一个节点**上来回递归，
+			// 直到 **stack overflow**。
+			//
+			// 这个失败模式特别狠：栈溢出是 fatal error，**recover 抓不到**，
+			// 进程会把整个 goroutine dump 打到终端再退出 —— 用户看到的就是
+			// 「打开这封邮件，程序刷屏退出」。`<center>` 在老邮件模板里满地
+			// 都是，所以这不是理论风险。
+			if isBlockElement(n) {
+				b.container(n, "\n")
+				return
+			}
 			b.inlineNode(n)
 		}
 
@@ -432,6 +477,12 @@ func (b *blockBuilder) childrenBlocks(n *html.Node, sep string) string {
 
 // inlineNode 把一个节点当行内内容写进 b。
 func (b *blockBuilder) inlineNode(n *html.Node) {
+	b.depth++
+	defer func() { b.depth-- }()
+	if b.depth > maxNestingDepth {
+		return
+	}
+
 	switch n.Type {
 	case html.TextNode:
 		b.text(n.Data)
@@ -481,7 +532,16 @@ func (b *blockBuilder) inlineNode(n *html.Node) {
 		default:
 			// 块级元素被塞进了行内上下文（HTML 不规范时很常见），
 			// 按块处理，别丢内容。
-			b.node(n)
+			//
+			// ⚠️ 同理：只有**真的是块级**才转回 node。认不出来的元素按
+			// 「无语义的行内元素」处理 —— 把子节点原样铺开，内容一个字不丢，
+			// 只是不加任何标记。少了这一层，两个 default 就会互相指到栈溢出
+			// （见 node 的 default）。
+			if isBlockElement(n) {
+				b.node(n)
+				return
+			}
+			b.plainInlineNode(n)
 		}
 	}
 }

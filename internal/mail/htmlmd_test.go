@@ -646,6 +646,80 @@ func TestHTMLToMarkdown_Robustness(t *testing.T) {
 	}
 }
 
+// 两边白名单都不认的元素，不能把渲染器带进互相递归。
+//
+// # 为什么单独立一条，上面那条 Robustness 盖不住
+//
+// 上面那条把所有输入包在 `recover()` 里，它的主张是「绝不会 panic」。
+// 但**互相递归导致的 stack overflow 是 fatal error，recover 抓不到** ——
+// 进程会把整个 goroutine dump 打到终端再退出。所以那条判据对这一类
+// 完全无能为力：它绿着，而客户端被一封邮件杀掉了。
+//
+// # 真实事故（2026-10-03）
+//
+// `node` 的 default 无条件转给 `inlineNode`，而 `inlineNode` 的 default
+// 又无条件转回 `node`。两个 default 互相指，凡是**两边都不认**的元素就在
+// **同一个节点**上来回递归：`<center>` `<dl>` `<select>` `<textarea>`
+// `<legend>` `<marquee>` `<math>` `<option>` …。`<center>` 在老邮件模板里
+// 满地都是，所以用户打开那封信 = 程序刷屏退出。
+//
+// # 判据为什么必须断言**输出**
+//
+// `maxNestingDepth` 那道兜底会把失控的递归变成「到深度就返回空」，于是
+// 「没崩」在根因没修的情况下**照样成立**，而内容已经全丢了。所以这里断言
+// 的是「文字还在」—— 它同时钉住「不递归」和「不丢内容」两件事。
+func TestHTMLToMarkdown_UnknownElementsDoNotRecurseForever(t *testing.T) {
+	// 这一批就是当初炸掉的那些：两边白名单都不认。
+	tags := []string{
+		"center", "dl", "menu", "dialog", "select", "textarea", "legend",
+		"marquee", "math", "mrow", "datalist", "option", "optgroup",
+		"slot", "keygen", "bgsound", "basefont", "col", "colgroup",
+	}
+
+	for _, tag := range tags {
+		for _, tc := range []struct{ name, in string }{
+			{"块级位置", "<" + tag + ">甲</" + tag + ">"},
+			{"行内位置", "<p>乙<" + tag + ">甲</" + tag + ">丙</p>"},
+			{"表格单元格里", "<table><tr><td><" + tag + ">甲</" + tag + "></td></tr></table>"},
+			{"列表项里", "<ul><li><" + tag + ">甲</" + tag + "></li></ul>"},
+		} {
+			t.Run(tag+"/"+tc.name, func(t *testing.T) {
+				got := HTMLToMarkdown(tc.in)
+				if !strings.Contains(got, "甲") {
+					t.Errorf("<%s> 在%s里的内容丢了：\n  in: %s\n got: %q",
+						tag, tc.name, tc.in, got)
+				}
+			})
+		}
+	}
+}
+
+// 深度兜底：嵌套再深也不能炸栈，而且**正常深度**的邮件不该被它误伤。
+//
+// 上下两头都要钉：只钉「深了不炸」，把上限压到 3 也照样绿；只钉「正常邮件
+// 不丢」，把上限删掉也照样绿（根因修好之后不会递归了）。
+func TestHTMLToMarkdown_DepthCap(t *testing.T) {
+	// 深到远超上限：不炸，但内容允许被截断（兜底的全部意义就是「宁可少渲染
+	// 一部分，也不杀掉进程」）。
+	deep := strings.Repeat("<div>", maxNestingDepth*4) + "深" +
+		strings.Repeat("</div>", maxNestingDepth*4)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("深嵌套 panic 了：%v", r)
+			}
+		}()
+		_ = HTMLToMarkdown(deep)
+	}()
+
+	// 正常邮件的嵌套是个位数，必须**一个字都不丢**。
+	normal := strings.Repeat("<div>", maxNestingDepth/2) + "正文" +
+		strings.Repeat("</div>", maxNestingDepth/2)
+	if got := HTMLToMarkdown(normal); !strings.Contains(got, "正文") {
+		t.Errorf("深度 %d 的正常嵌套被兜底误伤了：%q", maxNestingDepth/2, got)
+	}
+}
+
 // 纯文字（不带任何标签）必须原样显示，只是把 Markdown 特殊字符转义掉。
 func TestHTMLToMarkdown_PlainTextIsEscaped(t *testing.T) {
 	got := HTMLToMarkdown("价格是 2*3 元，见 user_id")
