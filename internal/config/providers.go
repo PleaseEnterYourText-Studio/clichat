@@ -130,13 +130,19 @@ func FindProvider(id string) *Provider {
 	return nil
 }
 
-// ApplyProvider 把预设的服务器地址写进配置。
-// 自定义预设不做任何改动。
+// ApplyProvider 把预设的服务器地址写进配置。自定义预设没有地址可写，
+// 但同样记下用户的选择。
 func ApplyProvider(cfg *Config, p *Provider) {
-	if p == nil || p.ID == CustomProviderID {
+	if p == nil {
 		return
 	}
 	cfg.Account.Provider = p.ID
+
+	// 自定义的地址由向导手填，这里不动端点。
+	if p.ID == CustomProviderID {
+		return
+	}
+
 	cfg.IMAP = Endpoint{Host: p.IMAPHost, Port: p.IMAPPort, TLS: TLSImplicit}
 	cfg.SMTP = Endpoint{Host: p.SMTPHost, Port: p.SMTPPort, TLS: TLSImplicit}
 }

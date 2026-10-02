@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,6 +25,13 @@ const (
 	TLSImplicit = "ssl"
 	// TLSStartTLS 是先明文连接再升级，对应 143（IMAP）/ 587（SMTP）。
 	TLSStartTLS = "starttls"
+)
+
+// 两个协议的默认端口，供自定义服务商手填服务器时使用。
+// 取的是隐式 TLS 那一组；选 STARTTLS 的话端口要改成 143 / 587。
+const (
+	DefaultIMAPPort = 993
+	DefaultSMTPPort = 465
 )
 
 // 配置目录下的文件名。
@@ -48,6 +57,40 @@ type Endpoint struct {
 // Addr 返回 host:port 形式，便于直接喂给 net 包。
 func (e Endpoint) Addr() string {
 	return fmt.Sprintf("%s:%d", e.Host, e.Port)
+}
+
+// ParseEndpoint 解析手填的「主机[:端口]」，端口省略时用 defaultPort。
+// TLS 一律先填隐式 TLS —— 向导里紧接着有一步让用户改。
+//
+// 带冒号但解析不出端口时直接报错，不当作「含冒号的主机名」：那是端口写错了，
+// 报错能当场发现，默默套默认端口则要等到连接失败才暴露。
+func ParseEndpoint(raw string, defaultPort int) (Endpoint, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return Endpoint{}, errors.New("不能为空")
+	}
+
+	host, port := s, defaultPort
+	if strings.Contains(s, ":") {
+		h, p, err := net.SplitHostPort(s)
+		if err != nil {
+			return Endpoint{}, errors.New("要写成 主机:端口 的形式（例如 imap.example.com:993）")
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return Endpoint{}, fmt.Errorf("端口 %q 不是数字", p)
+		}
+		host = strings.Trim(h, "[]")
+		port = n
+	}
+
+	if host == "" {
+		return Endpoint{}, errors.New("主机名不能为空")
+	}
+	if port < 1 || port > 65535 {
+		return Endpoint{}, fmt.Errorf("端口 %d 超出 1-65535", port)
+	}
+	return Endpoint{Host: host, Port: port, TLS: TLSImplicit}, nil
 }
 
 // Account 是账号信息。这里 **不存密码**。

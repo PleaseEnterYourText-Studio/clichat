@@ -687,8 +687,33 @@ func (m Model) viewSetup() string {
 		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定 · Ctrl+C 退出"))
 
 	case stepEmail:
-		b.WriteString("第 1 步 · 邮箱地址\n\n")
+		b.WriteString(m.stepHeader("邮箱地址") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n")
+
+	case stepCustomIMAP:
+		b.WriteString(m.stepHeader("IMAP 服务器") + "\n\n")
+		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		b.WriteString(styleMuted.Render("  主机:端口，例如 imap.example.com:993") + "\n")
+		b.WriteString(styleMuted.Render(fmt.Sprintf(
+			"  已按你的邮箱域名预填，不对就直接改（省略端口时默认 %d）", config.DefaultIMAPPort)) + "\n")
+
+	case stepCustomSMTP:
+		b.WriteString(m.stepHeader("SMTP 服务器") + "\n\n")
+		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
+		b.WriteString(styleMuted.Render("  主机:端口，例如 smtp.example.com:465") + "\n")
+		b.WriteString(styleMuted.Render(fmt.Sprintf(
+			"  已按你的邮箱域名预填，不对就直接改（省略端口时默认 %d）", config.DefaultSMTPPort)) + "\n")
+
+	case stepCustomTLS:
+		b.WriteString(m.stepHeader("加密方式") + "\n\n")
+		for i, opt := range tlsOptions {
+			if i == m.setup.tls {
+				b.WriteString("  " + styleSelected.Render("▸ "+padRight(opt.Label, 24)) + "\n")
+			} else {
+				b.WriteString("    " + padRight(opt.Label, 24) + "\n")
+			}
+		}
+		b.WriteString("\n" + styleMuted.Render("↑/↓ 选择 · 回车确定"))
 
 	case stepPassword:
 		p := m.currentProvider()
@@ -696,14 +721,14 @@ func (m Model) viewSetup() string {
 		if p != nil {
 			name = p.Name
 		}
-		b.WriteString("第 2 步 · " + name + " 的凭据\n\n")
+		b.WriteString(m.stepHeader(name+" 的凭据") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
 		if p != nil && len(p.Guide) > 0 {
 			b.WriteString(renderCredentialHelp(p))
 		}
 
 	case stepMaster:
-		b.WriteString("第 3 步 · 主密码\n\n")
+		b.WriteString(m.stepHeader("主密码") + "\n\n")
 		b.WriteString("  " + stylePrompt.Render(m.input.View()) + "\n\n")
 		b.WriteString(styleMuted.Render("  凭据会用这个密码加密后存在本地。") + "\n")
 		b.WriteString(styleMuted.Render("  它不会被发送到任何地方，忘了就只能重新配置。") + "\n")
@@ -713,6 +738,17 @@ func (m Model) viewSetup() string {
 		b.WriteString("\n" + styleError.Render(m.setup.err) + "\n")
 	}
 	return b.String()
+}
+
+// stepHeader 返回「第 N 步 · 标题」。步数按当前流程现算 —— 自定义比预设多
+// 三步，同一个步骤在两种流程里的序号不一样。
+func (m Model) stepHeader(title string) string {
+	for i, s := range m.setupFlow() {
+		if s == m.setup.step {
+			return fmt.Sprintf("第 %d 步 · %s", i+1, title)
+		}
+	}
+	return title
 }
 
 // ---- 渲染辅助 ----
