@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +15,14 @@ import (
 const testSelf = "me@example.com"
 
 func newTestApp(t *testing.T, fake *mail.Fake) *App {
+	t.Helper()
+	return newTestAppWithClient(t, fake)
+}
+
+// newTestAppWithClient 用任意 Client 实现装配一个 App。
+//
+// 存在的理由是注入 Fake 造不出来的行为 —— 比如"服务端上没有这个文件夹"。
+func newTestAppWithClient(t *testing.T, client mail.Client) *App {
 	t.Helper()
 
 	cfg := config.Default()
@@ -28,7 +37,7 @@ func newTestApp(t *testing.T, fake *mail.Fake) *App {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	return New(cfg, fake, ix)
+	return New(cfg, client, ix)
 }
 
 func TestApp_InitialSyncAggregatesThreads(t *testing.T) {
@@ -343,4 +352,70 @@ func TestApp_InitialWindowFiltersByAge(t *testing.T) {
 	if !got["<nodate@x>"] {
 		t.Error("Date 缺失的邮件应保守保留，而不是被丢掉")
 	}
+}
+
+// missingFolderClient 让某个文件夹像真实服务端那样"不存在"。
+//
+// 真实场景：配置里写的是 "Sent"，但网易系（163 / 126）上这个文件夹叫
+// 「已发送」，EXAMINE 会失败。这里只模拟"不存在"这一个行为 ——
+// 名字解析本身在 mail 包里有单测，不在这里重复。
+type missingFolderClient struct {
+	mail.Client
+	missing string
+}
+
+func (c missingFolderClient) Folder(name string) (mail.Folder, error) {
+	if name == c.missing {
+		return mail.Folder{}, fmt.Errorf("%w: %q", mail.ErrNoSuchFolder, name)
+	}
+	return c.Client.Folder(name)
+}
+
+// 服务端上少一个文件夹，不该让整个 Sync 报错。
+//
+// 之前的行为是把它和真正的连接错误一视同仁，结果界面整个标成"离线"，
+// 反而盖住了 INBOX 其实同步成功了这件事。
+func TestSync_MissingFolderIsNotAnError(t *testing.T) {
+	fake := mail.NewFake()
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<a@x>", From: "alice@x.com", To: []string{testSelf},
+		Subject: "在的", Date: time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC),
+	}, "正文")
+
+	a := newTestAppWithClient(t, missingFolderClient{Client: fake, missing: "Sent"})
+
+	changed, err := a.Sync()
+	if err != nil {
+		t.Errorf("缺一个文件夹不该报错，实际: %v", err)
+	}
+	if !changed {
+		t.Error("INBOX 里那封新邮件应该让 changed 为 true")
+	}
+
+	// 更要紧的是：不能因为 Sent 缺失就把 INBOX 的同步结果丢掉。
+	roots := map[string]bool{}
+	for _, th := range a.Threads() {
+		roots[th.Root] = true
+	}
+	if !roots["<a@x>"] {
+		t.Error("INBOX 里的会话没进索引 —— 缺的文件夹把同步结果带走了")
+	}
+}
+
+// 反面对照：真正的连接错误必须照报，别被上面那条"跳过"逻辑一起吞掉。
+func TestSync_RealErrorStillReported(t *testing.T) {
+	a := newTestAppWithClient(t, failingClient{Client: mail.NewFake()})
+
+	if _, err := a.Sync(); err == nil {
+		t.Error("连接层真出错时必须报出来，不能被跳过逻辑吞掉")
+	}
+}
+
+// failingClient 的 Folder 永远返回一个普通错误（非 ErrNoSuchFolder）。
+type failingClient struct {
+	mail.Client
+}
+
+func (failingClient) Folder(string) (mail.Folder, error) {
+	return mail.Folder{}, errors.New("连接被拒绝")
 }

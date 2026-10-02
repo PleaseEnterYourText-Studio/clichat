@@ -28,9 +28,13 @@ func (c *liveClient) Folder(name string) (Folder, error) {
 	if err := c.ensureLocked(); err != nil {
 		return Folder{}, err
 	}
-	mbox, err := c.conn.Select(name, true)
+	real, err := c.resolveLocked(name)
 	if err != nil {
-		return Folder{}, fmt.Errorf("选中文件夹 %s 失败: %w", name, err)
+		return Folder{}, err
+	}
+	mbox, err := c.conn.Select(real, true)
+	if err != nil {
+		return Folder{}, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 	return Folder{
 		Name:        mbox.Name,
@@ -51,9 +55,13 @@ func (c *liveClient) Headers(folder string, from, to uint32) ([]Header, error) {
 	if err := c.ensureLocked(); err != nil {
 		return nil, err
 	}
-	mbox, err := c.conn.Select(folder, true)
+	real, err := c.resolveLocked(folder)
 	if err != nil {
-		return nil, fmt.Errorf("选中文件夹 %s 失败: %w", folder, err)
+		return nil, err
+	}
+	mbox, err := c.conn.Select(real, true)
+	if err != nil {
+		return nil, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 
 	high := to
@@ -137,8 +145,12 @@ func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
 	if err := c.ensureLocked(); err != nil {
 		return Message{}, err
 	}
-	if _, err := c.conn.Select(folder, true); err != nil {
-		return Message{}, fmt.Errorf("选中文件夹 %s 失败: %w", folder, err)
+	real, err := c.resolveLocked(folder)
+	if err != nil {
+		return Message{}, err
+	}
+	if _, err := c.conn.Select(real, true); err != nil {
+		return Message{}, fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 
 	seqset := new(imap.SeqSet)
@@ -192,8 +204,12 @@ func (c *liveClient) MarkSeen(folder string, uids []uint32) error {
 	if err := c.ensureLocked(); err != nil {
 		return err
 	}
-	if _, err := c.conn.Select(folder, false); err != nil {
-		return fmt.Errorf("选中文件夹 %s 失败: %w", folder, err)
+	real, err := c.resolveLocked(folder)
+	if err != nil {
+		return err
+	}
+	if _, err := c.conn.Select(real, false); err != nil {
+		return fmt.Errorf("选中文件夹 %s 失败: %w", real, err)
 	}
 
 	seqset := new(imap.SeqSet)

@@ -9,12 +9,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/logging"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/mail"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/tui"
 )
@@ -23,6 +25,18 @@ import (
 var version = "dev"
 
 func main() {
+	// 日志最先起来 —— 后面任何一步出错都要能落到文件里，否则出问题时
+	// 用户手上只有一行会被截断的状态栏可看。
+	//
+	// 打不开日志不该挡住启动：退回 stderr 继续跑。
+	if closer, err := logging.Init(); err != nil {
+		fmt.Fprintln(os.Stderr, "clichat: 日志不可用，错误只会打到 stderr:", err)
+	} else {
+		// 注：fatal() 走 os.Exit，会跳过这个 defer。无害 —— log 包直接
+		// 写 os.File，没有缓冲区，不会有数据留在内存里丢掉。
+		defer closer()
+	}
+
 	// 声明终端为深色背景。
 	//
 	// 实测确认：这一行 **不能** 消除启动时那对终端能力查询
@@ -83,6 +97,7 @@ func fatal(err error) {
 	if err == nil {
 		return
 	}
+	log.Println("fatal:", err)
 	fmt.Fprintln(os.Stderr, "clichat:", err)
 	os.Exit(1)
 }

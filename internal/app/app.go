@@ -82,9 +82,12 @@ func (a *App) Sync() (bool, error) {
 
 	for _, folder := range a.cfg.Sync.Folders {
 		c, err := a.syncFolder(folder)
-		if err != nil {
+
+		// 服务端上没有这个文件夹不算故障，跳过就好 —— 各家对「已发送」
+		// 的叫法本来就不同（见 mail/folders.go 的别名表）。把它当错误
+		// 报上去，界面会整个标成"离线"，反而掩盖了真正同步成功的那些。
+		if err != nil && !errors.Is(err, mail.ErrNoSuchFolder) {
 			errs = append(errs, err)
-			continue
 		}
 		if c {
 			changed = true
