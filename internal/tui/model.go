@@ -125,7 +125,8 @@ func New(cfg *config.Config) Model {
 }
 
 // NewWithApp 用一个已经装配好的 app 启动界面，跳过解锁与配置向导。
-// --mock 模式用它。
+//
+// 只给测试用 —— 让界面层的测试能直接跑在内存假数据上，不碰真实邮箱。
 func NewWithApp(cfg *config.Config, a *app.App) Model {
 	in := textinput.New()
 	in.Prompt = "> "

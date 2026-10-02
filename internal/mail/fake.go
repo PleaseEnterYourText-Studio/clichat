@@ -7,9 +7,14 @@ import (
 	"time"
 )
 
-// Fake 是 Client 的内存实现，供单元测试和 --mock 模式使用。
+// Fake 是 Client 的内存实现，**只供测试使用**。
 //
-// 它存在的唯一理由是让自动化测试永远不碰真实邮箱。
+// 它不出现在任何产品代码路径里 —— clichat 没有离线演示模式，运行时
+// 要么连上真实邮箱，要么什么都不做。Fake 存在的唯一理由是让整套
+// 自动化测试能在不碰真实邮箱的前提下跑完。
+//
+// 因为它只被 _test.go 引用，Go 链接器的可达性分析会把它整个裁掉，
+// 不会进入最终二进制。
 type Fake struct {
 	mu      sync.Mutex
 	folders map[string]*fakeFolder
