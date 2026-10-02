@@ -38,10 +38,10 @@ var Providers = []Provider{
 		SMTPHost: "smtp.qq.com", SMTPPort: 465,
 		PasswordLabel: "授权码",
 		Guide: []string{
-			"登录 QQ 邮箱网页版，进入 设置 → 账户",
-			"找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务」一节",
-			"开启 IMAP/SMTP 服务，按提示用手机发送短信验证",
-			"把拿到的 16 位授权码填进来 —— 不是你的 QQ 密码",
+			"登录 QQ 邮箱网页版，点顶部「设置」，选「账号与安全」",
+			"找到「POP3/IMAP/SMTP/Exchange/CardDAV服务」区域，点旁边的「开启」",
+			"按提示用绑定的手机号发送指定内容到指定号码，发完点「我已发送」",
+			"页面会弹出 16 位授权码，复制它填进来 —— 不是你的 QQ 密码",
 		},
 	},
 	{

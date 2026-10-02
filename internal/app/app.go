@@ -454,8 +454,6 @@ func (a *App) forwardBody(th thread.Thread) string {
 	return b.String()
 }
 
-
-//
 // Reply 回复一个会话。
 //
 // replyAll 为 true 时发给会话里除自己外的所有人（默认，符合聊天语义）；
