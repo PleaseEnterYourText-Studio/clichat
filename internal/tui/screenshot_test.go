@@ -27,9 +27,11 @@ import (
 //	set CLICHAT_SCREENSHOTS=1
 //	set CLICOLOR_FORCE=1
 //	go test ./internal/tui/ -run TestGenerateScreenshots -v
-//	python tools/ansi2png.py
+//	python tools/render-screenshots.py
 //
-// 第一步产出 docs/images/raw/*.ansi，第二步把它们转成 docs/images/*.png。
+// 第一步产出 docs/images/raw/*.ansi，第二步把它们渲染成 docs/images/*.png
+// （用 charmbracelet/freeze 出 SVG，再用 Edge 无头模式栅格化 —— 为什么
+// 要绕这一圈，见 tools/render-screenshots.py 顶部的说明）。
 func TestGenerateScreenshots(t *testing.T) {
 	if os.Getenv("CLICHAT_SCREENSHOTS") != "1" {
 		t.Skip("需要 CLICHAT_SCREENSHOTS=1 才跑（见本文件顶部注释）")
@@ -136,6 +138,9 @@ func newSampleModel(t *testing.T) Model {
 	fake := mail.NewFake()
 
 	// —— 群聊：产品评审（截图里的主角）——
+	//
+	// 刻意铺得比一屏能放下的多：真实聊天窗口本来就是「滚到底、上面的
+	// 已经滚出去了」的样子，而且这能顺带展示 tailWindow 的裁剪行为。
 	group := []string{"me@example.com", "alice@example.com", "bob@example.com"}
 	fake.AddMessage("INBOX", mail.Header{
 		MessageID: "<p1@x>", From: "alice@example.com", FromName: "Alice",
@@ -176,11 +181,27 @@ func newSampleModel(t *testing.T) Model {
 		From: "alice@example.com", FromName: "Alice", To: group,
 		Subject: "Re: 周五的产品评审", Date: base.Add(48 * time.Minute),
 	}, "好，那就这么定。会议链接我发到群里了。")
+	// 这条故意写长，会折成两行 —— 截图里要看得见「正文会折行」这件事。
 	fake.AddMessage("INBOX", mail.Header{
 		MessageID: "<p9@x>", References: []string{"<p1@x>"},
+		From: "alice@example.com", FromName: "Alice", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(55 * time.Minute),
+	}, "对了，数据那块如果来不及，可以先只出华东区的。别为了凑全量把整个评审拖到下周，那样反而更被动。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p10@x>", References: []string{"<p1@x>"},
+		From: "me@example.com", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(62 * time.Minute), Seen: true,
+	}, "华东区的我今天就能出，全量的周五前应该也赶得上。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p11@x>", References: []string{"<p1@x>"},
 		From: "bob@example.com", FromName: "Bob", To: group,
-		Subject: "Re: 周五的产品评审", Date: base.Add(52 * time.Minute),
-	}, "收到。")
+		Subject: "Re: 周五的产品评审", Date: base.Add(68 * time.Minute),
+	}, "那就先按华东区准备，全量的当加分项。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<p12@x>", References: []string{"<p1@x>"},
+		From: "alice@example.com", FromName: "Alice", To: group,
+		Subject: "Re: 周五的产品评审", Date: base.Add(74 * time.Minute),
+	}, "行。那我把议程按这个顺序排一下，明天发出来。")
 
 	// —— 1:1，两条未读 ——
 	fake.AddMessage("INBOX", mail.Header{
@@ -221,6 +242,29 @@ func newSampleModel(t *testing.T) Model {
 		To: []string{"me@example.com"}, Subject: "磁盘使用率超过 85%", Date: base.Add(-30 * time.Hour),
 		Seen: true,
 	}, "生产环境磁盘使用率已超过阈值，请关注。")
+
+	// —— 第二个群聊：多几个人，让列表里有「群」和「1:1」的对比 ——
+	trip := []string{"me@example.com", "lisa@example.com", "tom@example.com", "erin@example.com"}
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<j1@x>", From: "lisa@example.com", FromName: "Lisa",
+		To: trip, Subject: "周末团建", Date: base.Add(-3 * time.Hour),
+	}, "周末团建定在周六还是周日？我先统计一下人数。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<j2@x>", References: []string{"<j1@x>"},
+		From: "tom@example.com", FromName: "Tom", To: trip,
+		Subject: "Re: 周末团建", Date: base.Add(-2 * time.Hour),
+	}, "周六吧，周日想在家躺着。")
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<j3@x>", References: []string{"<j1@x>"},
+		From: "me@example.com", To: trip,
+		Subject: "Re: 周末团建", Date: base.Add(-110 * time.Minute), Seen: true,
+	}, "周六可以，算我一个。")
+
+	// —— 1:1，未读 ——
+	fake.AddMessage("INBOX", mail.Header{
+		MessageID: "<k1@x>", From: "lisa@example.com", FromName: "Lisa",
+		To: []string{"me@example.com"}, Subject: "合同盖章的事", Date: base.Add(-14 * time.Hour),
+	}, "合同我已经寄出去了，大概周三到。")
 
 	// —— 已发送文件夹里也放一条，好让「切换文件夹」有东西可切 ——
 	fake.AddMessage("Sent", mail.Header{
