@@ -67,48 +67,17 @@ func threadMatches(th thread.Thread, query string) bool {
 	return false
 }
 
-// groupUnreadFirst 把未读会话稳定地挪到前面，让列表能按「未读 / 已读」
-// 分组。
-//
-// **分组必然带来重排。** 想分组又不重排是不可能的：一边要「未读的都
-// 挨在一起」，一边又要「严格按时间排」，遇到一封两天前的未读夹在今天
-// 两封已读中间就无解了。所以这里选了「分组优先」，组内仍然按时间
-// （也就是原顺序保持不变，稳定分区）。
-//
-// 为什么必须是**稳定**分区：光标和列表位置是一一对应的（m.cursor 索引
-// 的就是这个切片），组内乱序会让按下箭头跑到一条完全无关的会话上。
-//
-// 代价要说清楚：列表不再是严格的时间序。换来的是未读会浮到顶上 ——
-// 这也是导航上那些未读数字能派上用场的地方。
-func groupUnreadFirst(list []thread.Thread) []thread.Thread {
-	n := 0
-	for _, th := range list {
-		if th.Unread > 0 {
-			n++
-		}
-	}
-	if n == 0 || n == len(list) {
-		// 全已读或全未读：分组标题不会画，顺序也就没必要动。
-		// 原样返回还省一次拷贝。
-		return list
-	}
-
-	out := make([]thread.Thread, 0, len(list))
-	for _, th := range list {
-		if th.Unread > 0 {
-			out = append(out, th)
-		}
-	}
-	for _, th := range list {
-		if th.Unread == 0 {
-			out = append(out, th)
-		}
-	}
-	return out
-}
-
 // firstUnread 从 start 开始（含）朝 dir 方向找第一个未读会话的下标。
 // 找不到返回 -1。dir 只能是 +1 或 -1。
+//
+// 列表顺序现在是**稳定的时间序**（不再按未读分区，见 refreshVisible），
+// 所以「跳到下一条未读」必须靠**找**，不能靠「往下走一格」。这正是这个
+// 函数存在的理由，也是 `u` 键比 `↓` 好用的原因：一屏已读里按 `↓` 要按
+// 很多下，按 `u` 一步就到。
+//
+// （这里原本还有一个 groupUnreadFirst，把未读稳定地挪到前面。删掉它的
+// 理由见 refreshVisible 的注释：**分组必然带来重排**，而重排发生在用户
+// 正在操作的列表上，代价比「未读浮到顶上」那点好处大得多。）
 func firstUnread(list []thread.Thread, start, dir int) int {
 	for i := start; i >= 0 && i < len(list); i += dir {
 		if list[i].Unread > 0 {

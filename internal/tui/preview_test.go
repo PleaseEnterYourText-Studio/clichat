@@ -568,7 +568,18 @@ func TestThreadNamed_RecognisesThePreviewRow(t *testing.T) {
 func TestPreviews_DoNotLeakIntoTheChatStream(t *testing.T) {
 	forceColor(t)
 	m, _ := newPreviewModel(t)
-	m.cursor = 0
+
+	// ⚠️ 按**主题**定位那个会话，不要按下标 0。
+	//
+	// 下标 0 是哪一条取决于列表顺序，而顺序是稳定时间序（见
+	// listorder_test.go）—— 按下标写的判据会在顺序调整时悄悄量到另一条
+	// 会话上，然后报「这句话出现 0 次」，看着像摘要漏进了别处。
+	want := visibleNamed(t, m, "会议安排")
+	for i, th := range m.visible {
+		if th.ID == want.ID {
+			m.cursor = i
+		}
+	}
 	m, _ = update(m, keyMsg("enter"))
 	m = loadBodies(t, m)
 	m = loadPreviews(t, m)
@@ -584,31 +595,26 @@ func TestPreviews_DoNotLeakIntoTheChatStream(t *testing.T) {
 	}
 }
 
-// 分组标题（"未读 N" / "已读 N"）不能被当成会话。
+// 摘要那一套只认**会话**，不认列表里别的行。
 //
-// 顺带守着 listRows 的契约：src 里的分组行 idx 必须是 -1，摘要那一套
-// 才会跳过它（跳过靠的就是这个 -1）。
-func TestPreviews_SkipGroupHeaders(t *testing.T) {
+// 这条原来叫 TestPreviews_SkipGroupHeaders，守着「分组标题行 idx=-1、
+// 摘要要跳过它」。分组标题已经删了（理由见 listorder_test.go），但那条
+// 契约本身还活着：listRows 里每一行都必须指向一条真会话，摘要的条数
+// 不能超过会话数。少了这一条，往列表里插一行「不是会话的东西」就会让
+// 摘要多要一份、而它永远拉不到。
+func TestPreviews_OnlyCountsRealConversations(t *testing.T) {
 	forceColor(t)
 	m, _ := newPreviewModel(t)
 	m = loadPreviews(t, m)
 
-	var headers []int
 	for i, r := range m.listRows() {
-		if r.idx < 0 {
-			headers = append(headers, i)
-			if r.group == "" {
-				t.Errorf("第 %d 行 idx=-1 却没有组名", i)
-			}
+		if r.idx < 0 || r.idx >= len(m.visible) {
+			t.Fatalf("第 %d 行的 idx=%d 指不到任何会话（列表里有 %d 条）",
+				i, r.idx, len(m.visible))
 		}
 	}
-	if len(headers) == 0 {
-		// 夹具里 Alice 未读、Bob 已读，两组都有 —— 前提该成立。
-		t.Fatal("前提不成立：列表里没有分组标题行")
-	}
 
-	// 窗口里的摘要条数不能把分组标题算进去。
 	if got, want := len(m.wantedPreviews()), len(m.visible); got > want {
-		t.Errorf("要拉 %d 条，会话只有 %d 条", got, want)
+		t.Errorf("要拉 %d 条摘要，会话只有 %d 条", got, want)
 	}
 }

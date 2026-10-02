@@ -574,20 +574,30 @@ func listRowOf(t *testing.T, m Model, want string) string {
 func TestNextUnread_JumpsToUnread(t *testing.T) {
 	m, _ := newFeatureModel(t)
 
-	// 从**末尾**出发。未读的分组排在前面，光标初始位置（第 0 条）本来
-	// 就是未读的 —— 那样按 ] 只是原地不动，量不出「它会跳」。
-	m, _ = update(m, keyMsg("end"))
-	if m.visible[m.cursor].Unread != 0 {
-		t.Fatalf("前提不成立：末尾应该是已读的，实际 Unread=%d", m.visible[m.cursor].Unread)
+	// 起点自己挑一条**已读**的：光标初始位置本来就是未读的话，按 ] 只是
+	// 原地不动，量不出「它会跳」。
+	//
+	// ⚠️ 不能靠「末尾那条是已读的」这种间接前提 —— 那成立过是因为未读
+	// 被排到了前面（groupUnreadFirst），而顺序已经改成稳定时间序了。
+	// 靠顺序的判据会在顺序调整时变成「前提不成立」的空转。
+	start := -1
+	for i, th := range m.visible {
+		if th.Unread == 0 {
+			start = i
+			break
+		}
 	}
+	if start < 0 {
+		t.Fatal("前提不成立：列表里没有已读会话")
+	}
+	m.cursor = start
 
 	m, _ = update(m, keyMsg("]"))
-	if m.visible[m.cursor].Unread == 0 {
-		t.Errorf("] 应该跳到未读会话上，实际停在 %q", m.visible[m.cursor].Subject)
+	if m.cursor == start {
+		t.Fatalf("] 之后光标没动（还停在 %d）—— 从已读出发就该跳到未读上", start)
 	}
-	// 到底之后绕回第一组未读，所以该停在最前面那条上。
-	if first := firstUnread(m.visible, 0, 1); m.cursor != first {
-		t.Errorf("] 绕回后应该停在第一个未读（下标 %d），实际 %d", first, m.cursor)
+	if got := m.visible[m.cursor]; got.Unread == 0 {
+		t.Errorf("] 应该跳到未读会话上，实际停在 %q（已读）", got.Subject)
 	}
 }
 

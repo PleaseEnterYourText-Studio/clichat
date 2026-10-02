@@ -445,44 +445,31 @@ func (m Model) tabChipAt(l layout, x int) (tabChip, bool) {
 // 这一个出处 —— 各自算一遍的话，会分头漂移，而且只在有未读、或者窗口
 // 刚够放下某几条的时候才错。
 type listRow struct {
-	// group 非空表示这是一行分组标题。
-	group string
-	// idx 是这一行对应的会话在 m.visible 里的下标；标题行是 -1。
+	// idx 是这一行对应的会话在 m.visible 里的下标。
 	idx int
 	// first 表示这是该会话的第一行（标题行，第二行是主题）。
 	first bool
 }
 
-// listRows 把当前列表摊成待渲染的行。
+// listRows 把 visible 铺成「一行一条」的渲染行：每条会话占两行
+// （标题行 first=true + 副行）。
 //
-// 分组只在**两组都有内容**时才画标题：全是未读或全是已读的时候，
-// 一条孤零零的「未读 37」只是白占一行。
+// # 为什么不再分「未读 / 已读」两段
+//
+// 这里原来按已读状态切成两段、各带一行分组标题（「未读 3」「已读 12」）。
+// 那个分段的代价不是几行像素，而是**列表顺序被已读状态绑住了**：打开一条
+// 就把它挪到另一段，光标底下换人、滚动窗口跟着跳。详见 refreshVisible 的
+// 注释和 listorder_test.go。
+//
+// 未读现在靠行内的强调色 + 计数表示（见 listRowStyled），位置不再承载状态。
 func (m Model) listRows() []listRow {
 	if len(m.visible) == 0 {
 		return nil
 	}
-
-	var unread, read []int
-	for i, th := range m.visible {
-		if th.Unread > 0 {
-			unread = append(unread, i)
-		} else {
-			read = append(read, i)
-		}
+	out := make([]listRow, 0, len(m.visible)*2)
+	for i := range m.visible {
+		out = append(out, listRow{idx: i, first: true}, listRow{idx: i})
 	}
-
-	out := make([]listRow, 0, len(m.visible)*2+2)
-	both := len(unread) > 0 && len(read) > 0
-	add := func(title string, idxs []int) {
-		if both {
-			out = append(out, listRow{group: title, idx: -1})
-		}
-		for _, i := range idxs {
-			out = append(out, listRow{idx: i, first: true}, listRow{idx: i})
-		}
-	}
-	add(fmt.Sprintf("未读 %d", len(unread)), unread)
-	add(fmt.Sprintf("已读 %d", len(read)), read)
 	return out
 }
 
@@ -614,37 +601,12 @@ func (m Model) renderListRow(r listRow, width int) string {
 	inner := listRowInner(width)
 	inset := strings.Repeat(" ", listRowInset)
 
-	if r.group != "" {
-		// 分组标题也走同一套内缩，于是它和条目共用左边那条基准线；
-		// 计数右对齐到同一列，右边缘也齐。
-		return inset + styleGroupTitle.Render(padRight(listGroupText(r.group, inner), inner+2*listRowPad)) + inset
-	}
-
 	th := m.visible[r.idx]
 	if r.idx == m.cursor {
 		return inset + styleRowSelected.Render(
 			padRight(m.listRowText(th, r.first, inner), inner)) + inset
 	}
 	return inset + padRight(m.listRowStyled(th, r.first, inner), inner) + inset
-}
-
-// listGroupText 拼分组标题的纯文本：标题靠左、计数靠右，中间留白。
-//
-// 右对齐不是为了好看：分组标题和条目共用同一条右基准线之后，整栏的右边缘
-// 才是一条直线，而不是长短不一的一排。上一版「未读 5」四个字挤在一起，
-// 右边缘是毛的。
-func listGroupText(group string, inner int) string {
-	// group 的形状是「未读 5」—— 标题和计数之间是最后一个空格。
-	title, count, found := strings.Cut(group, " ")
-	if !found {
-		return truncate(group, inner)
-	}
-	gap := inner - textWidth(title) - textWidth(count)
-	if gap < 1 {
-		// 太窄就退回原来的连写形式，别把标题截成一个字。
-		return truncate(title+" "+count, inner)
-	}
-	return title + strings.Repeat(" ", gap) + count
 }
 
 // 列表行的两列宽度预算。

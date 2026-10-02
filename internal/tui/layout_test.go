@@ -921,52 +921,32 @@ func chipIDs(chips []tabChip) []string {
 	return out
 }
 
-// ---- 列表分组 ----
+// ---- 列表顺序 ----
 
-// 分组标题只在两组都有内容时才画。
-func TestList_GroupHeadersOnlyWhenBothGroupsExist(t *testing.T) {
-	m, _ := newFeatureModel(t)
-	text := strings.Join(plainTexts(strings.Split(m.renderThreadList(m.listWidth(), m.bodyHeight()), "\n")), "\n")
-	if !strings.Contains(text, "未读") || !strings.Contains(text, "已读") {
-		t.Fatalf("夹具里未读和已读都有，两个标题都该出现：\n%s", text)
-	}
-
-	// 全部标成已读之后，就不该再留一个孤零零的「已读」压在上面。
-	for i := range m.visible {
-		m.visible[i].Unread = 0
-	}
-	text = strings.Join(plainTexts(strings.Split(m.renderThreadList(m.listWidth(), m.bodyHeight()), "\n")), "\n")
-	if strings.Contains(text, "已读 ") {
-		t.Errorf("全已读时不该画分组标题：\n%s", text)
-	}
-}
-
-// 未读的排在已读前面，而且组内保持原来的顺序（稳定分区）。
+// 列表行里**不许再有分组标题行**。
 //
-// 组内**必须**稳定：m.cursor 索引的就是这个切片，组内乱序会让按下箭头跑到
-// 一条完全无关的会话上。要两条以上未读才测得出来 —— 只有一条未读时，
-// 「保持原序」和「反过来」是同一件事（这条判据最初就是那么写的，把分组
-// 改成倒序它照样绿）。
-func TestList_UnreadFirstAndStableWithinGroups(t *testing.T) {
-	mk := func(subject string, unread int) thread.Thread {
-		return thread.Thread{Subject: subject, Unread: unread}
-	}
-	in := []thread.Thread{
-		mk("a", 0), mk("b", 1), mk("c", 0), mk("d", 1), mk("e", 0),
-	}
-	got := subjects(groupUnreadFirst(in))
-	want := []string{"b", "d", "a", "c", "e"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("分组后 = %v，want %v（未读在前、组内保持原序）", got, want)
-	}
-
-	// 端到端也走一遍：真的模型、真的列表。
+// 这一节原来叫「列表分组」：未读一段、已读一段，各带一行标题。那套已经删了
+// —— 它把**列表顺序绑在了已读状态上**（打开一条就挪到另一段，光标底下换人）。
+// 顺序的判据搬到 listorder_test.go 了，那里量的是「顺序不随已读状态变」这件
+// 更要紧的事。
+//
+// 留这一条是因为「分组标题」很容易被顺手加回来：它一旦回来，列表就又会随
+// 已读状态重排。查的是**结构**（行里有没有 idx<0 的标题行），不是画面上有没有
+// 那两个字 —— 绑文案的话，改个措辞就变成假红了。
+func TestList_RowsCarryNoGroupTitles(t *testing.T) {
 	m, _ := newFeatureModel(t)
-	// 夹具的顺序（按时间降序）：Sent、Bob、Alice；只有 Alice 未读。
-	got = subjects(m.visible)
-	want = []string{"会议安排", "发出去的", "周末爬山"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("会话顺序 = %v，want %v（未读在前、组内保持时间序）", got, want)
+	rows := m.listRows()
+	if len(rows) == 0 {
+		t.Fatal("前提不成立：列表是空的")
+	}
+	for i, r := range rows {
+		if r.idx < 0 {
+			t.Errorf("第 %d 行是分组标题行（idx<0）—— 顺序不该再按已读状态分段", i)
+		}
+	}
+	// 每条会话两行，一条不多一条不少。
+	if want := len(m.visible) * 2; len(rows) != want {
+		t.Errorf("行数 = %d，want %d（%d 条会话 × 2 行）", len(rows), want, len(m.visible))
 	}
 }
 
@@ -1080,9 +1060,6 @@ func TestList_StyledRowMatchesItsPlainText(t *testing.T) {
 
 	checked := 0
 	for _, r := range rows[start:end] {
-		if r.group != "" {
-			continue
-		}
 		th := m.visible[r.idx]
 		plain := m.listRowText(th, r.first, inner)
 		styled := plainText(m.listRowStyled(th, r.first, inner))
@@ -1173,7 +1150,7 @@ func TestList_EveryRowEndsAtTheSameColumn(t *testing.T) {
 
 	checked := 0
 	for i := start; i < end; i++ {
-		if rows[i].group != "" || !rows[i].first {
+		if !rows[i].first {
 			continue
 		}
 		line := strings.TrimRight(plainText(lines[1+(i-start)]), " ")
@@ -1210,7 +1187,7 @@ func TestList_SubLineSharesTheNameColumn(t *testing.T) {
 
 	checked := 0
 	for i := start; i+1 < end; i++ {
-		if rows[i].group != "" || !rows[i].first || rows[i+1].first ||
+		if !rows[i].first || rows[i+1].first ||
 			rows[i+1].idx != rows[i].idx {
 			continue
 		}
