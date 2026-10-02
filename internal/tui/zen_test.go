@@ -273,6 +273,36 @@ func TestZenLogo_WidthMatchesLipgloss(t *testing.T) {
 	}
 }
 
+// 字标第 0 行和第 5 行开头的空格不能丢。
+//
+// ANSI Shadow 的阴影相对字身右下偏移一格，所以 'C' 的顶横 `██████╗` 和底横
+// `╚═════╝` 都比它的竖笔 `██║` 右移一列 —— figlet 官方输出里这两行就以一个
+// 空格开头，其余四行从第 0 列起。丢掉这个空格，'C' 的上下两横会比竖笔左移
+// 一格，整个字像被斜切了一刀。
+//
+// 这条抓的是**复制粘贴吃字符**：从终端里拷字标时行首那个空格很容易被顺手
+// trim 掉，而丢掉之后画面只是「有点歪」，不像坏了 —— 肉眼扫过去会当成设计。
+// 下面两组数来自 figlet 的 ansi_shadow 字体生成 "CLICHAT" 的官方输出
+// （去掉行尾空格）。
+func TestZenLogo_LeadingSpacesMatchFiglet(t *testing.T) {
+	wantIndent := []int{1, 0, 0, 0, 0, 1}
+	wantWidth := []int{52, 52, 49, 49, 49, 49}
+
+	if len(zenLogoArt) != len(wantIndent) {
+		t.Fatalf("字标 %d 行，want %d 行", len(zenLogoArt), len(wantIndent))
+	}
+	for i, l := range zenLogoArt {
+		if got := len(l) - len(strings.TrimLeft(l, " ")); got != wantIndent[i] {
+			t.Errorf("第 %d 行前导空格 %d 个，want %d —— 行首那个空格是字的一部分，不是缩进",
+				i, got, wantIndent[i])
+		}
+		if got := textWidth(strings.TrimRight(l, " ")); got != wantWidth[i] {
+			t.Errorf("第 %d 行去掉行尾空格后 %d 列，want %d —— 字形和 figlet 官方输出对不上",
+				i, got, wantWidth[i])
+		}
+	}
+}
+
 // 首页那行提示说的是首页能做的事，不是会话屏的。
 func TestZen_HintIsScreenSpecific(t *testing.T) {
 	home := zenHintFor(zenHome)
