@@ -48,6 +48,8 @@ type fakeFolder struct {
 type fakeMessage struct {
 	header Header
 	body   string
+	// html 为真表示 body 是 HTML 转过来的（见 AddHTMLMessage）。
+	html bool
 }
 
 // NewFake 创建一个空的假客户端，自带 INBOX、Sent、Trash 三个文件夹。
@@ -62,8 +64,27 @@ func NewFake() *Fake {
 	return f
 }
 
-// AddMessage 往文件夹里塞一封邮件，返回分配到的 UID。
+// AddMessage 往文件夹里塞一封纯文本邮件，返回分配到的 UID。
 func (f *Fake) AddMessage(folder string, h Header, body string) uint32 {
+	return f.add(folder, h, body, false)
+}
+
+// AddHTMLMessage 往文件夹里塞一封 **HTML** 邮件，返回分配到的 UID。
+//
+// rawHTML 是**原始 HTML**，不是转好的 Markdown：这里会走一遍真实的
+// CleanBody(raw, true)，存进去的东西和线上取信得到的完全一致。Fake 的
+// 意义就是让测试跑在生产那条路径上，正文转出来的形状也是这条路径的一部分
+// —— 直接把转好的 Markdown 塞进去，等于把生成器从这条链路上摘掉了，
+// 「HTML 邮件被标成 HTML」这类判据也就没了依据（那个标记正是从这一支
+// 冒出来的，见 readPlainText）。
+//
+// 单独一个方法而不是给 AddMessage 加个 bool 参数：绝大多数测试用的是
+// 纯文本，给它们全部改一遍调用点，换来的只是每个调用点多一个 false。
+func (f *Fake) AddHTMLMessage(folder string, h Header, rawHTML string) uint32 {
+	return f.add(folder, h, CleanBody(rawHTML, true), true)
+}
+
+func (f *Fake) add(folder string, h Header, body string, isHTML bool) uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -71,7 +92,7 @@ func (f *Fake) AddMessage(folder string, h Header, body string) uint32 {
 	fl.nextUID++
 	h.UID = fl.nextUID
 	h.Folder = folder
-	fl.messages[h.UID] = &fakeMessage{header: h, body: body}
+	fl.messages[h.UID] = &fakeMessage{header: h, body: body, html: isHTML}
 	return h.UID
 }
 
@@ -191,6 +212,7 @@ func (f *Fake) Body(folder string, uid uint32) (Message, error) {
 		FromName: m.header.FromName,
 		Date:     m.header.Date,
 		Body:     m.body,
+		HTML:     m.html,
 	}, nil
 }
 

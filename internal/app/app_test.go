@@ -75,8 +75,9 @@ func TestApp_InitialSyncAggregatesThreads(t *testing.T) {
 	if len(threads) != 1 {
 		t.Fatalf("want 1 thread, got %d", len(threads))
 	}
-	if threads[0].Root != "<a@x>" {
-		t.Errorf("root = %q, want <a@x>", threads[0].Root)
+	// 会话 ID 按参与人集合算：这一来一往只有 alice 一个对方。
+	if threads[0].ID != "alice@x.com" {
+		t.Errorf("ID = %q, want %q", threads[0].ID, "alice@x.com")
 	}
 	if got := len(threads[0].Messages); got != 2 {
 		t.Errorf("want 2 messages, got %d", got)
@@ -310,6 +311,12 @@ func TestApp_Bodies(t *testing.T) {
 	fake.AddMessage("INBOX", mail.Header{
 		MessageID: "<a@x>", From: "a@x.com", To: []string{testSelf}, Date: time.Now(),
 	}, "正文内容")
+	// HTML 邮件要能一路把「这是我转来的」这个事实带到界面上，否则消息头
+	// 上那个标记就没有依据。同一个发件人 —— 会话按参与人集合分，换个人
+	// 就落到另一个会话里去了。
+	fake.AddHTMLMessage("INBOX", mail.Header{
+		MessageID: "<h@x>", From: "a@x.com", To: []string{testSelf}, Date: time.Now(),
+	}, "<p>HTML 正文</p>")
 
 	a := newTestApp(t, fake)
 	if _, err := a.Sync(); err != nil {
@@ -320,8 +327,14 @@ func TestApp_Bodies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bodies: %v", err)
 	}
-	if got := bodies["<a@x>"]; got != "正文内容" {
-		t.Errorf("正文 = %q", got)
+	if got := bodies["<a@x>"]; got.Text != "正文内容" {
+		t.Errorf("正文 = %q", got.Text)
+	}
+	if got := bodies["<a@x>"]; got.HTML {
+		t.Error("纯文本正文被标成了 HTML")
+	}
+	if got := bodies["<h@x>"]; !got.HTML {
+		t.Error("来自 text/html 的正文没被标成 HTML")
 	}
 }
 
@@ -349,15 +362,15 @@ func TestApp_InitialWindowFiltersByAge(t *testing.T) {
 
 	got := map[string]bool{}
 	for _, th := range a.Threads() {
-		got[th.Root] = true
+		got[th.ID] = true
 	}
-	if got["<old@x>"] {
+	if got["a@x.com"] {
 		t.Error("一年前的邮件应被时间窗口裁掉")
 	}
-	if !got["<new@x>"] {
+	if !got["b@x.com"] {
 		t.Error("刚收到的邮件不该被裁掉")
 	}
-	if !got["<nodate@x>"] {
+	if !got["c@x.com"] {
 		t.Error("Date 缺失的邮件应保守保留，而不是被丢掉")
 	}
 }
@@ -401,11 +414,11 @@ func TestSync_MissingFolderIsNotAnError(t *testing.T) {
 	}
 
 	// 更要紧的是：不能因为 Sent 缺失就把 INBOX 的同步结果丢掉。
-	roots := map[string]bool{}
+	ids := map[string]bool{}
 	for _, th := range a.Threads() {
-		roots[th.Root] = true
+		ids[th.ID] = true
 	}
-	if !roots["<a@x>"] {
+	if !ids["alice@x.com"] {
 		t.Error("INBOX 里的会话没进索引 —— 缺的文件夹把同步结果带走了")
 	}
 }
@@ -587,6 +600,9 @@ func TestApp_LastBodyTextLoadsOnDemand(t *testing.T) {
 // 这个开关最容易做成一个假功能：配置改了、状态栏也显示了，但历史邮件
 // 一封都没多 —— 因为本地游标还停在半路，下一轮同步照旧从 LastUID+1 走。
 // 所以这条判据盯的不是「配置项变成 true」，而是**邮件真的多出来了**。
+//
+// 数的是**消息条数**不是会话数：这六封都来自 alice，按参与人聚合是同
+// 一个会话（会话数一直是 1，拿它当判据什么都测不出来）。
 func TestApp_AllMailRewindsCursorAndSkipsClamp(t *testing.T) {
 	fake := mail.NewFake()
 	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
@@ -610,7 +626,7 @@ func TestApp_AllMailRewindsCursorAndSkipsClamp(t *testing.T) {
 	if _, err := a.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if got := len(a.Threads()); got != 2 {
+	if got := countMessages(a.Threads()); got != 2 {
 		t.Fatalf("默认模式下首次同步只该拉最近 2 封，实际 %d 封", got)
 	}
 
@@ -624,9 +640,18 @@ func TestApp_AllMailRewindsCursorAndSkipsClamp(t *testing.T) {
 	if _, err := a.Sync(); err != nil {
 		t.Fatalf("第二轮 Sync: %v", err)
 	}
-	if got := len(a.Threads()); got != 6 {
+	if got := countMessages(a.Threads()); got != 6 {
 		t.Errorf("打开全量模式后应该看到 6 封，实际 %d 封 —— 游标没退回去", got)
 	}
+}
+
+// countMessages 数出所有会话里一共有多少条消息。
+func countMessages(threads []thread.Thread) int {
+	n := 0
+	for _, th := range threads {
+		n += len(th.Messages)
+	}
+	return n
 }
 
 // 关掉全量模式不该反过来删东西：已经同步下来的邮件得留着，游标也不该动。

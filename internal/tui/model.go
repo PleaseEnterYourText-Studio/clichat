@@ -100,14 +100,14 @@ type Model struct {
 	// helpReturn 记录帮助页是从哪个界面打开的，关掉时退回去。
 	helpReturn mode
 
-	// confirmKind 描述待确认的操作；pendingRoot 是它作用的会话根 ID。
+	// confirmKind 描述待确认的操作；pendingID 是它作用的会话 ID。
 	// 转发也复用它来记住目标会话。
 	confirmKind confirmKind
-	pendingRoot string
+	pendingID   string
 
-	activeRoot string
-	bodies     map[string]string
-	replyAll   bool
+	activeID string
+	bodies   map[string]app.Body
+	replyAll bool
 
 	// lastSentText 暂存发送失败的那条消息，供重发用。
 	lastSentText string
@@ -128,17 +128,24 @@ type Model struct {
 type syncResultMsg struct {
 	changed bool
 	err     error
+
+	// manual 表示这次同步是用户按了刷新（Ctrl+R），不是定时轮询。
+	//
+	// 手动刷新时即使没有新数据也要重读一次正文：用户按了键、界面却纹丝
+	// 不动，看着就是「刷新坏了」；何况上一轮的正文可能加载失败过，这里
+	// 是重试的机会。轮询不能这么干 —— 每 30 秒一次全量正文往返。
+	manual bool
 }
 
 type sendResultMsg struct {
-	// root 是这条消息所属会话的根 ID。新会话发完之后靠它把视图切过去。
-	root string
-	err  error
+	// id 是这条消息所属会话的 ID。新会话发完之后靠它把视图切过去。
+	id  string
+	err error
 }
 
 type bodiesResultMsg struct {
-	root   string
-	bodies map[string]string
+	id     string
+	bodies map[string]app.Body
 	err    error
 }
 
@@ -186,7 +193,7 @@ func New(cfg *config.Config) Model {
 	m := Model{
 		cfg:      cfg,
 		input:    in,
-		bodies:   map[string]string{},
+		bodies:   map[string]app.Body{},
 		replyAll: true,
 	}
 
@@ -213,7 +220,7 @@ func NewWithApp(cfg *config.Config, a *app.App) Model {
 		cfg:      cfg,
 		app:      a,
 		input:    in,
-		bodies:   map[string]string{},
+		bodies:   map[string]app.Body{},
 		replyAll: true,
 		mode:     modeList,
 		status:   "正在同步…",
@@ -241,6 +248,18 @@ func (m Model) syncCmd() tea.Cmd {
 	}
 }
 
+// refreshCmd 是用户主动触发的同步（会话里按 Ctrl+R）。
+//
+// 和 syncCmd 只差一个 manual 标记 —— 有了它，即使这一轮没有新邮件，
+// 当前会话的正文也会重读一遍（见 syncResultMsg.manual）。
+func (m Model) refreshCmd() tea.Cmd {
+	a := m.app
+	return func() tea.Msg {
+		changed, err := a.Sync()
+		return syncResultMsg{changed: changed, err: err, manual: true}
+	}
+}
+
 func (m Model) pollCmd() tea.Cmd {
 	d := m.cfg.PollInterval()
 	if d < minPollInterval {
@@ -249,12 +268,22 @@ func (m Model) pollCmd() tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return pollTickMsg(t) })
 }
 
-func (m Model) loadBodiesCmd(th thread.Thread) tea.Cmd {
+// loadBodiesByIDCmd 生成一个「读某个会话的正文」的命令。
+//
+// 会话只在**执行的那一刻**按 ID 去取，不在生成命令时取好塞进闭包 ——
+// 命令是异步跑的，从生成到执行之间，会话可能已经因为一次同步而变了
+// （多了新邮件）。拿着按下按键那一刻的旧快照去读，读出来的是旧正文，
+// 落地后反而把刚刷新的内容覆盖掉；而且看运气：并发的「同步」和「读正文」
+// 谁后完成谁赢。
+func (m Model) loadBodiesByIDCmd(id string) tea.Cmd {
 	a := m.app
-	root := th.Root
 	return func() tea.Msg {
+		th, ok := a.Thread(id)
+		if !ok {
+			return bodiesResultMsg{id: id}
+		}
 		bodies, err := a.Bodies(th)
-		return bodiesResultMsg{root: root, bodies: bodies, err: err}
+		return bodiesResultMsg{id: id, bodies: bodies, err: err}
 	}
 }
 
@@ -269,22 +298,22 @@ func (m Model) markReadCmd(th thread.Thread) tea.Cmd {
 
 func (m Model) replyCmd(text string) tea.Cmd {
 	a := m.app
-	root := m.activeRoot
+	id := m.activeID
 	replyAll := m.replyAll
 	return func() tea.Msg {
-		th, ok := a.Thread(root)
+		th, ok := a.Thread(id)
 		if !ok {
 			return sendResultMsg{err: errors.New("会话已经不存在了")}
 		}
-		return sendResultMsg{root: root, err: a.Reply(th, text, replyAll)}
+		return sendResultMsg{id: id, err: a.Reply(th, text, replyAll)}
 	}
 }
 
 func (m Model) startCmd(to []string, text string) tea.Cmd {
 	a := m.app
 	return func() tea.Msg {
-		root, err := a.Start(to, text)
-		return sendResultMsg{root: root, err: err}
+		id, err := a.Start(to, text)
+		return sendResultMsg{id: id, err: err}
 	}
 }
 
@@ -379,7 +408,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.lastSync = time.Now()
 		m.applySyncResult(msg)
-		return m, nil
+		// 同步之后，当前会话的正文也要跟着重载（什么时候该重载见
+		// reloadBodiesIfChanged 的说明）。
+		//
+		// 少了这一步，用户在会话里干等的时候，对方新来的那一封只会出现在
+		// 左边的列表里（未读标记、时间、主题都会变），右边那一屏却停在
+		// 上一轮的内容上 —— 看上去就是「刷新没用」。轮询路径原先只更新了
+		// 列表，这就是本轮修的那个 bug。
+		return m, m.reloadBodiesIfChanged(msg)
 
 	case sendResultMsg:
 		m.busy = false
@@ -396,13 +432,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setThreads(m.app.Threads())
 		}
 		// 新会话在发出去之前不存在于列表里，发完才出现 —— 把视图切过去。
-		if msg.root != "" {
-			m.activeRoot = msg.root
+		if msg.id != "" {
+			m.activeID = msg.id
 		}
 		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
 
 	case bodiesResultMsg:
-		if msg.root != m.activeRoot {
+		if msg.id != m.activeID {
 			return m, nil // 用户已经切走了，这份结果作废
 		}
 		m.bodies = msg.bodies
@@ -429,11 +465,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// 会话被删掉之后要退回列表，否则会停在一个已经不存在的会话上，
 		// 标题空着、输入框还能打字，但发不出去。
-		if m.activeRoot != "" {
-			if _, ok := m.app.Thread(m.activeRoot); !ok {
+		if m.activeID != "" {
+			if _, ok := m.app.Thread(m.activeID); !ok {
 				m.mode = modeList
-				m.activeRoot = ""
-				m.bodies = map[string]string{}
+				m.activeID = ""
+				m.bodies = map[string]app.Body{}
 				m.input.Blur()
 			}
 		}
@@ -719,10 +755,10 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.allMailCmd(!m.app.AllMail())
 		}
 
-		// 顺序要紧：pendingThread 读的是 pendingRoot，必须趁清空之前问。
+		// 顺序要紧：pendingThread 读的是 pendingID，必须趁清空之前问。
 		th, ok := m.pendingThread()
 		m.confirmKind = confirmNone
-		m.pendingRoot = ""
+		m.pendingID = ""
 		m.mode = modeList
 		m.input.Blur()
 		if !ok {
@@ -736,7 +772,7 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n", "esc", "q":
 		m.confirmKind = confirmNone
-		m.pendingRoot = ""
+		m.pendingID = ""
 		m.mode = modeList
 		return m, nil
 	}
@@ -745,10 +781,10 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // pendingThread 返回模态操作（删除确认 / 转发）作用在哪个会话上。
 func (m Model) pendingThread() (thread.Thread, bool) {
-	if m.app == nil || m.pendingRoot == "" {
+	if m.app == nil || m.pendingID == "" {
 		return thread.Thread{}, false
 	}
-	return m.app.Thread(m.pendingRoot)
+	return m.app.Thread(m.pendingID)
 }
 
 func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -854,7 +890,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "d":
 		if th, ok := m.currentThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.confirmKind = confirmDelete
 			m.mode = modeConfirm
 			return m, nil
@@ -862,7 +898,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "f":
 		if th, ok := m.currentThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.mode = modeForward
 			m.input.EchoMode = textinput.EchoNormal
 			m.input.Placeholder = "转发给（收件人邮箱地址）"
@@ -885,10 +921,10 @@ func (m Model) openActive(solo bool) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.activeRoot = th.Root
+	m.activeID = th.ID
 	m.mode = modeChat
 	m.scroll = 0
-	m.bodies = map[string]string{}
+	m.bodies = map[string]app.Body{}
 	m.replyAll = !solo
 	m.input.EchoMode = textinput.EchoNormal
 	m.input.Placeholder = "输入消息，回车发送"
@@ -897,7 +933,7 @@ func (m Model) openActive(solo bool) (tea.Model, tea.Cmd) {
 
 	return m, tea.Batch(
 		textinput.Blink,
-		m.loadBodiesCmd(th),
+		m.loadBodiesByIDCmd(th.ID),
 		m.markReadCmd(th),
 	)
 }
@@ -908,8 +944,8 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "esc":
 		m.mode = modeList
-		m.activeRoot = ""
-		m.bodies = map[string]string{}
+		m.activeID = ""
+		m.bodies = map[string]app.Body{}
 		m.input.Blur()
 		return m, nil
 	case "tab":
@@ -921,6 +957,22 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.scroll > 0 {
 			m.scroll -= 5
 		}
+
+	// 会话里的刷新。
+	//
+	// 必须带 Ctrl：这里输入框有焦点，裸 r 会被当成正文的字符打进去
+	// （下面那段注释说的就是这个坑）。列表上的 r 还在，那是另一个界面。
+	//
+	// 只发一条命令（同步），正文的重载由 syncResultMsg 那条路自己接上。
+	// **别写成 tea.Batch(syncCmd, loadActiveBodiesCmd)**：两条命令并发跑，
+	// 读正文那条若在同步落地之前开始，读到的就是旧会话，完成得又晚的话
+	// 还会把新正文覆盖回去 —— 表现为「按了刷新，内容随机地不更新」。
+	case "ctrl+r":
+		if m.app == nil {
+			return m, nil
+		}
+		m.busy = true
+		return m, m.refreshCmd()
 
 	// 下面这几个都用 Ctrl 组合键：会话里输入框有焦点，单个字母会被
 	// 当成正文打进消息里。这是"聊天界面"和"列表界面"按键设计上最
@@ -941,14 +993,14 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if th, ok := m.activeThread(); ok {
 			m.busy = true
 			m.mode = modeList
-			m.activeRoot = ""
-			m.bodies = map[string]string{}
+			m.activeID = ""
+			m.bodies = map[string]app.Body{}
 			m.input.Blur()
 			return m, m.unreadCmd(th)
 		}
 	case "ctrl+d":
 		if th, ok := m.activeThread(); ok {
-			m.pendingRoot = th.Root
+			m.pendingID = th.ID
 			m.confirmKind = confirmDelete
 			m.mode = modeConfirm
 			m.input.Blur()
@@ -963,8 +1015,8 @@ func (m Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		m.lastSentText = text
 		m.busy = true
-		// activeRoot 为空说明这是刚新建、还没落地的会话。
-		if m.activeRoot == "" {
+		// activeID 为空说明这是刚新建、还没落地的会话。
+		if m.activeID == "" {
 			return m, m.startCmd(m.newChatTo, text)
 		}
 		return m, m.replyCmd(text)
@@ -994,8 +1046,8 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeChat
-		m.activeRoot = "" // 还没建立会话
-		m.bodies = map[string]string{}
+		m.activeID = "" // 还没建立会话
+		m.bodies = map[string]app.Body{}
 		m.input.Placeholder = "输入消息，回车发送"
 		m.input.SetValue("")
 		m.newChatTo = []string{addr}
@@ -1009,14 +1061,35 @@ func (m Model) handleNewChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) loadActiveBodiesCmd() tea.Cmd {
-	if m.app == nil || m.activeRoot == "" {
+	if m.app == nil || m.activeID == "" {
 		return nil
 	}
-	th, ok := m.app.Thread(m.activeRoot)
-	if !ok {
+	if _, ok := m.app.Thread(m.activeID); !ok {
 		return nil
 	}
-	return m.loadBodiesCmd(th)
+	return m.loadBodiesByIDCmd(m.activeID)
+}
+
+// reloadBodiesIfChanged 决定「这一轮同步之后，要不要重读当前会话的正文」。
+//
+// 四种情况分开看：
+//   - 同步出错 → 不读。索引可能只同步了一半，读出来的是一份残缺的正文。
+//   - 用户按了 Ctrl+R（manual）→ 读。按了键就得有动静，这也是重试正文
+//     加载失败的机会。
+//   - 轮询且确有新数据（changed）→ 读。这正是要修的那个 bug：不读的话，
+//     对方新来的那一封只出现在左边列表里，右边停在上一轮的内容上。
+//   - 轮询且没有新数据 → 不读。定时器每 30 秒响一次，每次都把整个会话的
+//     正文重拉一遍，等于把空转的轮询变成稳定的网络流量。
+//
+// 不在会话里时 loadActiveBodiesCmd 自己返回 nil，所以列表模式下这里是无操作。
+func (m Model) reloadBodiesIfChanged(msg syncResultMsg) tea.Cmd {
+	if msg.err != nil {
+		return nil
+	}
+	if !msg.changed && !msg.manual {
+		return nil
+	}
+	return m.loadActiveBodiesCmd()
 }
 
 // setThreads 换掉会话列表，并重算过滤结果与光标位置。
@@ -1064,10 +1137,10 @@ func (m *Model) clampCursor() {
 
 // activeThread 返回当前打开的会话。
 func (m Model) activeThread() (thread.Thread, bool) {
-	if m.app == nil || m.activeRoot == "" {
+	if m.app == nil || m.activeID == "" {
 		return thread.Thread{}, false
 	}
-	return m.app.Thread(m.activeRoot)
+	return m.app.Thread(m.activeID)
 }
 
 // ---- 连接 ----

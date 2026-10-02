@@ -24,6 +24,10 @@ func update(m Model, msg tea.Msg) (Model, tea.Cmd) {
 }
 
 // keyMsg 把按键名转成 tea.KeyMsg。
+//
+// ctrl+<字母> 走真实的 KeyCtrl<X> 类型，而不是把 "ctrl+r" 当字面字符串
+// 塞进 KeyRunes —— 后者只是碰巧 String() 也叫 "ctrl+r"，看着能过，
+// 但它模拟的是「用户打了 ctrl+r 这六个字符」，不是按下组合键。
 func keyMsg(s string) tea.KeyMsg {
 	switch s {
 	case "enter":
@@ -36,9 +40,14 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
-	default:
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 	}
+	if len(s) == 6 && strings.HasPrefix(s, "ctrl+") {
+		if c := s[5]; c >= 'a' && c <= 'z' {
+			// Ctrl+A 是 0x01，往下顺推 —— 和 bubbletea 的 KeyCtrlX 编码一致。
+			return tea.KeyMsg{Type: tea.KeyType(c - 'a' + 1)}
+		}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
 
 // newMockModel 造一个跑在内存假数据上的模型。
@@ -87,12 +96,12 @@ func syncOnce(t *testing.T, m Model) Model {
 // loadBodies 直接调 app.Bodies 并把结果喂给模型。
 func loadBodies(t *testing.T, m Model) Model {
 	t.Helper()
-	th, ok := m.app.Thread(m.activeRoot)
+	th, ok := m.app.Thread(m.activeID)
 	if !ok {
 		return m
 	}
 	bodies, err := m.app.Bodies(th)
-	m, _ = update(m, bodiesResultMsg{root: th.Root, bodies: bodies, err: err})
+	m, _ = update(m, bodiesResultMsg{id: th.ID, bodies: bodies, err: err})
 	return m
 }
 
@@ -104,9 +113,11 @@ func TestModel_ListsThreads(t *testing.T) {
 		t.Fatalf("want 1 thread, got %d", got)
 	}
 	view := m.View()
-	if !strings.Contains(view, "alice") {
+	// 会话标题是「和谁」—— 对方的名字（有显示名就用显示名）。
+	if !strings.Contains(view, "Alice") {
 		t.Errorf("会话列表里没看到对方名字:\n%s", view)
 	}
+	// 副行是「现在在聊什么」—— 会话里最新一条的主题。
 	if !strings.Contains(view, "会议") {
 		t.Errorf("会话列表里没看到主题:\n%s", view)
 	}
@@ -199,7 +210,7 @@ func TestModel_EscReturnsToList(t *testing.T) {
 	if m.mode != modeList {
 		t.Fatalf("Esc 之后 mode = %v, want modeList", m.mode)
 	}
-	if m.activeRoot != "" {
+	if m.activeID != "" {
 		t.Error("Esc 之后应清空当前会话")
 	}
 }
@@ -260,7 +271,7 @@ func TestModel_SetupWizardStartsWithProviders(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -292,7 +303,7 @@ func TestModel_UnlockRejectsShortMasterPassword(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m.setup.step = stepMaster

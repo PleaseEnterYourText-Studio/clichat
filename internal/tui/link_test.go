@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/app"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 )
 
@@ -94,7 +95,7 @@ func TestSetupWizard_ShowsClickableLink(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})
@@ -118,7 +119,7 @@ func TestSetupWizard_LinkVisibleOnPasswordStep(t *testing.T) {
 	m := Model{
 		cfg:    config.Default(),
 		input:  textinput.New(),
-		bodies: map[string]string{},
+		bodies: map[string]app.Body{},
 	}
 	m.beginSetup()
 	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})

@@ -142,6 +142,8 @@ func (m Model) renderThreadList(width, height int) string {
 		}
 
 		title := truncate(marker+star+threadTitle(th), width-2)
+		// 副行是「现在在聊什么」—— 会话里最新一条的主题。一个会话可以
+		// 横跨很多话题，所以它和标题（对方的名字）回答的是两个问题。
 		subject := th.Subject
 		if subject == "" {
 			subject = "(无主题)"
@@ -236,17 +238,19 @@ func (m Model) renderChat(width, height int) string {
 }
 
 func (m Model) chatTitle() string {
-	if m.activeRoot == "" && len(m.newChatTo) > 0 {
+	if m.activeID == "" && len(m.newChatTo) > 0 {
 		return "新会话 → " + strings.Join(m.newChatTo, ", ")
 	}
-	if th, ok := m.activeThread(); ok {
-		title := threadTitle(th)
-		if th.IsGroup() {
-			title += fmt.Sprintf("（%d 人）", len(th.Participants))
-		}
-		return title
+	th, ok := m.activeThread()
+	if !ok {
+		return "会话"
 	}
-	return "会话"
+	// 群聊在会话页里把人全列出来：这一行比列表宽得多，而列表里那个
+	// 「等 N 人」只是为了省地方。
+	if th.IsGroup() {
+		return fmt.Sprintf("%s（%d 人）", strings.Join(peerNames(th), ", "), len(th.Peers))
+	}
+	return threadTitle(th)
 }
 
 // renderMessage 把一个消息渲染成若干行。
@@ -260,36 +264,64 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 
 	body := m.bodies[msg.MessageID]
 	switch {
-	case body != "":
+	case body.Text != "":
 	case msg.UID == 0:
-		body = "（本地待同步）"
+		body.Text = "（本地待同步）"
 	default:
-		body = "…"
+		body.Text = "…"
 	}
 
-	who := displayName(msg, mine) + "  " + msg.Date.Local().Format("15:04")
+	// 消息头 = 谁 + 什么时候 [+ HTML 标记]。
+	//
+	// 那个标记是「为什么这段排版和邮件原文不一样」的答案：HTML 邮件在
+	// 入库前被转成了 Markdown（见 mail.HTMLToMarkdown），按钮、表格、
+	// 标题都被重排过。没有它的话，用户看到排版差异只会以为是我们
+	// 渲染坏了，然后去提一个查不出来源的 bug。
+	tag := ""
+	if body.HTML {
+		tag = "HTML"
+	}
+
+	name := displayName(msg, mine) + "  " + msg.Date.Local().Format("15:04")
+	// 先按可用宽度截断**再**上色 —— 反过来的话 lipgloss 会把转义序列
+	// 算进宽度，右边的边框就歪了（styles.go 里那条硬约束）。显示名是
+	// 对方自己写的，长度没有上限，所以这一步不是多余的。
+	budget := width - 2
+	if tag != "" {
+		budget -= textWidth(tag) + 1 // +1 是标记前面那个空格
+	}
+	name = truncate(name, budget)
+
 	if mine {
-		who = styleMine.Render(who)
+		name = styleMine.Render(name)
 	} else {
-		who = senderStyle(msg.From).Render(who)
+		name = senderStyle(msg.From).Render(name)
+	}
+
+	head := name
+	if tag != "" {
+		head += " " + styleTag.Render(tag)
 	}
 
 	out := make([]string, 0, 8)
+	// 布局：自己的靠右对齐、无底色；对方的左起一格缩进、铺满一条灰底，
+	// 一直铺到版面右沿。两边在余光里就能分开（paintPeerRow 里说明了
+	// 为什么不能直接把整行丢给 style.Render）。
 	if mine {
-		out = append(out, padLeft(who, width-2))
+		out = append(out, padLeft(head, width-2))
 	} else {
-		out = append(out, " "+who)
+		out = append(out, paintPeerRow(padRight(" "+head, width-2)))
 	}
 	// 正文里存的是 Markdown（见 mail.HTMLToMarkdown），这里渲染成终端样式。
 	//
 	// 别改成「先上色再折行」—— 折行必须在 renderMarkdown 内部、在**上色之前**
 	// 完成：按 rune 算宽度的折行会把转义序列的每个字符当成一列，折点落错位置，
 	// 还会把序列拦腰切断。详见 markdown.go 里的说明。
-	for _, line := range renderMarkdown(body, inner) {
+	for _, line := range renderMarkdown(body.Text, inner) {
 		if mine {
 			out = append(out, padLeft(line, width-2))
 		} else {
-			out = append(out, " "+line)
+			out = append(out, paintPeerRow(padRight(" "+line, width-2)))
 		}
 	}
 	return append(out, "")
@@ -316,13 +348,16 @@ func (m Model) renderInput() string {
 			styleMuted.Render("   （回车确定，Esc 取消）")
 
 	case modeChat:
-		hint := ""
-		if m.activeRoot != "" {
-			if m.replyAll {
-				hint = "   （Tab：发给所有人）"
-			} else {
-				hint = "   （Tab：只回发件人）"
-			}
+		hint := m.chatHint()
+		// 先按剩余宽度截断提示**再**上色。输入框里的字数是没上限的
+		// （textinput 不会自己折行），用户敲长句时提示会把这一行顶出
+		// 屏幕，右边那栏的边框就歪了。反过来先上色再截断会把转义序列
+		// 剪断（styles.go 那条硬约束）。
+		//
+		// 输入框自己的宽度用 lipgloss.Width 量 —— 它带 SGR 和光标，
+		// textWidth 那把尺子不认识转义序列。
+		if room := m.width - lipgloss.Width(m.input.View()); textWidth(hint) > room {
+			hint = truncate(hint, room)
 		}
 		return stylePrompt.Render(m.input.View()) + styleMuted.Render(hint)
 	}
@@ -330,6 +365,24 @@ func (m Model) renderInput() string {
 	// 列表模式没有输入框，这一行留给常驻快捷键提示。
 	// 界面上的功能之所以长期"不存在"，就是因为它们只活在代码里。
 	return styleMuted.Render(truncate(listHints(), m.width))
+}
+
+// chatHint 是会话内输入行右侧那串提示。
+//
+// 它是会话里唯一能直接看见动作键的地方 —— 输入框有焦点，动作键全被
+// 逼成了 Ctrl 组合（见 handleChatKey 顶部的说明），而帮助页在会话里
+// 得按 F1 才打得开。所以「刷新」这种天天要用的键必须写在这一行上：
+// 只写在帮助页里，等于它是一个只有按过 F1 的人才知道的功能。
+func (m Model) chatHint() string {
+	if m.activeID == "" {
+		// 新会话，还没落地 —— Tab 在这里没有意义（没有会话可回）。
+		return "   （回车发出第一封 · F1 帮助）"
+	}
+	scope := "只回发件人"
+	if m.replyAll {
+		scope = "发给所有人"
+	}
+	return "   （Tab：" + scope + " · Ctrl+R 刷新 · F1 帮助）"
 }
 
 // confirmPrompt 是确认框上的一句话。
@@ -607,18 +660,41 @@ func tailWindow(lines []string, height, scroll int) []string {
 }
 
 // threadTitle 给会话起一个短标题。
+//
+// 会话的名字是「和谁」，不是「聊什么」—— 这是 IM 的语义，也是把聚合键
+// 换成参与人集合之后自然的结果。主题降级成列表里的副行。
+//
+// 1:1 显示对方的名字（显示名优先，没有就用地址 @ 前那一段）；
+// 群聊显示「Alice 等 3 人」—— 没人给群起名字时 IM 就是这么写的。
 func threadTitle(th thread.Thread) string {
-	if len(th.Participants) == 0 {
+	if len(th.Peers) == 0 {
 		return "(只有你)"
 	}
-	if !th.IsGroup() {
-		return shortAddr(th.Participants[0])
+	name := peerLabel(th, th.Peers[0])
+	if len(th.Peers) == 1 {
+		return name
 	}
-	names := make([]string, 0, len(th.Participants))
-	for _, p := range th.Participants {
-		names = append(names, shortAddr(p))
+	return fmt.Sprintf("%s 等 %d 人", name, len(th.Peers))
+}
+
+// peerNames 是会话里全部对方的名字，顺序与 Peers 一致（按地址排序）。
+func peerNames(th thread.Thread) []string {
+	names := make([]string, 0, len(th.Peers))
+	for _, p := range th.Peers {
+		names = append(names, peerLabel(th, p))
 	}
-	return strings.Join(names, ", ")
+	return names
+}
+
+// peerLabel 是单个对方在界面上显示的名字。
+//
+// 地址本身是兜底：显示名只有在对方作为发件人露过面时才有（Header 里
+// 只有 FromName），所以群聊成员里有人只有地址是正常的。
+func peerLabel(th thread.Thread, addr string) string {
+	if n := th.NameOf(addr); n != "" {
+		return n
+	}
+	return shortAddr(addr)
 }
 
 // displayName 决定消息上显示谁的名字。

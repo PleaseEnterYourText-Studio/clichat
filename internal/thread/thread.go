@@ -1,22 +1,41 @@
-// Package thread 把散装的邮件头部聚合成会话线程。
+// Package thread 把散装的邮件头部聚合成会话。
 //
 // 这是纯函数模块：无 IO、无全局状态、可完全单测。
 //
 // # 聚合规则
 //
-// 对每条消息，按优先级挑出它的「父消息」：
+// 一个会话 = 和同一批人的全部往来。具体地，把每条消息的 From / To / Cc
+// 合起来、去掉自己，得到一个**参与人集合**；参与人集合相同的消息属于
+// 同一个会话。
 //
-//  1. References[0]  —— 引用链的第一个 ID 就是线程根
-//  2. In-Reply-To    —— 引用链缺失时的退化路径
-//  3. 都没有          —— 自己就是线程根
+// 这是「IM 语义」而不是「邮件线程语义」，是本包有意做的取舍：clichat 把
+// 邮件按层级呈现成聊天，会话列表要回答的是「和谁」，不是「哪个话题」。
 //
-// 关键点：父消息 **不需要** 存在于本地索引里。两条都引用同一个尚未拉取的
-// 根消息的邮件，依然会被正确合并。这正是冷启动能工作的原因。
+//   - **双向**：Alice 发我的、我发 Alice 的，参与人都是 {alice} —— 同一个
+//     会话。IM 里给某人发的消息本来就留在同一个窗口里。
+//   - **同样一批人的群发单独一个会话**：To 是 [Alice, Bob] 的讨论不会和
+//     只跟 Alice 的私聊混在一起。
+//   - 集合按**排序去重**后当键，所以聚合结果与输入顺序无关。
 //
-// # 明确不做
+// # References / In-Reply-To 不再参与聚合
 //
-// 不做 Subject 兜底匹配。它会把「同标题的两场不同讨论」错误合并。
-// 宁可有断链，不要错并。
+// 这是本包最反直觉的一处，理由写在这里：
+//
+//   - 一个话题里的消息本来就引用彼此、共用同一个参与人集合，所以按参与人
+//     聚合**天然蕴含**了线程合并 —— 回复链不可能被拆散，不需要并查集。
+//   - 「参与人相同但引用链断了」（对方换了客户端、中间几封没同步下来、
+//     根消息早于拉取窗口）现在也能并起来，比按引用链更抗噪。
+//
+// 代价是「同一个人 + 不同话题」也会合到一起。这是选定的行为，不是副作用：
+// 会话的名字是「和谁」，「聊什么」降到列表里的副行（最新一条的主题）。
+//
+// ⚠️ 因为这条规则，**界面上的一个会话不等于一个话题**，回复一个会话时
+// 引用链只能描述最后那一条消息的祖先（见 Thread.ReplyRefs），不能把会话
+// 里所有 Message-ID 都挂上去 —— 和同一个人来往几年的邮件有几千封，
+// 那个 References 头部会长到让服务端拒收。
+//
+// （旧版本这里写着「不做 Subject 兜底匹配……宁可有断链，不要错并」。
+// 那条规矩是跟着引用链聚合一起的，两者一起作废了。）
 package thread
 
 import (
@@ -52,18 +71,33 @@ type Header struct {
 
 // Thread 是一次聚合产出的会话。
 type Thread struct {
-	// Root 是线程根的 Message-ID。它可能并不存在于输入里
-	// （根消息比我们拉取的时间窗口更早），此时仅作标识用。
-	Root string
+	// ID 是会话的身份，由参与人集合派生（见 conversationKey）。
+	//
+	// 它取代了旧版的 Root。按参与人聚合之后不存在「线程根」—— 根是
+	// 引用链起点的名字，而引用链已经不参与聚合了。
+	//
+	// ID 与具体消息无关，所以它是稳定的：拉到新邮件、删掉旧邮件都不会
+	// 改变它。界面上用它记住「当前打开的是哪个会话」。
+	ID string
 
 	// Messages 按 (Date, MessageID) 升序排列。
 	Messages []Header
 
-	// Participants 是会话中出现过的所有地址（不含 self），
-	// 按首次出现顺序排列。
-	Participants []string
+	// Peers 是会话里除自己以外的全部地址，**按地址排序**。
+	//
+	// 排序而不是按出现顺序：它同时是会话键的一部分，必须与输入顺序
+	// 无关。会话里每条消息的参与人集合都等于它（这正是它们被分到
+	// 一起的原因）。
+	Peers []string
 
-	// Subject 是会话中最早那条消息的 Subject，已剥掉回复/转发前缀。
+	// Subject 是会话中**最新**那条有主题的消息的 Subject，
+	// 已剥掉回复/转发前缀。
+	//
+	// 用最新那条而不是最早那条：一个会话横跨多个话题时，「最早的
+	// 主题」什么都不是，最新那条才代表「现在在聊什么」。
+	//
+	// 从最后往前找第一条非空的：偶尔会有客户端发出不带主题的回复，
+	// 那时候退回上一条比整条会话失去主题强。
 	Subject string
 
 	// LastDate 是会话中最新一条消息的时间。
@@ -107,21 +141,71 @@ func (t Thread) LastFrom() string {
 	return t.Messages[len(t.Messages)-1].From
 }
 
+// ReplyRefs 返回「回复会话里最后一条消息」时该带的引用链：
+// 最后一条自己的 References，加上它本身。
+//
+// ⚠️ 别图省事直接用 MessageIDs()。会话是按参与人聚合的，可以横跨几年、
+// 上千封邮件，把它们全塞进 References 会写出一个几十 KB 的头部 ——
+// RFC 5322 建议单行不超过 998 字符，很多服务端直接拒收。引用链只该
+// 描述这一条消息的祖先，而它的父就是会话里的最后一条。
+func (t Thread) ReplyRefs() []string {
+	if len(t.Messages) == 0 {
+		return nil
+	}
+	last := t.Messages[len(t.Messages)-1]
+
+	seen := make(map[string]bool, len(last.References)+1)
+	out := make([]string, 0, len(last.References)+1)
+	for _, id := range last.References {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if last.MessageID != "" && !seen[last.MessageID] {
+		out = append(out, last.MessageID)
+	}
+	return out
+}
+
+// NameOf 返回某个地址在会话里出现过的显示名。
+//
+// 只认「作为发件人时带的显示名」—— Header 只有 FromName，To / Cc 那边
+// 不带名字。从最新往前找：对方改过显示名的话，最新的那个才对。
+//
+// 从来没露过名字就返回空串，由调用方决定拿什么兜底（界面用的是
+// 地址 @ 之前的那一段）。
+func (t Thread) NameOf(addr string) string {
+	addr = NormalizeAddress(addr)
+	if addr == "" {
+		return ""
+	}
+	for i := len(t.Messages) - 1; i >= 0; i-- {
+		if t.Messages[i].FromName != "" && NormalizeAddress(t.Messages[i].From) == addr {
+			return t.Messages[i].FromName
+		}
+	}
+	return ""
+}
+
 // IsGroup 判断是否为群聊。
 //
 // 规则：会话中出现过的地址（不含自己）≥ 2 个即为群聊，
 // 等价于「含自己 ≥ 3」。
 //
-// 注意一个预期行为：一次 CC 了第三人的 1:1 对话会被算作群聊。
+// 注意一个预期行为：一次 CC 了第三人的 1:1 对话会被算作群聊，
+// 而且**自成一个会话**、不会并进那两个人和我的私聊里。
 // 这是规则的正常结果，不做特例。
 func (t Thread) IsGroup() bool {
-	return len(t.Participants) >= 2
+	return len(t.Peers) >= 2
 }
 
 // Aggregate 把邮件头部聚合成会话，按 LastDate 降序返回。
 //
 // self 是当前账号地址（内部会做小写规范化），用于把「自己」
-// 从参与者列表里剔除。
+// 从参与人集合里剔除。
 //
 // 输出是确定的：同样的输入集合，无论顺序如何，结果都一致。
 func Aggregate(headers []Header, self string) []Thread {
@@ -129,6 +213,9 @@ func Aggregate(headers []Header, self string) []Thread {
 
 	// 先补齐缺失的 Message-ID，再按 ID 去重 —— 这样合成 ID 撞车
 	// 的情况也能被去重覆盖到。
+	//
+	// 顺序有讲究：conversationKey 在参与人为空时会退化成用 Message-ID
+	// 当键，所以它必须在合成 ID 之后跑。
 	msgs := make([]Header, len(headers))
 	copy(msgs, headers)
 	for i := range msgs {
@@ -138,35 +225,28 @@ func Aggregate(headers []Header, self string) []Thread {
 	}
 	msgs = dedupeByMessageID(msgs)
 
-	uf := newUnionFind()
+	// 按会话键分组，同时保持首次出现的顺序 —— 输出确定靠它。
+	groups := make(map[string]*group, len(msgs))
+	order := make([]*group, 0, len(msgs))
 	for i := range msgs {
-		uf.add(msgs[i].MessageID)
-	}
-	for i := range msgs {
-		if parent := threadParent(msgs[i]); parent != "" {
-			uf.union(msgs[i].MessageID, parent)
+		key, peers := conversationKey(msgs[i], self)
+		g, ok := groups[key]
+		if !ok {
+			g = &group{key: key, peers: peers}
+			groups[key] = g
+			order = append(order, g)
 		}
+		g.idx = append(g.idx, i)
 	}
 
-	// 按并查集的根分组，同时保持首次出现的顺序，保证输出确定。
-	groups := make(map[string][]int)
-	roots := make([]string, 0, len(msgs))
-	for i := range msgs {
-		root := uf.find(msgs[i].MessageID)
-		if _, seen := groups[root]; !seen {
-			roots = append(roots, root)
-		}
-		groups[root] = append(groups[root], i)
-	}
-
-	threads := make([]Thread, 0, len(roots))
-	for _, root := range roots {
-		threads = append(threads, buildThread(root, groups[root], msgs, self))
+	threads := make([]Thread, 0, len(order))
+	for _, g := range order {
+		threads = append(threads, buildThread(g, msgs))
 	}
 
 	sort.Slice(threads, func(i, j int) bool {
 		if threads[i].LastDate.Equal(threads[j].LastDate) {
-			return threads[i].Root < threads[j].Root
+			return threads[i].ID < threads[j].ID
 		}
 		return threads[i].LastDate.After(threads[j].LastDate)
 	})
@@ -174,21 +254,54 @@ func Aggregate(headers []Header, self string) []Thread {
 	return threads
 }
 
-// threadParent 按优先级挑出这条消息的父消息 ID。
-// 返回空串表示它自己是线程根。
-func threadParent(m Header) string {
-	if len(m.References) > 0 {
-		if id := strings.TrimSpace(m.References[0]); id != "" {
-			return id
-		}
-	}
-	return strings.TrimSpace(m.InReplyTo)
+// group 是分组过程中的临时状态：一个会话键、它的参与人集合、命中的消息下标。
+type group struct {
+	key   string
+	peers []string
+	idx   []int
 }
 
-// buildThread 把一组消息组装成一个 Thread。
-func buildThread(root string, idx []int, msgs []Header, self string) Thread {
-	list := make([]Header, len(idx))
-	for i, k := range idx {
+// conversationKey 算出一条消息的会话键与参与人集合。
+//
+// 参与人集合 = From ∪ To ∪ Cc − 自己，排序去重。排序是必须的：键是分组
+// 依据，「A 发给 B」和「B 发给 A」要算出同一个键，双向语义才成立。
+func conversationKey(m Header, self string) (string, []string) {
+	seen := make(map[string]bool, len(m.To)+len(m.Cc)+1)
+	peers := make([]string, 0, len(m.To)+len(m.Cc)+1)
+	add := func(addr string) {
+		a := NormalizeAddress(addr)
+		if a == "" || a == self || seen[a] {
+			return
+		}
+		seen[a] = true
+		peers = append(peers, a)
+	}
+
+	add(m.From)
+	for _, addr := range m.To {
+		add(addr)
+	}
+	for _, addr := range m.Cc {
+		add(addr)
+	}
+	sort.Strings(peers)
+
+	// 分隔符用 NUL：地址里不可能有它，逗号/空格都可能（带引号的本地部分）。
+	key := strings.Join(peers, "\x00")
+	if key == "" {
+		// 没有别的参与人 —— 自己发给自己，或者头部残缺到地址全空。
+		// 这种消息没有「和谁」可言，一条一个会话。硬塞进同一个空键
+		// 的会话里，会把互不相干的邮件藏到一起（而且藏得很深：
+		// 列表上只显示成一条「(只有你)」）。
+		key = "\x01" + m.MessageID
+	}
+	return key, peers
+}
+
+// buildThread 把一组同键的消息组装成一个 Thread。
+func buildThread(g *group, msgs []Header) Thread {
+	list := make([]Header, len(g.idx))
+	for i, k := range g.idx {
 		list[i] = msgs[k]
 	}
 	sort.Slice(list, func(i, j int) bool {
@@ -199,13 +312,13 @@ func buildThread(root string, idx []int, msgs []Header, self string) Thread {
 	})
 
 	t := Thread{
-		Root:     root,
+		ID:       g.key,
 		Messages: list,
-		Subject:  StripSubjectPrefix(list[0].Subject),
+		Peers:    g.peers,
+		Subject:  latestSubject(list),
 		LastDate: list[len(list)-1].Date,
 	}
 
-	seen := make(map[string]bool)
 	for _, m := range list {
 		if !m.Seen {
 			t.Unread++
@@ -213,25 +326,18 @@ func buildThread(root string, idx []int, msgs []Header, self string) Thread {
 		if m.Flagged {
 			t.Starred++
 		}
-		for _, addr := range addressesOf(m) {
-			a := NormalizeAddress(addr)
-			if a == "" || a == self || seen[a] {
-				continue
-			}
-			seen[a] = true
-			t.Participants = append(t.Participants, a)
-		}
 	}
-
 	return t
 }
 
-func addressesOf(m Header) []string {
-	out := make([]string, 0, 2+len(m.To)+len(m.Cc))
-	out = append(out, m.From)
-	out = append(out, m.To...)
-	out = append(out, m.Cc...)
-	return out
+// latestSubject 取「现在在聊什么」：从最新往前找第一条有主题的消息。
+func latestSubject(list []Header) string {
+	for i := len(list) - 1; i >= 0; i-- {
+		if s := StripSubjectPrefix(list[i].Subject); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // dedupeByMessageID 去掉 Message-ID 重复的邮件。
@@ -314,46 +420,4 @@ func StripSubjectPrefix(s string) string {
 		}
 		s = strings.TrimSpace(s[cut:])
 	}
-}
-
-// unionFind 是不带 rank 的并查集，但有一条关键约定：
-// union(child, parent) 永远让 **被引用的那一方当根**。
-//
-// 这样并查集的根会自然收敛到真正的线程根（References 链的起点），
-// 而不是任意一个节点。路径压缩保证复杂度依然接近 O(1)。
-type unionFind struct {
-	parent map[string]string
-}
-
-func newUnionFind() *unionFind {
-	return &unionFind{parent: make(map[string]string)}
-}
-
-func (u *unionFind) add(x string) {
-	if _, ok := u.parent[x]; !ok {
-		u.parent[x] = x
-	}
-}
-
-func (u *unionFind) find(x string) string {
-	u.add(x)
-	root := x
-	for u.parent[root] != root {
-		root = u.parent[root]
-	}
-	// 路径压缩
-	for u.parent[x] != root {
-		next := u.parent[x]
-		u.parent[x] = root
-		x = next
-	}
-	return root
-}
-
-func (u *unionFind) union(child, parent string) {
-	rc, rp := u.find(child), u.find(parent)
-	if rc == rp {
-		return
-	}
-	u.parent[rc] = rp
 }

@@ -24,10 +24,11 @@ took four messages over two hours ends up looking like a small pile of paperwork
 
 clichat just looks at it differently: **treat mail as messages.**
 
-- **Threads, not messages.** Replies are grouped by the `References` /
-  `In-Reply-To` headers that mail has always carried. No subject-line guessing,
-  because merging two unrelated discussions that happen to share a title is
-  worse than leaving them apart.
+- **Conversations, not messages.** A conversation is the set of people on the
+  other side, so it is what the conversation actually *is* — Alice writing to you
+  and you writing to Alice are one conversation, and a message to
+  `[Alice, Bob]` is another. No subject-line guessing: merging two unrelated
+  discussions that happen to share a title is worse than leaving them apart.
 - **One binary, no server.** IMAP and SMTP go straight from your machine to your
   provider. There is no clichat account, no relay, no third party in the middle.
 - **Your credentials stay yours.** The auth code is encrypted with a master
@@ -39,8 +40,9 @@ clichat just looks at it differently: **treat mail as messages.**
 
 ## Screenshots
 
-**Conversation view** — group threads are coloured per sender, your own messages
-sit on the right:
+**Conversation view** — the other side's rows sit on a grey band while yours are
+right-aligned; in group threads every sender is coloured. The `HTML` marker in a
+message head means that body was converted from an HTML mail:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
@@ -133,7 +135,20 @@ and the process list.
 
 **Reading**
 
-- Threads grouped by `References` / `In-Reply-To`, not by subject line
+- **A conversation is a set of participants.** The key is the set of addresses
+  on the other side, excluding you: mail Alice sent you and mail you sent Alice
+  land in the same conversation, while a message addressed to just
+  `[Alice, Bob]` is a separate one. That is what a chat means by a conversation —
+  it is *who*, not *which reply chain*. (Earlier versions chained
+  `References` / `In-Reply-To`; the moment someone else replied it fell apart
+  into a new thread, and long mail lists shattered.)
+- The list **titles a conversation with the other side's name** (participants,
+  for a group) and puts what you are actually talking about on the second line —
+  that is the subject of the newest message. A conversation spans many subjects,
+  so those are two different questions
+- **The other side's rows sit on a grey band**, while yours are right-aligned
+  with no background — after a few exchanges you no longer have to read names to
+  tell who is talking. The grey adapts to the terminal's lightness
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
@@ -145,7 +160,12 @@ and the process list.
 - …and that Markdown is rendered back into terminal styling — headings lose
   their hashes and are colour-coded by level, list items get real numbers,
   tables come out as aligned columns, images show their `alt` text, links stay
-  clickable. You read mail, not markup
+  clickable, and horizontal rules span the whole chat pane. You read mail, not
+  markup
+- **Messages that came from HTML carry an `HTML` marker in the message head.**
+  The conversion is lossy (buttons, tables and font-size headings all get
+  re-flowed); the marker is there so "the layout differs from the original mail"
+  has an explanation instead of looking like a rendering bug
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -162,6 +182,11 @@ and the process list.
 **Keeping it working**
 
 - Cold start pulls only the last 90 days / 500 messages, whichever comes first
+- **Refresh**: when polling finds new mail, the open conversation's bodies
+  reload with it, so sitting in a chat never leaves you on last round's screen;
+  inside a conversation `Ctrl+R` syncs immediately and re-reads its bodies.
+  A poll that found nothing does *not* reload them — otherwise every 30-second
+  tick would turn into a full network round-trip
 - "All mail" mode (`a` in the list) rewinds the local cursor and pulls the whole
   history in one go. While it is on, the status bar keeps saying so — the first
   sync gets noticeably slower, and that should not be a surprise
@@ -344,6 +369,7 @@ message — every action uses a `Ctrl` combination instead.
 |---|---|
 | `Enter` | Send |
 | `Tab` | Reply-all / reply-to-sender |
+| `Ctrl+R` | Refresh: sync once now, and re-read this conversation's bodies |
 | `PgUp` / `PgDn` | Scroll |
 | `Esc` | Back to list |
 | `Ctrl+Y` | Copy last message body |
@@ -464,7 +490,7 @@ The layout, top-down by dependency:
 
 | Package | Responsibility |
 |---|---|
-| `internal/thread` | Pure threading algorithm (union-find). No IO, fully unit-tested |
+| `internal/thread` | Pure functions: group by participant set, order, count unread and stars. No IO, fully unit-tested |
 | `internal/mail` | IMAP fetch / SMTP send / MIME parsing, behind a `Client` interface |
 | `internal/store` | Header index, persisted as JSON |
 | `internal/config` | Config, provider presets, Argon2id + secretbox credential encryption |

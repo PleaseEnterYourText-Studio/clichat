@@ -29,10 +29,22 @@ type App struct {
 
 	mu      sync.Mutex
 	threads []thread.Thread
-	byRoot  map[string]thread.Thread
+	byID    map[string]thread.Thread
 
 	bodyMu sync.Mutex
-	bodies map[string]string // Message-ID -> 正文
+	bodies map[string]Body // Message-ID -> 正文
+}
+
+// Body 是一封邮件的正文，连同它是怎么来的。
+//
+// 把「怎么来的」和正文放在一起，是为了让它跟着正文走在同一条路上 ——
+// 分成两个 map（正文一个、标记一个）的话，两边一旦不同步，界面上就会
+// 出现「这条的标记是上一条的」这种极难查的错位。
+type Body struct {
+	Text string
+	// HTML 为真表示 Text 是 text/html 转成 Markdown 的结果（见
+	// mail.HTMLToMarkdown）。界面上要在消息头标出来 —— 转换是有损的。
+	HTML bool
 }
 
 // New 组装一个 App。
@@ -41,8 +53,8 @@ func New(cfg *config.Config, client mail.Client, index *store.Index) *App {
 		cfg:    cfg,
 		client: client,
 		index:  index,
-		byRoot: map[string]thread.Thread{},
-		bodies: map[string]string{},
+		byID:   map[string]thread.Thread{},
+		bodies: map[string]Body{},
 	}
 	a.reaggregate()
 	return a
@@ -64,12 +76,15 @@ func (a *App) Threads() []thread.Thread {
 	return out
 }
 
-// Thread 按根 ID 取一个会话。
-func (a *App) Thread(root string) (thread.Thread, bool) {
+// Thread 按会话 ID 取一个会话。
+//
+// ID 是按参与人集合算出来的（见 thread.Aggregate），不是某条消息的
+// Message-ID —— 它和会话里某一条消息的 ID 长得像，但两者不能混用。
+func (a *App) Thread(id string) (thread.Thread, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	t, ok := a.byRoot[root]
+	t, ok := a.byID[id]
 	return t, ok
 }
 
@@ -268,18 +283,43 @@ func (a *App) reaggregate() {
 	defer a.mu.Unlock()
 
 	a.threads = threads
-	a.byRoot = make(map[string]thread.Thread, len(threads))
+	a.byID = make(map[string]thread.Thread, len(threads))
 	for _, t := range threads {
-		a.byRoot[t.Root] = t
+		a.byID[t.ID] = t
 	}
+}
+
+// threadIDOf 找出包含某条消息的会话 ID。
+//
+// 发出消息之后界面要切到那个会话上，而会话 ID 是按参与人集合算出来的、
+// 并不等于刚生成的 Message-ID（那只是会话里的一条消息）。所以这里要
+// 回过头去索引里找它落在了哪个会话。
+//
+// 找不到返回空串 —— 调用方当作「不切视图」处理，不要猜一个。
+func (a *App) threadIDOf(messageID string) string {
+	if messageID == "" {
+		return ""
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, t := range a.threads {
+		for _, m := range t.Messages {
+			if m.MessageID == messageID {
+				return t.ID
+			}
+		}
+	}
+	return ""
 }
 
 // Bodies 返回一个会话里所有消息的正文，key 是 Message-ID。
 //
 // 单封拉取失败不会让整个会话打不开 —— 那一封填一句提示，
 // 其余的照常显示。返回的 error 只表示「有部分失败」。
-func (a *App) Bodies(th thread.Thread) (map[string]string, error) {
-	out := make(map[string]string, len(th.Messages))
+func (a *App) Bodies(th thread.Thread) (map[string]Body, error) {
+	out := make(map[string]Body, len(th.Messages))
 
 	var missing []mail.Header
 	for _, m := range th.Messages {
@@ -289,7 +329,7 @@ func (a *App) Bodies(th thread.Thread) (map[string]string, error) {
 		}
 		if m.UID == 0 {
 			// 乐观插入的本地消息还没有 UID，服务端拿不到。
-			out[m.MessageID] = ""
+			out[m.MessageID] = Body{}
 			continue
 		}
 		missing = append(missing, m)
@@ -299,17 +339,18 @@ func (a *App) Bodies(th thread.Thread) (map[string]string, error) {
 	for _, m := range missing {
 		msg, err := a.client.Body(m.Folder, m.UID)
 		if err != nil {
-			out[m.MessageID] = "（正文加载失败）"
+			out[m.MessageID] = Body{Text: "（正文加载失败）"}
 			errs = append(errs, fmt.Errorf("%s UID %d: %w", m.Folder, m.UID, err))
 			continue
 		}
-		a.cacheBody(m.MessageID, msg.Body)
-		out[m.MessageID] = msg.Body
+		b := Body{Text: msg.Body, HTML: msg.HTML}
+		a.cacheBody(m.MessageID, b)
+		out[m.MessageID] = b
 	}
 	return out, errors.Join(errs...)
 }
 
-func (a *App) cachedBody(id string) (string, bool) {
+func (a *App) cachedBody(id string) (Body, bool) {
 	a.bodyMu.Lock()
 	defer a.bodyMu.Unlock()
 
@@ -317,11 +358,11 @@ func (a *App) cachedBody(id string) (string, bool) {
 	return b, ok
 }
 
-func (a *App) cacheBody(id, body string) {
+func (a *App) cacheBody(id string, b Body) {
 	a.bodyMu.Lock()
 	defer a.bodyMu.Unlock()
 
-	a.bodies[id] = body
+	a.bodies[id] = b
 }
 
 // MarkRead 把一个会话标为已读，服务端和本地索引一起改。
@@ -494,7 +535,7 @@ func (a *App) lastBody(th thread.Thread) (string, error) {
 	last := th.Messages[len(th.Messages)-1]
 
 	if b, ok := a.cachedBody(last.MessageID); ok {
-		return b, nil
+		return b.Text, nil
 	}
 	if last.UID == 0 {
 		// 本地乐观插入的副本还没同步到服务端，服务端上没有它。
@@ -504,8 +545,9 @@ func (a *App) lastBody(th thread.Thread) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	a.cacheBody(last.MessageID, msg.Body)
-	return msg.Body, nil
+	b := Body{Text: msg.Body, HTML: msg.HTML}
+	a.cacheBody(last.MessageID, b)
+	return b.Text, nil
 }
 
 // forwardBody 拼出转发正文：一段来源说明 + 原文。
@@ -542,7 +584,7 @@ func (a *App) Reply(th thread.Thread, body string, replyAll bool) error {
 
 	var to []string
 	if replyAll {
-		to = append(to, th.Participants...)
+		to = append(to, th.Peers...)
 	} else if target := replyTarget(th, a.cfg.Self()); target != "" {
 		to = append(to, target)
 	}
@@ -551,20 +593,24 @@ func (a *App) Reply(th thread.Thread, body string, replyAll bool) error {
 	}
 
 	// 回复的返回值不重要 —— 会话本来就已经存在，界面不需要切过去。
+	//
+	// References 用 ReplyRefs() 而不是 MessageIDs()：会话是按参与人聚合的，
+	// 一个会话可以横跨上千封邮件，全挂上去会写出一个让服务端拒收的头部。
 	_, err := a.send(mail.Outgoing{
 		To:         to,
 		Subject:    "Re: " + th.Subject,
 		Body:       body,
 		InReplyTo:  th.LastMessageID(),
-		References: th.MessageIDs(),
+		References: th.ReplyRefs(),
 	})
 	return err
 }
 
 // Start 新建一个会话并发出第一条消息。
 //
-// 返回新会话的根 ID（就是这条消息的 Message-ID）。界面需要它把视图
-// 切到刚建好的会话上 —— 否则用户发完第一条消息会停在一个空白页面上。
+// 返回的是**会话 ID**（按参与人集合算出来的），不是这条消息的 Message-ID。
+// 界面需要它把视图切到刚建好的会话上 —— 否则用户发完第一条消息会停在
+// 一个空白页面上。
 func (a *App) Start(to []string, body string) (string, error) {
 	if len(to) == 0 {
 		return "", errors.New("收件人为空")
@@ -580,11 +626,14 @@ func (a *App) Start(to []string, body string) (string, error) {
 	return a.send(mail.Outgoing{To: to, Subject: subject, Body: body})
 }
 
-// send 发信，并把发出去的消息立刻并进本地索引。
+// send 发信，并把发出去的消息立刻并进本地索引，返回它落在的**会话 ID**。
 //
 // 这个「乐观插入」很重要：服务商把已发送邮件存进 Sent 需要一轮轮询，
 // 不等它的话，用户发完消息要盯着空白的会话看半分钟。
 // 等 Sent 的副本同步回来时，会因为 Message-ID 相同而被自动去重。
+//
+// 返回值是会话 ID 而不是 Message-ID：界面拿它去 Thread() 里查会话，
+// 两者不通用（会话 ID 按参与人集合算，见 thread.Aggregate）。
 func (a *App) send(out mail.Outgoing) (string, error) {
 	id, err := a.client.Send(out)
 	if err != nil {
@@ -595,7 +644,7 @@ func (a *App) send(out mail.Outgoing) (string, error) {
 	}
 	log.Printf("发送成功: Message-ID=%s，%d 个收件人", id, len(out.To)+len(out.Cc))
 
-	a.cacheBody(id, out.Body)
+	a.cacheBody(id, Body{Text: out.Body})
 	a.index.Merge([]mail.Header{{
 		MessageID:  id,
 		References: out.References,
@@ -609,7 +658,7 @@ func (a *App) send(out mail.Outgoing) (string, error) {
 		Seen:       true,
 	}})
 	a.reaggregate()
-	return id, nil
+	return a.threadIDOf(id), nil
 }
 
 // replyTarget 找出「只回发件人」时该发给谁。

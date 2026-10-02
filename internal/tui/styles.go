@@ -23,7 +23,74 @@ var (
 	styleLink     = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
 	// styleMDRule 是正文里分隔线（---）被渲染成的那条横线。
 	styleMDRule = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	// styleTag 是消息头上那个「HTML」小标记。
+	//
+	// 用灰色而不是亮色：它是一条**只读说明**（这条正文是转出来的），
+	// 不是状态、更不是警告，亮起来会跟发件人名字抢注意力。灰色却仍然
+	// 看得见，足够了。
+	styleTag = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	// stylePeerRow 是对方消息那几行的底色。
+	//
+	// 只给**对方**的行铺灰底，自己的保持无底色 —— 自己那边靠右对齐、
+	// 名字用另一个颜色，已经够区分了。这样余光一扫就能分出「谁在说」，
+	// 不用去读名字。
+	//
+	// 自适应深浅：浅色终端给浅灰，深色终端给深灰。写死一个灰，在另一种
+	// 背景的终端上要么糊成一片、要么刺眼。
+	stylePeerRow = lipgloss.NewStyle().Background(peerRowBg)
 )
+
+// peerRowBg 是对对方消息行铺的那个灰。
+//
+// 253 = 很浅的灰（浅色终端上刚刚看得出来），236 = 很深的灰（深色终端上
+// 同样只差一档）。两边都刻意贴着各自的背景走：这是**分区**用的底色，
+// 不是高亮，抢了正文的对比度就本末倒置了。
+var peerRowBg = lipgloss.AdaptiveColor{Light: "253", Dark: "236"}
+
+// peerRowBgSeq 返回当前终端上该用的底色序列；终端不支持颜色时返回空串。
+//
+// 借 lipgloss 把自适应色解析成具体序列，而不是自己去判断终端深浅 ——
+// 深浅判断（COLORFGBG / OSC 11 查询）和色彩降级（真彩 → 256 → 16）都是
+// lipgloss/termenv 的活，手抄一遍迟早和别处的上色对不上。
+func peerRowBgSeq() string {
+	// 探针字符只是为了把「样式前缀」和「内容」分开；用一个宽度为 0、
+	// 不可能出现在正文里的字符，就不用担心它在别处出现。
+	const probe = "\x00"
+	rendered := stylePeerRow.Render(probe)
+	if i := strings.Index(rendered, probe); i > 0 {
+		return rendered[:i]
+	}
+	return ""
+}
+
+// paintPeerRow 给对方消息的整整一行铺上底色（右侧一直铺到版面边沿）。
+//
+// ⚠️ 不能简单地写 stylePeerRow.Render(line)。行里已经套着各种前景色样式
+// （发件人名字、标题、链接、行内代码），每一段结尾都带一个 SGR 重置
+// \x1b[0m，它会把外层刚设好的底色**一起清掉**。实测：
+//
+//	inner    "\x1b[1;38;5;39m我\x1b[0m  14:32"
+//	wrapped  "\x1b[48;5;236m\x1b[1;38;5;39m我\x1b[0m  14:32\x1b[0m"
+//	                                              ↑ 从这里起底色就没了
+//
+// 于是底色只在「没上过色的那几段」后面看得见，一行花成一段一段的 ——
+// 比不铺还难看。
+//
+// 所以底色是**在每个重置之后重新压上去**的，末了用 \x1b[49m 恢复终端的
+// 默认背景，免得底色漏到下一行去。
+//
+// 这条做法依赖一个实测过的事实：渲染层吐出的重置序列只有 \x1b[0m 一种，
+// 其余都是 \x1b[1m / \x1b[3m / \x1b[38;5;Nm 这类「设参数」序列，不会反向
+// 清掉底色。TestChat_PeerRowsAreBandPainted 守着这一点。
+func paintPeerRow(line string) string {
+	seq := peerRowBgSeq()
+	if seq == "" {
+		return line
+	}
+	line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+seq)
+	return seq + line + "\x1b[49m"
+}
 
 // hyperlink 把文本包成 OSC 8 终端超链接。
 //

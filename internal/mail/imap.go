@@ -192,9 +192,11 @@ func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySecti
 	return h
 }
 
-// Body 拉取单封邮件的纯文本正文。
+// Body 拉取单封邮件的正文。
 //
-// HTML 邮件会被降级成纯文本，引用历史会被砍掉 —— 这是聊天视图该有的样子。
+// HTML 邮件会被转成 Markdown（不是降级成纯文本 —— 链接、表格、标题都
+// 要留着，见 readPlainText），引用历史会被砍掉，这是聊天视图该有的样子。
+// 返回的 Message.HTML 说明正文走的是哪一支。
 func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -226,11 +228,12 @@ func (c *liveClient) Body(folder string, uid uint32) (Message, error) {
 			}
 		}
 		if r := msg.GetBody(section); r != nil {
-			body, err := readPlainText(r)
+			body, isHTML, err := readPlainText(r)
 			if err != nil {
 				return Message{}, fmt.Errorf("解析 %s 的正文失败: %w", folder, err)
 			}
 			out.Body = body
+			out.HTML = isHTML
 		}
 	}
 	if err := <-done; err != nil {
@@ -337,10 +340,13 @@ func (c *liveClient) Move(folder string, uids []uint32, dest string) error {
 // 4 MB，这点开销可以忽略。
 //
 // 附件一律忽略 —— v1 不支持附件。
-func readPlainText(r io.Reader) (string, error) {
+//
+// 第二个返回值说明正文是从哪儿来的：true 表示走的是 HTML 那一支。
+// 调用方要把它一路带到界面上（消息头的 HTML 标记），因为转换是有损的。
+func readPlainText(r io.Reader) (body string, isHTML bool, err error) {
 	mr, err := gomail.CreateReader(r)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer mr.Close()
 
@@ -351,7 +357,7 @@ func readPlainText(r io.Reader) (string, error) {
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 
 		switch h := part.Header.(type) {
@@ -373,9 +379,9 @@ func readPlainText(r io.Reader) (string, error) {
 	}
 
 	if strings.TrimSpace(htmlBody) != "" {
-		return CleanBody(htmlBody, true), nil
+		return CleanBody(htmlBody, true), true, nil
 	}
-	return CleanBody(plain, false), nil
+	return CleanBody(plain, false), false, nil
 }
 
 // hasFlag 判断标志集合里有没有某个标志。

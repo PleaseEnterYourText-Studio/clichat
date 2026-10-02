@@ -468,6 +468,34 @@ func TestRenderMarkdown_RuleBecomesLine(t *testing.T) {
 	}
 }
 
+// 分隔线要铺满聊天区的可用宽度。
+//
+// 原先这里硬限 40 列（min(width, 40)），在宽终端里一条分隔线只是一小截
+// 短线悬在左边，看着像没渲染完 —— 而它本来是对方在正文里画的一条分隔线，
+// 视觉上就该横贯聊天区（用户提的第 5 条）。
+func TestRenderMarkdown_RuleFillsWidth(t *testing.T) {
+	forceColor(t)
+
+	// 40 是原来那个上限，特意跨过去；30 在限内，一起看免得改过头。
+	for _, width := range []int{30, 60, 120} {
+		plain := plainText(joined(t, "上\n\n---\n\n下", width))
+
+		rule := ""
+		for _, ln := range strings.Split(plain, "\n") {
+			if strings.Contains(ln, "─") {
+				rule = ln
+				break
+			}
+		}
+		if rule == "" {
+			t.Fatalf("width=%d: 没找到分隔线:\n%s", width, plain)
+		}
+		if got := textWidth(rule); got != width {
+			t.Errorf("width=%d: 分隔线画了 %d 列，应该铺满整个可用宽度", width, got)
+		}
+	}
+}
+
 func TestRenderMarkdown_QuoteKeepsMarker(t *testing.T) {
 	forceColor(t)
 

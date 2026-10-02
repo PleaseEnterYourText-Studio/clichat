@@ -75,9 +75,14 @@ func TestReadPlainText_PrefersHTML(t *testing.T) {
 		"<p><a href=\"https://ex.com/confirm\" style=\"background:#07c\">确认订阅</a></p>\r\n" +
 		"--BOUND--\r\n"
 
-	got, err := readPlainText(strings.NewReader(raw))
+	got, isHTML, err := readPlainText(strings.NewReader(raw))
 	if err != nil {
 		t.Fatalf("readPlainText 出错: %v", err)
+	}
+
+	// 走的是 HTML 那一支 —— 界面靠这个标记在消息头上写「HTML」。
+	if !isHTML {
+		t.Error("正文来自 text/html，却没被标成 HTML")
 	}
 
 	// HTML 那一支胜出，按钮被还原成了 Markdown 链接。
@@ -97,9 +102,13 @@ func TestReadPlainText_PlainOnlyIsKeptAsIs(t *testing.T) {
 		"\r\n" +
 		"价格 2*3 元，字段 user_id\r\n"
 
-	got, err := readPlainText(strings.NewReader(raw))
+	got, isHTML, err := readPlainText(strings.NewReader(raw))
 	if err != nil {
 		t.Fatalf("readPlainText 出错: %v", err)
+	}
+	// 正文是纯文本，不该带上「HTML」标记 —— 消息头上会多一个骗人的标记。
+	if isHTML {
+		t.Error("正文是纯文本，却被标成了 HTML")
 	}
 	if want := "价格 2*3 元，字段 user_id"; got != want {
 		t.Errorf("纯文本正文被改动了:\n got: %q\nwant: %q", got, want)
@@ -114,9 +123,12 @@ func TestReadPlainText_HTMLOnly(t *testing.T) {
 		"\r\n" +
 		"<h2>本周进度</h2><ul><li>甲</li><li>乙</li></ul>\r\n"
 
-	got, err := readPlainText(strings.NewReader(raw))
+	got, isHTML, err := readPlainText(strings.NewReader(raw))
 	if err != nil {
 		t.Fatalf("readPlainText 出错: %v", err)
+	}
+	if !isHTML {
+		t.Error("只有 HTML 部分的邮件没被标成 HTML")
 	}
 	for _, want := range []string{"## 本周进度", "- 甲", "- 乙"} {
 		if !strings.Contains(got, want) {

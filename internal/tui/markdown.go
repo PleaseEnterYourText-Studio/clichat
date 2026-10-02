@@ -209,8 +209,14 @@ func renderMarkdown(src string, width int) []string {
 
 		if ln.kind == blockRule {
 			// 分隔线画成一条实心横线，比原样的 "---" 更像分隔线。
-			// 限长 40 列：横贯整个屏幕在聊天视图里太吵。
-			out = append(out, styleMDRule.Render(strings.Repeat("─", min(width, 40))))
+			//
+			// 铺满整个可用宽度。原先这里硬限 40 列，在宽终端里一条分隔线
+			// 只是一小截短线悬在左边，看着像没渲染完 —— 而它本来是对方
+			// 在正文里画的一条分隔线，视觉上就该横贯聊天区。
+			//
+			// width 是调用方给的**可用**宽度（renderMessage 传的是 width-4，
+			// 左右各留了缩进），所以铺满它不会顶破版面。
+			out = append(out, styleMDRule.Render(strings.Repeat("─", width)))
 			i++
 			continue
 		}
