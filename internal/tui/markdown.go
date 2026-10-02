@@ -81,7 +81,32 @@ const (
 	// attrQuote 是引用块里的文字，整体压暗，让它一眼看出是引来的话
 	// 而不是对方在说的事。
 	attrQuote
+	// attrHeading 占最高的两位，存标题的**显眼程度**（见下面的 tier* 常量）。
+	// 它是 attrs 里唯一一个「多位存值」的属性 —— 别的属性都是「有/无」，
+	// 而标题的层级天然是个值。占两位不用额外字段：uint8 正好还剩两位。
+	attrHeading
+	_
 )
+
+// 标题的显眼程度。**由解析层定，渲染层只负责翻成样式** ——
+// 哪些级别算「大标题」是 Markdown 的语义，不是终端的事。
+const (
+	tierNone   = 0 // 不是标题
+	tierStrong = 1 // # / ##
+	tierMid    = 2 // ### / ####
+	tierPlain  = 3 // ##### / ######：只加粗
+)
+
+// headingShift 是标题位数在 attrs 里的起始位置。
+const headingShift = 6
+
+// headingTier 取出标题的显眼程度。
+func headingTier(a attrs) int { return int(a >> headingShift) }
+
+// withHeadingTier 把显眼程度写进属性位。
+func withHeadingTier(a attrs, t int) attrs {
+	return a&^(3<<headingShift) | attrs(t)<<headingShift
+}
 
 // span 是一段样式相同的文本。
 //
@@ -112,8 +137,7 @@ const (
 
 // mdLine 是解析出来的一行（还没折行）。
 type mdLine struct {
-	kind  blockKind
-	level int // 标题级别（1-6）；表格里不用
+	kind blockKind
 
 	// prefix 是第一行的纯文本前缀（"• "、"1. "、"> "）。它是**纯文本**，
 	// 所以折行时它的宽度会一起算进去，上色不会影响折行位置。
@@ -139,6 +163,23 @@ type mdLine struct {
 // 存量邮件里就存着改前生成的 ![](src)。真走到这里还没兜住的话，一整条
 // 地址（常带用户标识）会直接铺进聊天流，那比少显示一个词糟得多。
 const imageFallback = "图片"
+
+// headingTier 把 Markdown 的标题级别（1-6）折成显眼程度。
+//
+// 三档而不是六档：终端里没有字号，能用的维度只有「颜色」和「加粗」，
+// 六档必然有几档长得一模一样，等于骗人。分档的依据是**结构作用** ——
+// # / ## 是「这封信在讲什么」，### / #### 是「这一节在讲什么」，
+// 更深的在邮件里基本不出现，只保留加粗。
+func headingTierFor(level int) int {
+	switch {
+	case level <= 2:
+		return tierStrong
+	case level <= 4:
+		return tierMid
+	default:
+		return tierPlain
+	}
+}
 
 // renderMarkdown 把邮件正文渲染成终端里的若干行。
 //
@@ -235,10 +276,15 @@ func parseMarkdown(src string) []mdLine {
 
 		if level, rest, ok := heading(raw); ok {
 			// 标题不显示 # 号，直接加粗 —— 这才是「渲染」而不是「露出源码」。
+			// 显眼程度一起记下来（见 tier* 常量）：终端里放不了字号，
+			// 颜色是唯一还能表达层级的维度。
+			//
+			// 记的位置是**样式位**而不是 mdLine 上的一个字段：层级是每一段
+			// 文字自身的性质（标题里嵌的普通文字也该跟着变），放进 attrs 才
+			// 跟着 span 走。原先 mdLine 上有个 `level int` 只写不读，已删。
 			out = append(out, mdLine{
 				kind:  blockHeading,
-				level: level,
-				spans: parseInline(rest, attrBold),
+				spans: parseInline(rest, withHeadingTier(attrBold, headingTierFor(level))),
 			})
 			ol = 0
 			continue
@@ -247,7 +293,6 @@ func parseMarkdown(src string) []mdLine {
 		if depth, rest, ok := quote(raw); ok {
 			out = append(out, mdLine{
 				kind:        blockQuote,
-				level:       depth,
 				prefix:      strings.Repeat("> ", depth),
 				prefixAttrs: attrQuote,
 				spans:       parseInline(rest, attrQuote),
@@ -268,7 +313,6 @@ func parseMarkdown(src string) []mdLine {
 			}
 			out = append(out, mdLine{
 				kind:   blockBullet,
-				level:  indent,
 				prefix: strings.Repeat("  ", indent) + marker,
 				spans:  parseInline(rest, 0),
 			})
@@ -534,7 +578,20 @@ func parseInline(s string, base attrs) []span {
 
 		case s[i] == '[':
 			if text, url, next, ok := linkAt(s, i); ok {
-				emit(text, attrLink, url)
+				// 链接文字里**还可能有行内标记**：`<a href><b>立即购买</b></a>`
+				// 生成出来就是 [**立即购买**](url)，`<a href><code>npm i</code></a>`
+				// 则是 [`npm i`](url) —— 都是真实邮件里有的形状。
+				//
+				// 整段当成一个 span 的话这些标记不会被解析，`**` 和反引号
+				// 会原样显示给用户。所以这里要**递归解析**：标记被吃掉、
+				// 内容留下。
+				//
+				// 强调本身显示不出来（styleSpan 只给链接上前景色 ——
+				// 加粗会像下划线一样把 OSC 8 切碎，链接就点不动了），
+				// 但「吃掉不显示」正是我们要的：链接已经用颜色标出来了。
+				for _, sp := range parseInline(text, base|attrLink) {
+					emit(sp.text, sp.attrs, url)
+				}
 				i = next
 				continue
 			}
@@ -1155,6 +1212,20 @@ func markdownStyle(a attrs) lipgloss.Style {
 	}
 	if a&attrQuote != 0 {
 		st = st.Foreground(lipgloss.Color("245"))
+	}
+	// 标题分级：越显眼越靠前，后面覆盖前面的颜色。
+	//
+	// 只上**前景色**，不碰别的属性 —— 和链接那条规矩同一个理由：
+	// 样式一旦带上下划线之类的，lipgloss 会给每个字符单独套一串 SGR。
+	// 加粗本来就是每字符一串，标题不裹 OSC 8，所以这里安全；
+	// 但也没必要多叠属性，颜色加粗两项足够表达层级。
+	switch headingTier(a) {
+	case tierStrong:
+		st = st.Bold(true).Foreground(lipgloss.Color("141"))
+	case tierMid:
+		st = st.Bold(true).Foreground(lipgloss.Color("110"))
+	case tierPlain:
+		st = st.Bold(true)
 	}
 	return st
 }

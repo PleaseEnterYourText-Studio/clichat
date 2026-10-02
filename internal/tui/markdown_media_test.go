@@ -375,6 +375,56 @@ func TestRenderMarkdown_NoMarkupLeaksFromHTML(t *testing.T) {
 			`<p><button data-href="https://ex.com/go">确认订阅</button></p>`,
 			[]string{"确认订阅"},
 		},
+		{
+			// 样式加粗：模板不写 <b> 而是把 font-weight 写进 style。
+			"样式加粗",
+			`<p>请看<span style="font-weight:bold">注意</span>这一句。</p>`,
+			[]string{"请看", "注意", "这一句。"},
+		},
+		{
+			"样式加粗的段落",
+			`<p style="font-weight:bold">整段都加粗</p>`,
+			[]string{"整段都加粗"},
+		},
+		{
+			// 标题推断：真实邮件用字号表达标题，不是 <h1>。
+			"字号表达的标题",
+			`<p style="font-size:14px">正文这一段要写得足够长，长到它成为正文字号的基准。</p>` +
+				`<p style="font-size:28px;font-weight:bold">大标题</p>`,
+			[]string{"正文这一段要写得足够长", "大标题"},
+		},
+		{
+			// 按钮的标签外面还要包一层 ** —— 标签里再来个 <b> 的话，
+			// 生成端会写出 ****去支付****，四个星号渲染端认不出来，
+			// 会原样显示给用户。样板里 <b> 的形状很常见。
+			"按钮标签里的标签加粗",
+			`<p><button><b>去支付</b></button></p>`,
+			[]string{"去支付"},
+		},
+		{
+			"按钮标签里嵌套的块级加粗",
+			`<p><button><div><span style="font-weight:bold">去支付</span></div></button></p>`,
+			[]string{"去支付"},
+		},
+		{
+			// 链接文字整段是一个链接 span，里面的 ** 不会被解析 ——
+			// 生成的是 [**立即购买**](url)，渲染端得把标记吃掉。
+			"链接文字里的标签加粗",
+			`<p><a href="https://ex.com/buy"><b>立即购买</b></a></p>`,
+			[]string{"立即购买"},
+		},
+		{
+			"链接文字里的行内代码",
+			`<p><a href="https://ex.com/i"><code>npm i clichat</code></a></p>`,
+			[]string{"npm i clichat"},
+		},
+		{
+			// 嵌套强调压成一层：`**粗*斜***` 那种串渲染端认不出，
+			// 生成端就该压平（见 htmlmd_test.go 的「嵌套强调只留一层」）。
+			"嵌套的行内强调",
+			`<p><b>粗<i>斜</i></b></p>`,
+			[]string{"粗斜"},
+		},
 	}
 
 	// 屏幕上一律不该出现的标记。样本里的文字都刻意不含这些字符，
@@ -408,5 +458,53 @@ func TestRenderMarkdown_NoMarkupLeaksFromHTML(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRenderMarkdown_StyleBoldActuallyBolds 是上面那条不变量的**正面**版本。
+//
+// 不变量只查「标记没漏出来」—— 它可以靠「生成端压根不产出标记」蒙过去
+// （那样就不漏了，但粗体也没了）。所以这里反着钉一次：真 HTML 里的样式
+// 加粗，屏幕上必须真的出现加粗属性。
+func TestRenderMarkdown_StyleBoldActuallyBolds(t *testing.T) {
+	forceColor(t)
+
+	md := mail.HTMLToMarkdown(`<p>普通<span style="font-weight:bold">加粗</span>普通</p>`)
+	line := joined(t, md, 80)
+	if !hasSGRParam(line, "1") {
+		t.Errorf("样式加粗没渲染成加粗：\nMarkdown: %q\n屏幕:     %q", md, line)
+	}
+}
+
+// TestRenderMarkdown_StyleHeadingActuallyBolds 同理，盯标题推断的落地：
+// 样式化标题在屏幕上必须比正文更显眼（加粗），否则「智能分析标题等级」
+// 解析出来也没人看得见。
+func TestRenderMarkdown_StyleHeadingActuallyBolds(t *testing.T) {
+	forceColor(t)
+
+	md := mail.HTMLToMarkdown(
+		`<p style="font-size:14px">正文这一段要写得足够长，长到它成为正文字号的基准。</p>` +
+			`<p style="font-size:28px;font-weight:bold">大标题</p>`)
+
+	var heading, body string
+	for _, ln := range renderMarkdown(md, 80) {
+		switch {
+		case strings.Contains(plainText(ln), "大标题"):
+			heading = ln
+		case strings.Contains(plainText(ln), "正文这一段"):
+			body = ln
+		}
+	}
+	if heading == "" || body == "" {
+		t.Fatalf("没找到标题行或正文行：\nMarkdown: %q", md)
+	}
+	if !hasSGRParam(heading, "1") {
+		t.Errorf("样式化标题没渲染成加粗：%q", heading)
+	}
+	if hasSGRParam(body, "1") {
+		t.Errorf("正文被渲染成加粗了：%q", body)
+	}
+	if sameSGR(heading, body) {
+		t.Errorf("标题和正文的样式一模一样，层级没落地：\n标题 %q\n正文 %q", heading, body)
 	}
 }

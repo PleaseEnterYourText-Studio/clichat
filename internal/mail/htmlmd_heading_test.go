@@ -162,8 +162,11 @@ func TestHTMLToMarkdown_HeadingNeedsOwnFontSize(t *testing.T) {
 		},
 		{
 			// 加粗**不是**判据的一部分：字号没超出正文就只是个加粗的段落。
+			// 这里刻意用 font-weight 样式而不是 <b> 标签 —— 真实邮件就是
+			// 这么写的，而它必须同时满足两件事：转成 **（样式即语义），
+			// 但不升级成标题（字号不够）。
 			name: "字号和正文一样不算标题",
-			sub:  `<p style="font-size:14px"><b>也是正文</b></p>`,
+			sub:  `<p style="font-size:14px;font-weight:bold">也是正文</p>`,
 			tail: "**也是正文**",
 		},
 		{
@@ -212,7 +215,7 @@ func TestHTMLToMarkdown_HeadingNeedsOwnFontSize(t *testing.T) {
 				`<p style="font-size:16px">内层的正文段落，字数要足够多，多到只要它被正确计入就一定是基准。</p>` +
 				`<p style="font-size:18px;font-weight:bold">略大的一点</p>` +
 				`</div></body>`,
-			wantRaw: "内层的正文段落，字数要足够多，多到只要它被正确计入就一定是基准。\n略大的一点",
+			wantRaw: "内层的正文段落，字数要足够多，多到只要它被正确计入就一定是基准。\n**略大的一点**",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

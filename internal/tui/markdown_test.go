@@ -329,8 +329,130 @@ func TestRenderMarkdown_HeadingDropsHashes(t *testing.T) {
 		t.Errorf("# 号没去掉，这不是渲染而是露出源码：%q", plainText(got[0]))
 	}
 	// 标题本身要加粗 —— 去掉 # 之后总得有个东西表示「这是标题」。
-	if !strings.Contains(got[0], "\x1b[1m") {
+	if !hasSGRParam(got[0], "1") {
 		t.Errorf("标题没加粗，看着和正文一样：%q", got[0])
+	}
+}
+
+// hasSGRParam 报告 s 里的 SGR 序列有没有 code 这个参数。
+//
+// **为什么不能写 strings.Contains(s, "\x1b[1m")**：lipgloss 会把同一个
+// 样式的参数合并成一条序列，加了前景色就成了 "\x1b[1;38;5;141m"。逐字节
+// 匹配只认「加粗恰好是唯一参数」这一种形态，别处一上色就假红 ——
+// 假红和假绿一样贵。而且参数要**分段精确比**，不能 Contains：256 色的
+// 色号 141 里也有个 "1"。
+func hasSGRParam(s, code string) bool {
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] != 0x1b || s[i+1] != '[' {
+			continue
+		}
+		j := i + 2
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' || j < len(s) && (s[j] == ';' || s[j] == ':') {
+			j++
+		}
+		if j >= len(s) || s[j] != 'm' {
+			continue // 不是 SGR（可能是别的 CSI），跳过
+		}
+		for _, p := range strings.FieldsFunc(s[i+2:j], func(r rune) bool {
+			return r == ';' || r == ':'
+		}) {
+			if p == code {
+				return true
+			}
+		}
+		i = j
+	}
+	return false
+}
+
+// sgrParams 把一行里所有 SGR 序列的参数收成一个集合（顺序无关）。
+// 用它比较「两种标题的样式不一样」，而不是去比具体色号 —— 配色是设计
+// 决定，判据要钉的是「分级确实生效」这个事实。
+func sgrParams(s string) map[string]bool {
+	out := map[string]bool{}
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] != 0x1b || s[i+1] != '[' {
+			continue
+		}
+		j := i + 2
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' || j < len(s) && (s[j] == ';' || s[j] == ':') {
+			j++
+		}
+		if j >= len(s) || s[j] != 'm' {
+			continue
+		}
+		for _, p := range strings.FieldsFunc(s[i+2:j], func(r rune) bool {
+			return r == ';' || r == ':'
+		}) {
+			out[p] = true
+		}
+		i = j
+	}
+	return out
+}
+
+func TestRenderMarkdown_HeadingTiersDiffer(t *testing.T) {
+	forceColor(t)
+
+	// 同一封信里三种层级的标题，渲染出来必须**看得出区别**。
+	// 否则「智能分析标题等级」解析出来也没用 —— 屏幕上还是分不出。
+	lines := renderMarkdown("# 一级\n\n### 三级\n\n##### 五级", 80)
+	if len(lines) != 5 {
+		t.Fatalf("想要 5 行（三个标题 + 两个空行），得到 %d 行：%q", len(lines), lines)
+	}
+	strong, mid, plain := lines[0], lines[2], lines[4]
+
+	for _, l := range []string{strong, mid, plain} {
+		if !hasSGRParam(l, "1") {
+			t.Errorf("标题没加粗：%q", l)
+		}
+	}
+	if sameSGR(strong, mid) {
+		t.Errorf("一级和三级标题样式一模一样，分级没生效：\n一级 %q\n三级 %q", strong, mid)
+	}
+	if sameSGR(mid, plain) {
+		t.Errorf("三级和五级标题样式一模一样，分级没生效：\n三级 %q\n五级 %q", mid, plain)
+	}
+}
+
+func sameSGR(a, b string) bool {
+	pa, pb := sgrParams(a), sgrParams(b)
+	if len(pa) != len(pb) {
+		return false
+	}
+	for k := range pa {
+		if !pb[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestRenderMarkdown_LinkTextMarkersAreEaten 盯的是「链接文字里的行内标记」。
+//
+// 生成端会产出 [**立即购买**](url) 和 [`npm i`](url) —— 分别是
+// `<a href><b>…</b></a>` 和 `<a href><code>…</code></a>` 的真实形状，
+// 在营销邮件里到处都是。链接文字如果整段当成一个 span，这些标记不会被
+// 解析，`**` 和反引号会原样显示给用户。
+//
+// 判据直接看屏幕：标记字符一个都不许留下。
+func TestRenderMarkdown_LinkTextMarkersAreEaten(t *testing.T) {
+	forceColor(t)
+
+	for _, tc := range []struct{ src, want string }{
+		{"[**立即购买**](https://ex.com/buy)", "立即购买"},
+		{"[`npm i clichat`](https://ex.com/i)", "npm i clichat"},
+		{"[~~旧价格~~](https://ex.com/old)", "旧价格"},
+		{"[**甲**和`乙`](https://ex.com/mix)", "甲和乙"},
+	} {
+		lines := renderMarkdown(tc.src, 80)
+		if len(lines) == 0 {
+			t.Fatalf("%q 渲染出了 0 行", tc.src)
+		}
+		got := plainText(lines[0])
+		if got != tc.want {
+			t.Errorf("%q 渲染成 %q，想要 %q（标记没被吃掉）", tc.src, got, tc.want)
+		}
 	}
 }
 

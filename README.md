@@ -138,13 +138,14 @@ and the process list.
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
   addresses, tables, lists and code blocks keep as much of their shape as
-  they can, and headings are recovered from **font size** (real mail styles
-  them, it does not tag them); quoted history trimmed — this is a chat view,
-  and quoting is noise in it. See [HTML mail, turned into
-  Markdown](#html-mail-turned-into-markdown) for how
+  they can, and headings are recovered from **font size** while bold is read
+  from `font-weight` (real mail styles them, it does not tag them); quoted
+  history trimmed — this is a chat view, and quoting is noise in it. See [HTML
+  mail, turned into Markdown](#html-mail-turned-into-markdown) for how
 - …and that Markdown is rendered back into terminal styling — headings lose
-  their hashes, list items get real numbers, tables come out as aligned columns,
-  images show their `alt` text, links stay clickable. You read mail, not markup
+  their hashes and are colour-coded by level, list items get real numbers,
+  tables come out as aligned columns, images show their `alt` text, links stay
+  clickable. You read mail, not markup
 - Two-pane layout, collapsing to a single pane under 80 columns
 
 **Acting**
@@ -216,13 +217,24 @@ emitting Markdown. The rules it follows:
   `<td style="font-size:28px;font-weight:bold">`. Trust only the tags and the
   hierarchy of the whole mail collapses in conversion: title, section headings
   and body all come out as the same-sized paragraphs. So we first estimate the
-  message's **body size** (the most frequent explicit `font-size`, ties going
-  to the smaller one), then map markedly larger sizes onto `#`-`######` in
-  bands. The test is deliberately strict: the element must declare its own
-  `font-size` (inherited does not count), and its content must hold no block
-  element, link, button or image — buttons are the most title-like thing there
-  is (big, bold, white on colour), and only "it is an `<a>` inside" tells them
-  apart.
+  message's **body size** (weighted by how much text each size carries, counting
+  only the innermost declaration, with ties going to the smaller one), then map
+  markedly larger sizes onto `#`-`######` in bands. The test is deliberately
+  strict: the element must declare its own `font-size` (inherited does not
+  count), and its content must hold no block element, link, button or image —
+  buttons are the most title-like thing there is (big, bold, white on colour),
+  and only "it is an `<a>` inside" tells them apart.
+- **Bold is read from styles too, not just from `<b>`.** Same cause: templates
+  put `font-weight:bold` in `style`, and trusting only the tags flattens every
+  emphasis in the body. `bold`, `bolder` and `600`-`900` all count, as does the
+  old `<font weight="bold">`.
+- **Markers must never nest into a string the renderer cannot read.** A style
+  bold and a tag bold on top of each other would emit `**a**b****`, and
+  `<b><i>a</i></b>` would emit `***a***` — the renderer deliberately rejects
+  ambiguous runs of asterisks (it shows the line verbatim rather than guess), so
+  the generator has to flatten instead: once inside asterisks, no inner marker.
+  `~~` is exempt — it does not collide with asterisks, and `**a~~old~~**`
+  renders fine.
 - **Body text is escaped.** A message containing `2*3` or `[TODAY]` should not
   come out italic, or open a link nobody wrote.
 - **Quoted history is dropped.** In a chat view, re-quoting the thread you just
@@ -239,6 +251,23 @@ into something readable: `###` becomes a bold line, list items get their real
 numbers (`1.` `2.` `3.`, not three `1.`s — the generator writes `1.` for every
 item on purpose), `[text](url)` shows only the text and stays clickable, and
 `2*3`, escaped on the way in, comes back as `2*3`.
+
+**Headings also have to stay distinguishable.** A terminal has no font size, so
+the only dimensions left are **colour** and **bold**. Six levels would mean some
+of them look identical, which is a lie — so they fold into three tiers by
+structural role:
+
+| Level | On screen | Why |
+| --- | --- | --- |
+| `#` `##` | accent colour + bold | what the message is about |
+| `###` `####` | another colour + bold | what this section is about |
+| `#####` `######` | bold only | barely occurs in mail; no second colour |
+
+Only the parser knows which levels count as "large"; the renderer just turns
+that into style — the banding is Markdown's semantics, not the terminal's. The
+prominence lives in the top two bits of `attrs`, making it the one
+**multi-valued** attribute there (the rest are on/off; a heading level is
+genuinely a value).
 
 There is no Markdown library in the loop. The input is a **closed** set of
 syntax, because clichat is what wrote it in the first place: every `*`,

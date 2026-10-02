@@ -95,6 +95,26 @@ type blockBuilder struct {
 	// 「标题级」—— 见 headingLevel。0 表示没测出来，此时不做标题推断。
 	base float64
 
+	// starDepth 是「当前已经嵌进几层星号标记（* / **）里」。
+	//
+	// 存在的理由是强调会叠在一起：`<span style="font-weight:bold">甲<b>乙</b></span>`
+	// 里外层包一次、<b> 再包一次，写出来是 `**甲**乙****` —— 内层的 ** 会
+	// 和外层的配对错位，渲染出来是一堆裸露的星号。所以已经在星号里时，
+	// 内层不再加标记。
+	//
+	// 只数星号，不数 ~~：`~~` 和星号不冲突，`**甲~~旧~~**` 渲染器认得。
+	// 而星号嵌套（`<b><i>甲</i></b>` → `***甲***`）渲染器认不得 ——
+	// 见 tui.until 里那段「前后不能再有同类字符」，它宁可整段原样显示，
+	// 所以生成端不制造那种串。
+	starDepth int
+
+	// noMark 表示「这一段不要再包行内标记」。给标题的内容、按钮的标签、
+	// 链接文字用 —— 它们的结果要么本来就渲染成粗体（标题），要么外面还
+	// 要再包一层 **（无地址的按钮的标签），要么被整段当成一个链接 span
+	// （链接文字，见 tui.parseInline）。内层再加标记是冗余，叠起来还会
+	// 写出 `****` 或者让标记漏到屏幕上。
+	noMark bool
+
 	out    []string
 	inline strings.Builder
 	// pendSpace 表示「攒了一个空格待写」。HTML 的空白折叠规则：
@@ -106,11 +126,20 @@ type blockBuilder struct {
 
 // sub 派生一个同上下文的子构造器，只换分隔符。
 //
-// 子构造器必须继承 base —— 标题推断是**整封信**的性质（比较的是本合同
-// 的字号和全文正文基准），不是某一段的性质。忘了传 base 的话，嵌套在
-// 表格/列表里的标题会静默地不再被识别。
+// 要继承的是**语义约束**：
+//
+//   - base 是整封信的性质（比较的是本合同字号和全文正文基准），不传的话
+//     嵌在表格/列表里的标题会静默地不再被识别。
+//   - noMark 是「这段文字的上层已经决定了不加标记」（标题的内容、按钮的
+//     标签、链接文字），同样要一路传下去，否则深一层又会包出 `**`，
+//     叠到外层就成了 `****`，或者漏进链接文字里当字面星号显示。
+//
+// **不继承 starDepth。** 它记的是「光标附近已经有星号了」，但外层包**块级**
+// 子元素时 applyRange 会放弃加标记（标记无处可加），此时内层若也以为
+// 「已经在星号里」而闭嘴，整段就一处都不粗 —— 信息白丢。它只该在
+// 同一个构造器内部传递。
 func (b *blockBuilder) sub(sep string) *blockBuilder {
-	return &blockBuilder{sep: sep, base: b.base, inTable: b.inTable}
+	return &blockBuilder{sep: sep, base: b.base, inTable: b.inTable, noMark: b.noMark}
 }
 
 // text 写入文本，按 HTML 规则折叠空白，并转义 Markdown 特殊字符。
@@ -283,7 +312,23 @@ func (b *blockBuilder) container(n *html.Node, sep string) {
 		}
 		return
 	}
-	b.push(b.childrenBlocks(n, sep))
+	b.push(b.boldBlock(n, b.childrenBlocks(n, sep)))
+}
+
+// boldBlock 给「整块自己声明了加粗」的段落包上 **：
+//
+//	<td style="font-weight:bold">通过 HTTP 路由快速修改…</td>
+//
+// 前提是**单行**——标记不跨行（渲染器逐行解析）。多行内容原样返回，
+// 宁可少一处加粗，也不往正文里漏标记。
+func (b *blockBuilder) boldBlock(n *html.Node, s string) string {
+	if !elemBold(n) || b.noMark {
+		return s
+	}
+	if strings.TrimSpace(s) == "" || strings.Contains(s, "\n") {
+		return s
+	}
+	return wrapInline(s, "**")
 }
 
 // childrenBlocks 把子节点渲染成块，用 sep 连接。
@@ -305,6 +350,12 @@ func (b *blockBuilder) inlineNode(n *html.Node) {
 
 	case html.ElementNode:
 		if skipElement(n) {
+			return
+		}
+		// 无语义的行内元素（span/font/small…）只会把子节点原样铺开，
+		// 唯一的例外是它们**自己声明了加粗**。
+		if plainInline(n.DataAtom) {
+			b.plainInlineNode(n)
 			return
 		}
 		switch n.DataAtom {
@@ -337,22 +388,58 @@ func (b *blockBuilder) inlineNode(n *html.Node) {
 		case atom.Code, atom.Kbd, atom.Samp, atom.Tt:
 			b.raw(codeSpan(textContent(n)))
 
-		// --- 有语义但 Markdown 表达不了的：只保留内容 ---
-		case atom.U, atom.Span, atom.Font, atom.Small, atom.Big, atom.Mark,
-			atom.Sub, atom.Sup, atom.Time, atom.Abbr, atom.Q, atom.Label,
-			atom.Ins, atom.Bdi, atom.Bdo, atom.Ruby, atom.Rt, atom.Rp,
-			atom.Wbr, atom.Data, atom.Output, atom.Progress, atom.Meter:
-			// 直接写进当前缓冲区。这里不能改用 b.blocks(n) —— 它收尾时
-			// 会把当前这块提前 flush 掉，`<p>甲<span>乙</span>丙</p>`
-			// 于是变成「甲乙」和「丙」两块，正文里凭空多一个换行。
-			b.inlineChildren(n)
-
 		default:
 			// 块级元素被塞进了行内上下文（HTML 不规范时很常见），
 			// 按块处理，别丢内容。
 			b.node(n)
 		}
 	}
+}
+
+// plainInlineNode 渲染一个「无语义的行内元素」。
+//
+// 默认只是把子节点原样铺开 —— 这里不能改用 b.blocks(n)，它收尾时会把当前
+// 这块提前 flush 掉，`<p>甲<span>乙</span>丙</p>` 于是变成「甲乙」和「丙」
+// 两块，正文里凭空多一个换行。
+//
+// 唯一的例外是**自己声明了加粗**的元素：
+//
+//	<span style="font-weight:bold">注意</span>
+//
+// 邮件模板里大量这么写，原因和标题一样 —— 客户端会把 <b> 自带的样式
+// strip 掉，发件人只能自己把粗体写进 style。不认它，正文里的强调就全平了。
+func (b *blockBuilder) plainInlineNode(n *html.Node) {
+	if elemBold(n) && !b.noMark {
+		b.wrapChildren(n, "**", "**")
+		return
+	}
+	b.inlineChildren(n)
+}
+
+// plainInline 是「没有语义、只会把子节点原样铺开」的行内元素。
+//
+// 样式加粗只在这一类元素上生效：别的元素要么自己就会包标记（<b>、<i>），
+// 要么有更具体的处理（<code> 走行内代码、<a> 走链接）。
+func plainInline(a atom.Atom) bool {
+	switch a {
+	case atom.U, atom.Span, atom.Font, atom.Small, atom.Big, atom.Mark,
+		atom.Sub, atom.Sup, atom.Time, atom.Abbr, atom.Q, atom.Label,
+		atom.Ins, atom.Bdi, atom.Bdo, atom.Ruby, atom.Rt, atom.Rp,
+		atom.Wbr, atom.Data, atom.Output, atom.Progress, atom.Meter:
+		return true
+	}
+	return false
+}
+
+// elemBold 判断元素是不是**自己声明了**加粗。认两种写法：
+//
+//   - style="font-weight:bold|bolder|600…900"（现代写法，占绝大多数）
+//   - <font weight="bold">（HTML3 的老写法，老模板里还有）
+func elemBold(n *html.Node) bool {
+	if styleBold(n) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(attr(n, "weight")), "bold")
 }
 
 // inlineChildren 把子节点按行内内容写进当前块。
@@ -364,6 +451,33 @@ func (b *blockBuilder) inlineChildren(n *html.Node) {
 
 // wrapChildren 渲染子节点，再用 open/close 把新写进去的那一段包起来。
 func (b *blockBuilder) wrapChildren(n *html.Node, open, close string) {
+	// 这一段的上层已经决定了不加标记（标题的内容、按钮的标签、链接文字），
+	// 一律原样铺开。
+	//
+	// 必须在这里挡，不能只在 plainInlineNode / boldBlock 里挡：
+	// `<button><b>去支付</b></button>` 走的是 <b> 那条路，而按钮外面还要
+	// 包一层 **，两处一叠就是 `****去支付****` —— 渲染器认不出四个星号，
+	// 原样显示给用户。`<button><i>去支付</i></button>` 同理，出三个星号。
+	if b.noMark {
+		b.inlineChildren(n)
+		return
+	}
+
+	// 已经在星号里了，别再包一层。* 和 ** 都算。
+	//
+	// `<span style="font-weight:bold">甲<b>乙</b></span>`：外层包一次、
+	// <b> 再包一次的话写出来是 `**甲**乙****`；`<b><i>甲</i></b>` 则是
+	// `***甲***` —— 两种渲染器都认不出，会原样显示星号。内容照样渲染，
+	// 只是内层不加标记。
+	if open == "**" || open == "*" {
+		if b.starDepth > 0 {
+			b.inlineChildren(n)
+			return
+		}
+		b.starDepth++
+		defer func() { b.starDepth-- }()
+	}
+
 	start := b.inline.Len()
 	b.inlineChildren(n)
 	b.applyRange(start, func(lead, core, trail string) string {
@@ -371,6 +485,12 @@ func (b *blockBuilder) wrapChildren(n *html.Node, open, close string) {
 			// 没有可标记的内容。硬加标记会写出 `****`，那不但是噪音，
 			// 还会被 Markdown 当成一对真的强调标记。
 			return lead + trail
+		}
+		if strings.Contains(core, "\n") {
+			// 标记**不跨行**。渲染器是逐行解析的（parseMarkdown 按行切），
+			// 跨行的 `**` 两边配不上，会原样显示出来。宁可少一处加粗，
+			// 也不要往正文里漏标记。
+			return lead + core + trail
 		}
 		return lead + open + core + close + trail
 	})
@@ -408,7 +528,10 @@ func (b *blockBuilder) applyRange(start int, transform func(lead, core, trail st
 // 或 blockBuilder.anchor —— 那两条路共用同一套空白状态，元素末尾的空格
 // 才不会在收尾时被当垃圾丢掉。
 func renderInline(n *html.Node) string {
-	b := &blockBuilder{sep: "\n"}
+	// noMark：这里的结果要么放进标题（本来就渲染成粗体），要么被
+	// renderButtonish / renderInput 再包一层 ** —— 内层再加标记是冗余，
+	// 叠起来还会写出 ****。
+	b := &blockBuilder{sep: "\n", noMark: true}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
 		b.inlineNode(c)
 	}
@@ -1009,7 +1132,8 @@ func (b *blockBuilder) cellText(cell *html.Node) string {
 	s := sub.String()
 	// 单元格里不能有换行，压成一行。
 	s = strings.ReplaceAll(s, "\n", " ")
-	return strings.Join(strings.Fields(s), " ")
+	s = strings.Join(strings.Fields(s), " ")
+	return b.boldBlock(cell, s)
 }
 
 // ---- 标题推断 ----
