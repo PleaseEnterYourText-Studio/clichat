@@ -1,10 +1,11 @@
 name: CI
 
-# 日常门禁：每次推到 main、每个 PR 都跑一遍 vet + 测试 + 编译。
-# 发版走 release.yml，那边会再跑一次同样的检查，别让坏代码进 Release。
+# 只跑 PR 和手动触发。
+#
+# 推到 main 的检查由 release.yml 的 verify job 负责 —— 那边发版前本来就要
+# 跑一遍一模一样的 vet + test。两边都监听 push 的话，每次推 main 会白跑
+# 两遍同样的检查。
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 

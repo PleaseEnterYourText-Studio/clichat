@@ -1,15 +1,21 @@
 name: Release
 
-# 推一个 v 开头的 tag 就发版：
-#   git tag v1.0.0 && git push origin v1.0.0
-# 产物是六个平台的裸二进制 + SHA256SUMS.txt。
+# 每次提交到 main 就自动发一个测试版 Release。
+#
+#   git push origin main   ->   v0.1.0-beta.<提交数>
+#
+# 版本号从 VERSION 文件（基线）+ main 上的提交数（构建号）拼出来，全自动，
+# 不需要手工打 tag。见 VERSION 文件里的说明。
+#
+# 想换成「打 tag 才发版」的话，把下面的 push.branches 换成 push.tags: ['v*']，
+# 并把「计算版本号」那一步改成直接用 GITHUB_REF_NAME。
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:
 
-# gh release create 需要写权限。GITHUB_TOKEN 由 runner 自动注入，
-# 不需要在仓库里配任何 secret。
+# gh release create 需要写权限（它会顺手把 tag 建出来）。
+# GITHUB_TOKEN 由 runner 自动注入，不需要在仓库里配任何 secret。
 permissions:
   contents: write
 
@@ -19,13 +25,42 @@ env:
   CGO_ENABLED: '0'
 
 jobs:
-  # 打 tag 不等于代码是好的。发版前把和 CI 一样的检查再跑一遍，
-  # 免得一个手滑的 tag 直接变成 Release。
+  # 版本号单独算一次，给后面的 job 用。
+  #
+  # 不放在 build 里各算各的：四个 job 各算一遍，一旦算法有偏差
+  # 就会出现「产物的版本号和 Release 标题对不上」这种极难查的问题。
+  version:
+    name: 计算版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 必须是完整历史：git rev-list --count 在浅克隆（默认 fetch-depth: 1）
+          # 下只会返回 1，版本号会永远停在 beta.1。
+          fetch-depth: 0
+
+      - name: 拼出版本号
+        id: calc
+        run: |
+          set -eu
+          # VERSION 文件里带注释，取第一条非注释非空的行。
+          base="$(grep -v '^[[:space:]]*#' VERSION | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+          if [ -z "$base" ]; then
+            echo "VERSION 文件里没读到版本基线" >&2
+            exit 1
+          fi
+          build="$(git rev-list --count HEAD)"
+          echo "version=v${base}.${build}" >> "$GITHUB_OUTPUT"
+          echo "版本号：v${base}.${build}（基线 ${base} + 第 ${build} 次提交）"
+
+  # 提交不等于代码是好的。发版前把和 CI 一样的检查再跑一遍，
+  # 免得一个编译不过的提交直接变成 Release。
   verify:
     name: 发版前检查
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v7
 
@@ -44,7 +79,7 @@ jobs:
 
   build:
     name: 编译 ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -87,6 +122,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -eu
+          version='${{ needs.version.outputs.version }}'
           name="clichat-${GOOS}-${GOARCH}${{ matrix.ext }}"
           mkdir -p dist
           # -trimpath 去掉构建机上的绝对路径，产物可复现。
@@ -94,7 +130,7 @@ jobs:
           # main.version 会被 IMAP 的 ID 命令一并用上（见 mail.SetClientIDVersion），
           # 所以服务端看到的版本和 -version 打印的一致。
           go build -trimpath \
-            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -ldflags "-s -w -X main.version=${version}" \
             -o "dist/${name}" .
           ls -l "dist/${name}"
 
@@ -106,10 +142,9 @@ jobs:
 
   release:
     name: 发 Release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v7
 
@@ -132,18 +167,22 @@ jobs:
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eu
-          tag="${GITHUB_REF_NAME}"
 
-          # 重跑同一个 tag 时 release 可能已经在了，
-          # 这种情况改成覆盖上传资产，而不是让整个 job 红掉。
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag 已存在，覆盖上传资产"
-            gh release upload "$tag" ./dist/* --clobber
+          # 同一个提交重跑 CI 时会算出同一个版本号，此时 Release 可能已经在了。
+          # 这种情况改成覆盖上传资产，而不是让整个 job 红掉 —— 版本号是
+          # 从 git 推出来的，重跑本来就该更新同一个 Release。
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION 已存在，覆盖上传资产"
+            gh release upload "$VERSION" ./dist/* --clobber
           else
-            gh release create "$tag" ./dist/* \
-              --title "$tag" \
+            # --target 让 gh 顺手把 tag 建在这一次的提交上，不用额外 git tag + push。
+            # --prerelease：现在是测试版，不该占住仓库的「Latest」。
+            gh release create "$VERSION" ./dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$VERSION" \
               --generate-notes \
-              --verify-tag
+              --prerelease
           fi
