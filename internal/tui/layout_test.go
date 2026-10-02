@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/mail"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
@@ -80,17 +81,22 @@ func TestLayout_RegionsTileTheScreen(t *testing.T) {
 					w, h, l.bodyH, l.inputRows)
 			}
 
-			// 横向同理：导航 + 列表 + 竖线 + 会话流 = 整幅宽。
+			// 横向同理：导航 + 列表 + 会话流 = 整幅宽，**中间不留缝**。
 			if l.twoPane {
-				if l.navW != navWidth+navGutter {
-					t.Errorf("%dx%d：导航栏宽 %d，want %d（侧栏 + 空隙）",
-						w, h, l.navW, navWidth+navGutter)
+				if l.navW != navWidth {
+					t.Errorf("%dx%d：侧栏宽 %d，want %d", w, h, l.navW, navWidth)
 				}
 				if l.chatX+l.chatW != w {
 					t.Errorf("%dx%d：会话流右边缘在 %d 列，屏幕 %d 列", w, h, l.chatX+l.chatW, w)
 				}
-				if l.chatX != l.listX+l.listW+1 {
-					t.Errorf("%dx%d：竖线不在列表和会话流中间（chatX=%d）", w, h, l.chatX)
+				// 三栏首尾相接：列表紧接侧栏，会话流紧接列表。上一版这里
+				// 是 `+1`（那根竖线占的列），现在那一列回到了会话流里。
+				if l.chatX != l.listX+l.listW {
+					t.Errorf("%dx%d：会话流没紧接列表（chatX=%d，列表右沿 %d）",
+						w, h, l.chatX, l.listX+l.listW)
+				}
+				if l.listX != l.navW {
+					t.Errorf("%dx%d：列表没紧接侧栏（listX=%d navW=%d）", w, h, l.listX, l.navW)
 				}
 			} else if l.navW != 0 || l.listX != 0 {
 				t.Errorf("%dx%d：单栏模式下不该有导航栏（navW=%d listX=%d）", w, h, l.navW, l.listX)
@@ -236,27 +242,158 @@ func TestInputBlock_NoCapsuleInListMode(t *testing.T) {
 	}
 }
 
-// 输入框那一行必须占满「侧栏 + 空隙 + 内容区」，右边只留一列。
+// 输入框那一行必须占满「侧栏 + 列表栏 + 那 1 格内缩 + 输入卡」，右边只留一列。
 //
 // 这条管的是**对齐**，不是 sizedInput 的补差（那是
 // TestSizedInput_NeverWiderThanAsked 的事）：整行的宽度是外层补白定的，
 // 输入框自己多吐 3 列也会被截掉，看不出来。
+//
+// ⚠️ 输入卡现在只占正文栏（列 paneX 起，宽 paneW），不再是通栏 ——
+// 它两侧各留一格留白，"浮起"才成立（见 renderInputBlock）。
 func TestInputLine_FillsItsWidth(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.layout()
 	row := viewLines(m)[l.inputTop+1]
 
-	// 这一行的宽度：侧栏 + 空隙 + 输入块。块宽就是内容区宽，右边那格留白
-	// 不在块里 —— 所以整行应该是屏宽减一，而不是屏宽。
-	want := l.contentW + l.contentX
+	want := l.paneX + l.paneW
 	if got := lipgloss.Width(row); got != want {
-		t.Errorf("输入那一行宽 %d 列，want %d（侧栏 %d + 空隙 %d + 块宽 %d）；屏宽 %d，右边那一列留白",
-			got, want, navWidth, navGutter, l.contentW, m.width)
+		t.Errorf("输入那一行宽 %d 列，want %d（面板带 %d + 内缩 %d + 卡宽 %d）；屏宽 %d，右边那一列留白",
+			got, want, l.paneX-paneInset, paneInset, l.paneW, m.width)
 	}
 }
 
-// ---- 两级侧栏 ----
+// 侧栏和列表栏是两条**通到屏幕底**的面板带。
+//
+// 底下那几行（输入区的留白行、输入行、状态栏行）不走 renderNav /
+// renderThreadList，得由 withPaneStrip 一格格补上底色。漏了的话列表栏
+// 那层 235 在输入区凭空消失，看着像列表栏被输入框截掉了一截 —— 而这种
+// 事在截图里只会觉得「下面有点怪」，说不出怪在哪。
+func TestPanes_ReachTheBottomOfTheScreen(t *testing.T) {
+	forceColor(t)
+	m := openTwoPane(t)
+	l := m.layout()
+	rows := viewLines(m)
+
+	// 口径要对齐：bgAtFirstCell 给的是**裸参数**（"48;5;237"），而
+	// navBgSeq 给的是**整条 SGR 序列**（"\x1b[48;5;237m"）。少了这层剥壳，
+	// 判据会把「底色其实铺对了」判成红 —— 尺子错了，不是产品错了。
+	navWant := bgParamOf(navBgSeq())
+	listWant := bgParamOf(listBgSeq())
+	for _, w := range []struct{ name, v string }{{"侧栏", navWant}, {"列表栏", listWant}} {
+		if w.v == "" {
+			t.Fatalf("拿不到%s底色的序列 —— 这个用例大概忘了 forceColor", w.name)
+		}
+	}
+	// 列表栏取它中间那一列：左右各有一格是接缝（侧栏右沿、列表栏右沿），
+	// 量接缝等于在量两个面板的交界，说明不了「这条带子还在不在」。
+	x := l.listX + l.listW/2
+
+	for _, y := range []int{l.inputTop, l.inputTop + 1, l.statusRow} {
+		row := rows[y]
+		if got := bgAtFirstCell(ansiSlice(row, 0, 1)); got != navWant {
+			t.Errorf("第 %d 行第 0 列（侧栏）的底色是 %q，want %q —— 侧栏没铺到底",
+				y, got, navWant)
+		}
+		if got := bgAtFirstCell(ansiSlice(row, x, x+1)); got != listWant {
+			t.Errorf("第 %d 行第 %d 列（列表栏）的底色是 %q，want %q —— 列表栏没铺到底",
+				y, x, got, listWant)
+		}
+	}
+}
+
+// 浮起的输入卡只在**正文栏**里，两侧各留一格不放色。
+//
+// 通栏的输入框是这一版之前的样子，两个毛病：没有左右留白可以依托（"浮起"
+// 也就无从谈起，它读起来就是又一条贴底的横带），以及把列表栏从中间截断。
+// 这两条都是看在眼里才想得起来的，所以钉成判据。
+func TestInputCapsule_LivesInsideTheChatPane(t *testing.T) {
+	forceColor(t)
+	m := openTwoPane(t)
+	l := m.layout()
+	row := viewLines(m)[l.inputTop+1]
+
+	capBg := bgParamOf(bgSeqOf(styleInputRow))
+	// 输入卡底色拿不到时，下面「不该出现」的那三条会**恒真**——判据变成空壳还
+	// 一路绿着。这是负向断言特有的坑，必须在入口堵住。
+	if capBg == "" {
+		t.Fatal("拿不到输入卡底色的序列 —— 这个用例大概忘了 forceColor")
+	}
+	for _, probe := range []struct {
+		x    int
+		name string
+	}{
+		{0, "侧栏"},
+		{l.listX + l.listW/2, "列表栏"},
+		{l.paneX - paneInset, "输入卡左沿那一格留白"},
+	} {
+		if got := bgAtFirstCell(ansiSlice(row, probe.x, probe.x+1)); got == capBg {
+			t.Errorf("第 %d 列（%s）铺上了输入卡的底色 —— 它只该出现在正文栏里",
+				probe.x, probe.name)
+		}
+	}
+
+	if got := bgAtFirstCell(ansiSlice(row, l.paneX, l.paneX+1)); got != capBg {
+		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 输入卡没和气泡对齐",
+			l.paneX, got, capBg)
+	}
+}
+
+// 输入框里那句占位提示，不能和它自己的底色同色。
+//
+// 这就是**「字在，但看不见」**那类 bug 的判据。实际情况：textinput 的
+// PlaceholderStyle 默认是一个写死的 hex，降级到 256 色正好是 240，而
+// 输入卡底色（inputRowBg）也是 240 —— 两者一撞，「输入消息，回车发送」
+// 八个字在界面上整个消失，只剩一个孤零零的提示符。
+//
+// 这类失败最麻烦的地方是**代码怎么读都是对的**：Placeholder 设了、
+// 输入框渲染了、宽度也没算错，只有截图上看不见几个字。所以判据必须
+// 量颜色，光看代码是看不出来的。
+//
+// 判据绑的是**关系**（前景 ≠ 背景），不是具体色号 —— 以后改配色它不会
+// 变成一条假红，而"撞色"这件事它一直盯着。
+func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
+	forceColor(t)
+	m, _ := newFeatureModel(t)
+	m, _ = update(m, keyMsg("enter"))
+	m = loadBodies(t, m)
+
+	// 一、那句话得真的画出来。按**当前**的 Placement 文案去找，不写字面量：
+	// 文案改了这条不该跟着红（假红和假绿一样贵）。
+	ph := m.input.Placeholder
+	if ph == "" {
+		t.Fatal("前提不成立：会话模式的输入框没有占位提示")
+	}
+	row := viewLines(m)[m.layout().inputTop+1]
+	if !strings.Contains(plainText(row), ph) {
+		t.Fatalf("输入行里找不到占位提示 %q —— 字根本没画出来。\n这一行是：%q",
+			ph, plainText(row))
+	}
+
+	// 二、它得挂在**我们配的**那个样式上。少了这一条，下面比色是在比两个
+	// 常量：PlaceholderStyle 根本没设、bubbles 用默认色渲染，判据照样绿。
+	want := bgSeqOf(stylePlaceholder)
+	if want == "" {
+		t.Fatal("拿不到占位提示的样式序列 —— 这个用例大概忘了 forceColor")
+	}
+	if !strings.Contains(row, want) {
+		t.Errorf("输入行里没有出现占位提示该有的样式 %q —— "+
+			"这一行多半不是用 stylePlaceholder 画的（检查 newTextInput）", want)
+	}
+
+	// 三、前景和脚下的底色不能是同一个色。
+	fg := sgrColorOf(want, "38")
+	bg := sgrColorOf(bgSeqOf(styleInputRow), "48")
+	if fg == "" || bg == "" {
+		t.Fatalf("取不到色号（前景 %q / 底色 %q）—— 终端没颜色时判据会退化成空壳",
+			fg, bg)
+	}
+	if fg == bg {
+		t.Errorf("占位提示的前景和底色是同一个色（%s）—— 字在那儿，但一个像素也看不见。"+
+			"\n多半是 PlaceholderStyle 没设，用了 bubbles 的默认灰。"+
+			"\n输入框统一由 newTextInput() 造，别在别处直接 textinput.New()。", fg)
+	}
+}
 
 // 侧栏是一条**从上到下贯通的**竖带：每一行都铺着底色（选中那一项压着
 // 一块更亮的，其余是同一条带子）。
@@ -304,10 +441,17 @@ func TestNav_HasTwoLevels(t *testing.T) {
 		t.Errorf("侧栏第一行应该是「邮箱」这个组标题，实际 %q", plainText(rows[0]))
 	}
 	// 组里的项要缩进，和组标题错开 —— 这是「两级」在画面上唯一的表达。
-	title := plainText(rows[0])
-	item := plainText(rows[1])
-	if indentOf(item) <= indentOf(title) {
-		t.Errorf("组里的项没比组标题缩进：标题 %q、项 %q", title, item)
+	//
+	// ⚠️ 差必须 **≥2 格**，不能只比大小。差 1 格隔着一层文字根本看不出来，
+	// 而 navWidth 之所以从 12 加到 14，就是为了让这个差能给到 2 格（见
+	// styles.go 里 navWidth 那段）。只写「项 > 标题」的话，缩进退回 1 格
+	// 照样绿 —— 变异验证确认过（navItemIndent 3→1 时那种写法不变红），
+	// 而「缩进只差一格、看不出层级」正是这一版要修掉的那个毛病。
+	const minGap = 2
+	title, item := plainText(rows[0]), plainText(rows[1])
+	if gap := labelIndentOf(item) - labelIndentOf(title); gap < minGap {
+		t.Errorf("组里的项只比组标题深 %d 格（want ≥%d），看不出层级：标题 %q（第 %d 列）、项 %q（第 %d 列）",
+			gap, minGap, title, labelIndentOf(title), item, labelIndentOf(item))
 	}
 
 	for _, want := range []string{"全部", "收件箱", "已发送", "已删除"} {
@@ -436,12 +580,13 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 		t.Errorf("第一个标签是 %q，当前会话是 %q —— 不是 MRU 序", chips[0].id, m.activeID)
 	}
 
-	// 标签的坐标是内容区里的相对列，画面是屏幕列，所以要加上侧栏那一截。
+	// 标签的坐标是正文栏里的相对列，画面是屏幕列，所以要加上 paneX
+	// （面板带 + 那 1 格内缩）那一截。
 	l := m.layout()
 	row := viewLines(m)[l.tabsRow]
 	var marked []string
 	for _, c := range chips {
-		seg := ansiSlice(row, l.contentX+c.x0, l.contentX+c.x1)
+		seg := ansiSlice(row, l.paneX+c.x0, l.paneX+c.x1)
 		if bgAtFirstCell(seg) == want {
 			marked = append(marked, c.id)
 		}
@@ -450,11 +595,12 @@ func TestTabs_MRUFrontAndActiveMarked(t *testing.T) {
 		t.Errorf("铺了底色的标签是 %v，当前会话是 %q", marked, m.activeID)
 	}
 
-	// 第一个标签必须正好压在**内容区的左边缘**上：左边侧栏、中间列表、
-	// 下面输入框全都从这一列起步，标签页偏出十几列的话，一眼就看得出没对齐。
-	if got := bgAtFirstCell(ansiSlice(row, l.contentX, l.contentX+1)); got != want {
-		t.Errorf("第 %d 列（内容区左边缘）的底色是 %q，want %q —— 第一个标签没和内容区对齐",
-			l.contentX, got, want)
+	// 第一个标签必须正好压在**正文栏内容的左边缘**上：下面的气泡、输入
+	// 卡、状态栏全都从这一列起步，标签页偏出十几列的话，一眼就看得出
+	// 没对齐。
+	if got := bgAtFirstCell(ansiSlice(row, l.paneX, l.paneX+1)); got != want {
+		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 第一个标签没和正文栏对齐",
+			l.paneX, got, want)
 	}
 }
 
@@ -559,6 +705,9 @@ func subjects(list []thread.Thread) []string {
 // 不再是一回事。这条判据从**渲染出来的画面**里把铺了底色块的两行找出来，
 // 再和光标指向的那条会话对上 —— 它是这一轮最容易悄悄坏掉的地方：光标
 // 和行号一旦漂移，按 ↓ 会跳到一条和屏幕上完全无关的会话上。
+//
+// 量的是「这一行有多少格铺着选中底色」，不是「第一个格子的底色」：
+// 选中块两侧各内缩一格，第 0 列铺的是列表栏自己的带子。
 func TestList_HighlightAlwaysMatchesTheCursor(t *testing.T) {
 	forceColor(t)
 	want := selectedBg(t)
@@ -570,7 +719,7 @@ func TestList_HighlightAlwaysMatchesTheCursor(t *testing.T) {
 
 		var marked []string
 		for _, ln := range lines {
-			if bgAtFirstCell(ln) == want {
+			if bgColsOf(ln, want) > 0 {
 				marked = append(marked, strings.TrimSpace(plainText(ln)))
 			}
 		}
@@ -596,16 +745,25 @@ func TestList_HighlightAlwaysMatchesTheCursor(t *testing.T) {
 
 // 选中项用底色块，不再整行反白。反白是终端里最大的对比度，一行反白会
 // 在视野里炸开 —— 参照的设计里用的就是底色块。
+//
+// 顺着量一下底色块**够宽**：只数「有没有格子铺着」的话，某天渲染层把
+// 块画成一格宽的小点也照样绿。块的实际宽度是内缩之后的 `inner`，
+// 这里只要求它过半 —— 绑死具体列数就等于把内缩量也绑死了。
 func TestList_SelectedRowUsesBackgroundNotReverse(t *testing.T) {
 	forceColor(t)
 	want := selectedBg(t)
 	m, _ := newFeatureModel(t)
 	m.cursor = 0
 
-	lines := strings.Split(m.renderThreadList(m.listWidth(), m.bodyHeight()), "\n")
+	width := m.listWidth()
+	lines := strings.Split(m.renderThreadList(width, m.bodyHeight()), "\n")
 	var marked []string
 	for _, ln := range lines {
-		if bgAtFirstCell(ln) == want {
+		if n := bgColsOf(ln, want); n > 0 {
+			if n*2 < width {
+				t.Errorf("选中块的底色只铺了 %d 格（列表栏宽 %d）—— 那不是一块，是一个点: %q",
+					n, width, ln)
+			}
 			marked = append(marked, ln)
 		}
 	}
@@ -717,26 +875,45 @@ func TestMouse_ClickNavSwitchesFolder(t *testing.T) {
 	}
 }
 
-// 侧栏右边那一格空隙不属于任何一栏：点它不该有任何反应。
+// 三栏紧挨着，**没有一格"缝"**：每一列都属于某一栏，边界那一列归右边那一栏。
 //
-// 归给左边会让人误切文件夹，归给右边会误开一封邮件 —— 留白就该是留白。
-func TestMouse_ClickOnNavGutterDoesNothing(t *testing.T) {
+// 上一版这里是「点空隙不该有反应」—— 那时侧栏右边留了一格不属于任何栏的
+// 空白，归左边会误切文件夹、归右边会误开一封邮件。这一版把那格删掉了
+// （分界改由两块底色表达，见 styles.go 里 navGutter 那条注释），判据也就
+// 没了对象，于是换成它本来想守的那件事。
+//
+// 它挡的是这类漂移：navWidth 改了、而 layout 或 hitTest 里某处还留着老
+// 数字，于是屏幕上看着分得好好的、点下去却错一栏 —— 而且只在边界那一列
+// 上错，最难看出来。
+func TestMouse_EveryBodyColumnBelongsToAPane(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
 	l := m.layout()
+	row := l.bodyTop + 2
 
-	before := m.activeFolder
-	cursorBefore := m.cursor
-	m, _ = update(m, tea.MouseMsg{
-		X: navWidth, Y: l.bodyTop + 2,
-		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
-	})
-
-	if m.activeFolder != before {
-		t.Errorf("点空隙把文件夹换成了 %q", m.activeFolder)
+	names := map[hitRegion]string{
+		hitNone: "谁都不属于", hitNav: "侧栏", hitList: "列表", hitChat: "会话流",
 	}
-	if m.cursor != cursorBefore || m.mode != modeList {
-		t.Errorf("点空隙打开了会话（mode=%v cursor=%d）", m.mode, m.cursor)
+	for _, c := range []struct {
+		x    int
+		want hitRegion
+	}{
+		{l.navX + l.navW - 1, hitNav}, // 侧栏最后一列
+		{l.navX + l.navW, hitList},    // 列表第一列 —— 中间不许有缝
+		{l.chatX - 1, hitList},        // 列表最后一列
+		{l.chatX, hitChat},            // 会话流第一列
+	} {
+		if got, _ := m.hitTest(c.x, row); got != c.want {
+			t.Errorf("第 %d 列命中的是「%s」，want「%s」", c.x, names[got], names[c.want])
+		}
+	}
+
+	// 反过来再走一遍整行：不存在归属不明的列。有的话，点下去既不开会话
+	// 也不换文件夹 —— 一个安静的坑，用户只会觉得"这里点不动"。
+	for x := 0; x < m.width; x++ {
+		if got, _ := m.hitTest(x, row); got == hitNone {
+			t.Errorf("第 %d 列%s —— 点下去没有任何反应", x, names[got])
+		}
 	}
 }
 
@@ -998,9 +1175,22 @@ func TestNavAndFolderPickerAgreeOnTheFolder(t *testing.T) {
 
 // ---- 辅助 ----
 
-// indentOf 数一行开头的空格数（缩进）。
-func indentOf(s string) int {
-	return len(s) - len(strings.TrimLeft(s, " "))
+// labelIndentOf 给出「这一行的文字从第几列开始」，也就是缩进量。
+//
+// ⚠️ **不能数开头的空格数。** 侧栏选中项的最左一格是强调色标条 ▌（一个
+// 可见字符），数空格的写法会把整行的开头算成第 2 列 —— 于是「选中项比组
+// 标题缩进得少」，判据红在一个**根本不存在的版式问题**上（实测报的是
+// 标题 " 邮箱"、项 "▌   全部"）。标条是缩进的装饰，它占的那一格也要算进去。
+func labelIndentOf(s string) int {
+	col := 0
+	for _, r := range s {
+		if r == ' ' || string(r) == blockMark {
+			col += cellWidth(r)
+			continue
+		}
+		return col // 撞上第一个真正的文字了
+	}
+	return col
 }
 
 // bgParamOf 从一条 SGR 序列（"\x1b[1;38;5;141;48;5;238m"）里取出**背景色**
@@ -1057,6 +1247,36 @@ func bgAtFirstCell(s string) string {
 	return cur
 }
 
+// bgColsOf 数出这段字符串里有多少个**可见格**画在指定底色上。
+//
+// 这是 bgAtFirstCell 的加强版，用在「块不从第 0 列开始」的地方。列表选中项
+// 的底色块两侧各内缩一格（见 renderListRow），只量第一个格子的底色，量到的
+// 是列表栏自己那条带子 —— 判据会退化成「一个都不匹配」，看着像选中项丢了，
+// 其实是尺子只肯看第 0 列。
+//
+// 它反过来也不能退化成「这段字节里出现过哪些底色序列」（那个坑见
+// bgAtFirstCell 的说明）：这里按**可见格**计数，空转义序列一个格子也占不到。
+func bgColsOf(s, want string) int {
+	cur, n := "", 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := strings.IndexByte(s[i+2:], 'm')
+			if j < 0 {
+				break
+			}
+			cur = applyBgParam(cur, s[i+2:i+2+j])
+			i += 2 + j + 1
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if cur == want {
+			n += cellWidth(r)
+		}
+		i += size
+	}
+	return n
+}
+
 // applyBgParam 把一条 SGR 参数串（"1;38;5;141;48;5;238"）作用在当前底色上。
 //
 // 只认和底色有关的那几个：0 / 49 清掉，48;5;N 和 48;2;R;G;B 设上。
@@ -1084,6 +1304,39 @@ func applyBgParam(cur, params string) string {
 		}
 	}
 	return cur
+}
+
+// sgrColorOf 从一条 SGR 序列里取出**某一路**颜色（38 = 前景，48 = 底色），
+// 返回 "5;N" / "2;R;G;B" 这样的参数尾巴；没有返回 ""。
+//
+// 比色的时候只关心"两路颜色是不是同一个"，所以把前缀（38/48）摘掉、
+// 只留参数更省事：两个不同的样式序列，只要参数尾巴一样就是同色。
+func sgrColorOf(seq string, kind string) string {
+	body, ok := strings.CutPrefix(seq, "\x1b[")
+	if !ok {
+		return ""
+	}
+	body, ok = strings.CutSuffix(body, "m")
+	if !ok {
+		return ""
+	}
+	toks := strings.Split(body, ";")
+	for i := 0; i+1 < len(toks); i++ {
+		if toks[i] != kind {
+			continue
+		}
+		switch toks[i+1] {
+		case "5": // 38;5;N / 48;5;N
+			if i+2 < len(toks) {
+				return "5;" + toks[i+2]
+			}
+		case "2": // 38;2;R;G;B / 48;2;R;G;B
+			if i+4 < len(toks) {
+				return "2;" + strings.Join(toks[i+2:i+5], ";")
+			}
+		}
+	}
+	return ""
 }
 
 // selectedBg 是「选中」那一块的底色参数，顺便把「终端根本没颜色」这件事

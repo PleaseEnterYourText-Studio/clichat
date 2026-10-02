@@ -191,13 +191,26 @@ type allMailResultMsg struct {
 // pollTickMsg 是轮询定时器到点的信号。
 type pollTickMsg time.Time
 
+// newTextInput 造一个配好样式的输入框。
+//
+// 存在的理由很实际：`textinput.New()` 的零值里 PlaceholderStyle 是一个
+// 写死的 hex，降级到 256 色正好是 240 —— 和输入卡底色同色，那句提示会
+// 整个消失。而**散在两处** new 出来的话，迟早有一处漏配（这次就是），
+// 症状还极难查：代码全对，只有截图上看不见几个字。
+// 收成一个构造函数，样式就只有一处可漏了。
+func newTextInput() textinput.Model {
+	in := textinput.New()
+	in.Prompt = "> "
+	in.CharLimit = 0
+	in.PlaceholderStyle = stylePlaceholder
+	return in
+}
+
 // New 构造界面模型。
 //
 // 配置完整且凭据存在时进入解锁；否则进入配置向导。
 func New(cfg *config.Config) Model {
-	in := textinput.New()
-	in.Prompt = "> "
-	in.CharLimit = 0
+	in := newTextInput()
 
 	m := Model{
 		cfg:      cfg,
@@ -221,9 +234,7 @@ func New(cfg *config.Config) Model {
 //
 // 只给测试用 —— 让界面层的测试能直接跑在内存假数据上，不碰真实邮箱。
 func NewWithApp(cfg *config.Config, a *app.App) Model {
-	in := textinput.New()
-	in.Prompt = "> "
-	in.CharLimit = 0
+	in := newTextInput()
 
 	m := Model{
 		cfg:      cfg,
@@ -1410,12 +1421,15 @@ func (m *Model) moveCursor(dir int) {
 // hitRegion 是屏幕上一块可交互的区域。
 type hitRegion int
 
+// 注：这里原本还有个 hitDivider —— 列表栏和会话流之间那根竖线所在的列。
+// 竖线去掉之后那一列归了会话流（就是它的第 0 列），这个区域没有存在的
+// 理由了。留着它的话，那一列会变成"点了没反应"的死区 —— 而它明明在
+// 会话流里面。
 const (
 	hitNone hitRegion = iota
 	hitNav
 	hitTabs
 	hitList
-	hitDivider
 	hitChat
 	hitInput
 	hitStatus
@@ -1434,12 +1448,11 @@ func (m Model) hitTest(x, y int) (hitRegion, layout) {
 
 	switch {
 	case l.tabsRow >= 0 && y == l.tabsRow:
-		// 标签页占的是内容区那一行；左边那块还是导航。
-		if x < navWidth {
-			return hitNav, l
-		}
+		// 标签页占的是内容区那一行；左边那一截还是导航。
+		// 内容区从侧栏右沿开始（l.contentX == navWidth），所以这里只
+		// 需要一条判断 —— 上一版要两条，是因为两个数之间还夹着一格空隙。
 		if x < l.contentX {
-			return hitNone, l
+			return hitNav, l
 		}
 		return hitTabs, l
 
@@ -1451,16 +1464,10 @@ func (m Model) hitTest(x, y int) (hitRegion, layout) {
 
 	case y >= l.bodyTop && y < l.bodyTop+l.bodyH:
 		switch {
-		case x < navWidth:
+		case x < l.navX+l.navW:
 			return hitNav, l
-		case x < l.listX:
-			// 侧栏右边那一格空隙：不属于任何一栏。点它不该有反应 ——
-			// 归给左边会让人误按到文件夹，归给右边会误开一封邮件。
-			return hitNone, l
-		case x < l.listX+l.listW:
+		case x < l.chatX:
 			return hitList, l
-		case x == l.listX+l.listW:
-			return hitDivider, l
 		default:
 			return hitChat, l
 		}

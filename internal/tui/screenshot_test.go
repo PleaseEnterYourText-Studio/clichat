@@ -93,6 +93,18 @@ func TestGenerateScreenshots(t *testing.T) {
 			drive: func(t *testing.T, m Model) Model {
 				// 光标默认在第 0 个会话（最新那条）上，回车进会话。
 				m, _ = update(m, keyMsg("enter"))
+				// 再切到下一个会话、切回来。
+				//
+				// 这一趟不是为了内容，是为了**顶部那排标签页**：它只在
+				// 「开过两个以上会话」之后才出现（见 layout 里的 tabThreads
+				// 判断），而它是这一版布局里最容易被漏拍的一处新东西 ——
+				// 只按一次回车，截图上永远看不见它。
+				//
+				// 走到最后仍停在那个内容最丰富的群聊上：Ctrl+↓ 把标签页
+				// 从 1 个变成 2 个，Ctrl+↑ 把当前页切回来（标签页顺序是
+				// MRU，切回来的那个排在最前，所以亮着的是第一个标签）。
+				m, _ = update(m, keyMsg("ctrl+down"))
+				m, _ = update(m, keyMsg("ctrl+up"))
 				return loadBodies(t, m)
 			},
 		},
@@ -110,8 +122,12 @@ func TestGenerateScreenshots(t *testing.T) {
 			name: "03-search",
 			// 刻意用窄终端：宽度低于 96 列会降级成单栏，正好一并展示
 			// 响应式布局 —— 而且单栏下没有那个空着的右半边。
+			//
+			// 高度也是刻意压到 16 的：这一版列表有分组标题，四条命中要占
+			// 十行，20 行会在下面留出一大块空白，看着像渲染坏了。16 行
+			// 刚好「内容 + 一行补白」。
 			width:  74,
-			height: 20,
+			height: 16,
 			drive: func(t *testing.T, m Model) Model {
 				// 搜「周」会命中四条（周五的产品评审 / 周末团建 / 第 40 周
 				// 团队周报 / 周四下午），既看得出在过滤，列表又不至于空荡荡。

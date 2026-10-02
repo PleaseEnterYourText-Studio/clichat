@@ -187,6 +187,11 @@ func TestHelp_LinesFitWidth(t *testing.T) {
 //
 // 这就是本次改动的起因：功能早就有了，界面上却一个字都不提，
 // 用户只能靠猜。判据落在「有没有提示」上，不绑具体文案。
+//
+// ⚠️ 期望的键里原本有「文件夹」（Tab 那个选择器）。它已经从这一行里删掉了：
+// 双栏最窄的终端（96 列）减掉侧栏只剩 82 列，而带 Tab 的版本要 90 列 ——
+// 末尾那个「q 退出」**从来没显示出来过**。所以这里换成断言「退出」，
+// 它正是被截掉的那一个，留着当哨兵。见 help.go 里 hintKeys 的说明。
 func TestListMode_ShowsShortcutHints(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	if m.mode != modeList {
@@ -194,7 +199,7 @@ func TestListMode_ShowsShortcutHints(t *testing.T) {
 	}
 
 	view := m.View()
-	for _, want := range []string{"帮助", "新建", "搜索", "文件夹"} {
+	for _, want := range []string{"帮助", "新建", "搜索", "退出"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("列表底部提示里没有 %q:\n%s", want, view)
 		}
@@ -382,8 +387,14 @@ func TestStar_TogglesAndShowsMarker(t *testing.T) {
 		t.Error("星标没生效")
 	}
 	// 列表上要看得见，否则用户不知道按了有没有用。
-	if !strings.Contains(m.View(), "★") {
-		t.Error("列表里没有星标标记")
+	//
+	// 两处刻意的地方：绑 starMark 常量而不是写死字符（上一版写死的是 "★"，
+	// 而那个字符在 Windows 上会走 emoji 回退、被换成 "*" —— 于是判据成了
+	// 假红，见 styles.go 里那条规矩）；以及在**那一行**上找，不在整个 View
+	// 上找 —— 底部提示里也印着 "*"，整个 View 上找的话按不按都绿。
+	row := listRowOf(t, m, threadTitle(m.visible[0]))
+	if !strings.Contains(row, starMark) {
+		t.Errorf("星标没画在这条会话的行上：%q", plainText(row))
 	}
 
 	m, cmd = update(m, keyMsg("*"))
@@ -437,6 +448,21 @@ func threadBySubject(list []thread.Thread, subject string) (thread.Thread, bool)
 		}
 	}
 	return thread.Thread{}, false
+}
+
+// listRowOf 从**画出来的列表**里挑出含某段文字的那一行（带样式，原样）。
+//
+// 找的是列表栏自己的渲染结果，不是整幅 View：主题文字在会话流的标题行上
+// 也会出现一次，在整幅里找会挑到错的那一行。
+func listRowOf(t *testing.T, m Model, want string) string {
+	t.Helper()
+	for _, ln := range strings.Split(m.renderThreadList(m.listWidth(), m.bodyHeight()), "\n") {
+		if strings.Contains(plainText(ln), want) {
+			return ln
+		}
+	}
+	t.Fatalf("列表里没有含 %q 的行", want)
+	return ""
 }
 
 func TestNextUnread_JumpsToUnread(t *testing.T) {

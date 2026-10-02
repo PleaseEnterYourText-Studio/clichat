@@ -40,14 +40,14 @@ clichat just looks at it differently: **treat mail as messages.**
 
 ## Screenshots
 
-**Conversation view** — the other side's rows sit on a grey band while yours are
-right-aligned; in group threads every sender is coloured. The `HTML` marker in a
-message head means that body was converted from an HTML mail:
+**Conversation view** — the other side's rows sit on a grey bubble while yours
+are right-aligned; in group threads every sender is coloured. The `HTML` marker
+in a message head means that body was converted from an HTML mail:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
-**Conversation list** — unread count in the header, `●` for unread, `★` for
-starred:
+**Conversation list** — `▌` marks unread (with the count next to it), `*` marks
+starred, and the time is right-aligned:
 
 [![Conversation list](docs/images/02-list.png)](docs/images/02-list.png)
 
@@ -146,9 +146,9 @@ and the process list.
   for a group) and puts what you are actually talking about on the second line —
   that is the subject of the newest message. A conversation spans many subjects,
   so those are two different questions
-- **The other side's rows sit on a grey band**, while yours are right-aligned
-  with no background — after a few exchanges you no longer have to read names to
-  tell who is talking. The grey adapts to the terminal's lightness
+- **The other side's rows sit on a grey bubble that hugs the text**, while yours
+  are right-aligned with no background — after a few exchanges you no longer have
+  to read names to tell who is talking. The grey adapts to the terminal's lightness
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
@@ -173,6 +173,11 @@ and the process list.
   input box floats on the content with a blank line above and below it. Under 96
   columns it collapses to a single pane; "Sent" / "Trash" are then reached with
   `Tab` or `Ctrl+G`
+- **Depth comes from background, not from lines**: the three panes sit on a
+  ladder of greys (list < sidebar < bubble < raised), and the two side panes run
+  all the way to the bottom of the screen so the columns never look cut off
+- **A reply's block hugs its text** rather than spanning the whole pane, so a
+  one-line message looks like a one-line message
 - **The list is grouped** into unread / read, chronologically inside each group.
   The selected row gets a background block rather than reverse video — reverse
   video is the loudest thing a terminal can do, and one such row blows up the view

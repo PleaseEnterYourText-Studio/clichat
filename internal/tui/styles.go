@@ -17,20 +17,22 @@ const singlePaneWidth = 96
 
 // navWidth 是左侧导航列的宽度。
 //
-// 12 列 = 两格缩进 + 最多 8 列的标签 + 数字计数。8 列刚好放下
-// 「已发送」（3 个汉字 = 6 列）、「垃圾邮件」（4 个汉字 = 8 列）这类
-// 最常见的文件夹名；再长的会被截断成「病毒文件…」，那没关系 ——
-// 服务端文件夹那一组里通常只有一两个长名字。
+// 14 列拆开是这样：**3 格缩进**（两级层次在画面上唯一的表达）+ 8 列标签
+// + 3 列右对齐的未读计数。8 列刚好放下「已发送」（3 个汉字 = 6 列）、
+// 「垃圾邮件」（4 个汉字 = 8 列）这类最常见的文件夹名；再长的会被截断成
+// 「病毒文件…」，那没关系 —— 服务端文件夹那一组里通常只有一两个长名字。
 //
-// 再宽就是浪费：它只是一个文件夹切换器，每多一列都是从正文身上拿的。
-const navWidth = 12
+// ⚠️ 从 12 加到 14 是为了**缩进和计数各要一列**，不是为了放更多字。
+// 12 列时缩进只能给到 2 格，和组标题的 1 格只差一格 —— 隔着一层文字
+// 完全看不出来，于是「两级侧栏」在画面上等于没做。缩进差必须 ≥2 格才
+// 看得出层级，这条尺子比「省两列」重要。
+const navWidth = 14
 
-// navGutter 是侧栏右边那一格空隙。
-//
-// 它不铺任何底色 —— 这**正是它的作用**：整屏没有一条竖着贯通的硬线，
-// 「侧栏到哪儿结束」全靠这一格留白。参照的设计里那条缝也是留白，只是
-// 浏览器里能做得更宽；终端里一格已经够，再宽就是从正文身上拿。
-const navGutter = 1
+// 注：这里原本还有个 navGutter（侧栏右边那一格空隙）。删掉它是因为
+// **侧栏和列表栏现在各自铺一条底色**（navBg 237 / listBg 235），两块差
+// 2 格的面板紧挨着本身就是一条分界，再空一格反而把侧栏切成了一条飘着
+// 的细带。参照的设计里那条缝是留给「无底色的内容区」的，而这里的
+// 内容区在更右边 —— 会话流那一栏。
 
 // inputBlockHeight 是浮起输入区占的行数：上下各留一行空白，中间一行
 // 是输入行。
@@ -40,16 +42,96 @@ const navGutter = 1
 // 去掉留白，输入行就退回成又一条贴底的横带——也就是现在这样。
 const inputBlockHeight = 3
 
+// 气泡的几何。三个数是一组，改一个要连着看另外两个。
+//
+//	│←inset→│ pad ┌──────────┐ pad │
+//	│       │     │  正文…   │     │
+//
+// paneInset 是**正文栏里所有内容的左内缩**：气泡、会话标题、输入卡、
+// 状态栏都从栏左沿 +1 格开始。它必须存在，理由有两层：
+//
+//   - 会话流的左沿紧挨着列表栏的底色块（235），气泡底色是 238，直接贴
+//     上去的话两块只差 3 格的面板会挤在一起、看不出边界。留一格终端背景，
+//     气泡就"浮"在会话流里了。
+//   - **同一个数管着四样东西**，它们才会左对齐。各写各的缩进（气泡 1 格、
+//     标题 0 格、输入卡 0 格）看上去每处都"差不多"，合起来就是一条参差
+//     不齐的左边缘 —— 而参差没人会专门提，只会觉得"说不上哪儿别扭"。
+//
+// bubblePadX 是气泡内部左右各一格内边距 —— 文字贴到色块边缘会显得很挤。
+//
+// minBubbleW 是气泡的最小宽度。再窄就不像气泡，像一块补丁：一句「好」按
+// 「最长行 + 内边距」反推出来只有 4 列，那不是引用块，是渲染坏了的样子。
+//
+// 放在包级而不是 renderMessage 里，是因为判据要绑这三个数：绑常量而不是
+// 绑字面量，改设计时才不会把判据变成一条谁也不知道在说什么的硬编码。
+const (
+	paneInset  = 1
+	bubblePadX = 1
+	minBubbleW = 12
+	minNameW   = 4 // 消息头里留给名字的最小列数，见 renderMessage
+)
+
+// 灰阶：界面上所有「次要文字」的颜色。
+//
+// ⚠️ **不要用 Faint(true)**，这一版把它整个换掉了。
+//
+// Faint 是 SGR 2（"半亮"），它的实现是**把当前前景色往背景色方向压一半**，
+// 所以效果完全取决于终端和字体 —— 而 Windows Terminal 长期不支持 SGR 2，
+// 实测截图里所有本该变灰的文字（分组标题、非当前标签页、快捷键提示、
+// 状态栏）**一点都没变灰**，全是默认前景色。后果不是"不够淡"，是
+// **层次塌了**：标题、条目、说明文字亮度一样，一片平。这正是那张
+// 截图"没有设计感"的一半来源。
+//
+// 显式给一个灰色就没这个问题：它是确定的、跨终端一致的，也不依赖字体
+// 有没有做半亮字形。
+var (
+	// fgMuted 是次要信息（说明文字、非当前标签页、状态栏）。
+	fgMuted = lipgloss.AdaptiveColor{Light: "244", Dark: "244"}
+	// fgDim 更弱一档，给分组标题这类"只是分区、不需要读"的文字。
+	fgDim = lipgloss.AdaptiveColor{Light: "246", Dark: "242"}
+	// fgTime 比 fgMuted 再暗一点：列表里的时间是**背景信息**，
+	// 它要能被右对齐的基准线看到，但不该和名字抢注意力。
+	fgTime = lipgloss.AdaptiveColor{Light: "247", Dark: "241"}
+	// fgPlaceholder 是输入框里的占位提示文字。
+	//
+	// ⚠️ 它和上面那三个**不是**一档，不要照抄它们的值。那三个是给
+	// **不铺底**的地方用的（文字直接坐在终端背景上），而 placeholder
+	// 坐在输入卡那块抬升底色上 —— 底色抬了一层，字也得跟着抬。
+	//
+	// 上一版这里没设，用的是 bubbles 的默认灰（降级到 256 色正好是 240），
+	// 和输入卡底色（inputRowBg，也是 240）**一模一样**。结果「输入消息，
+	// 回车发送」八个字在界面上整个消失，只剩一个孤零零的提示符；而代码
+	// 里全是对的，查不出来。判据见 TestPlaceholder_ReadsOnItsOwnBackground。
+	fgPlaceholder = lipgloss.AdaptiveColor{Light: "238", Dark: "250"}
+)
+
 var (
 	styleTitle    = lipgloss.NewStyle().Bold(true)
-	styleMuted    = lipgloss.NewStyle().Faint(true)
+	styleMuted    = lipgloss.NewStyle().Foreground(fgMuted)
+	styleTime     = lipgloss.NewStyle().Foreground(fgTime)
 	styleError    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	styleOK       = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	styleUnread   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	styleSelected = lipgloss.NewStyle().Bold(true).Reverse(true)
-	stylePrompt   = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	styleMine     = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	styleLink     = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+
+	// styleAccent 是界面里**唯一**的强调色。
+	//
+	// 它只承担一个语义：「这里是你现在所在的位置」。撒开用（标题一个色、
+	// 分组一个色、图标再一个色）画面会花，而花和「有设计」恰好是反的 ——
+	// 层次是**克制**出来的，不是堆出来的。
+	//
+	// 位置本身由底色块表达（选中项、当前标签页都铺一块），强调色只是在
+	// 底色之上再点一下，给眼睛一个明确的落点。
+	styleAccent = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	// styleUnread 是列表行首那个未读标记。
+	//
+	// 也用强调色，不另开一个红/橙：**位置靠底色，状态靠颜色**。选中项已经
+	// 用底色块说了「你在这儿」，标记再抢一个颜色，就是两种语义抢同一个
+	// 位置，两个都会变弱。
+	styleUnread = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Bold(true)
+	// stylePrompt 是输入框前面那个提示符。
+	stylePrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	// styleMDRule 是正文里分隔线（---）被渲染成的那条横线。
 	styleMDRule = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	// styleTag 是消息头上那个「HTML」小标记。
@@ -61,46 +143,56 @@ var (
 
 	// ---- 分层用的底色 ----
 	//
-	// 这一组是「用底色代替线条」那套方案的落点。参照的设计里整屏没有
-	// 一条分割线，层次全靠底的深浅 —— 终端里同样能做，只是要克制：
-	// 底色只用来区分**区域**，不参与强调。
-	//
-	// 每一对都贴着各自的终端背景走（深色终端用比背景亮一两档的灰，
-	// 浅色终端用比背景暗一两档的灰），因为写死一个灰必然在另一种
-	// 终端上糊掉。
+	// 这一组是「用底色代替线条」那套方案的落点：整屏没有一条竖着贯通的
+	// 分割线，层次全靠底的深浅。终端里同样做得到 —— 只是必须**克制**：
+	// 底色只用来区分**区域**，不参与强调；而且相邻两块至少要差 2 格，
+	// 否则隔着一层文字根本看不出来（见下面 var 块的说明）。
 
-	// styleNav      是导航列的底色，让它在最左边自成一条。
+	// styleNav 是文件夹栏的底色：三块面板里最亮的一条（它最窄、最常被扫）。
 	styleNav = lipgloss.NewStyle().Background(navBg)
 	// styleNavActive / styleNavIdle 是导航项的两态。
 	//
 	// 选中态用的是和列表、标签页**同一块**底色（rowSelectedBg）：整个界面
-	// 里「选中」只有这一种表达方式，用户学会一次就够了。加上加粗和亮色，
-	// 是因为导航列的底色本身已经在参与分层，单靠一块底色不够醒目。
+	// 里「选中」只有这一种表达方式，用户学会一次就够了。加粗和亮色是因为
+	// 导航列的底色本身已经在参与分层，单靠一块底色不够醒目。
+	//
+	// 除了底色块它还有第三个标记：最左那一格的强调色标条（在 navItemRow
+	// 里和正文一起渲染）。底色块负责说「哪一行」，标条负责说「从哪儿
+	// 开始」—— 底色块的边界在浅色终端上会糊，标条不会。
 	styleNavActive = lipgloss.NewStyle().Bold(true).
 			Foreground(lipgloss.Color("141")).Background(rowSelectedBg)
-	styleNavIdle = lipgloss.NewStyle().Faint(true)
+	// styleNavIdle 是非选中导航项：只有灰字，不铺底 —— 那一行露出来的
+	// 就是侧栏自己的底色。
+	styleNavIdle = lipgloss.NewStyle().Foreground(fgMuted)
 
 	// styleRowSelected 是会话列表里选中项那条底色块。
 	//
 	// 替代了原先的整行反白（styleSelected）。反白是终端里最大的对比度，
-	// 一行反白会在视野里炸开；底色块只是「比周围亮一档」，选中位置照样
-	// 一眼看得见，但不会把整个列表压下去。参照的设计用的就是这种。
+	// 一行反白会在视野里炸开；底色块只是「比周围亮几档」，选中位置照样
+	// 一眼看得见，但不会把整个列表压下去。
 	//
-	// 导航项的选中态和顶部标签页的当前页用的也是这一块 —— 见 styleNavActive。
+	// ⚠️ 块的两侧各内缩一格（见 renderListRow）：通栏的色块看着像表格的
+	// 斑马纹，内缩之后才像「一条被选中的东西」。导航项的选中态和当前
+	// 标签页用的也是这一块 —— 见 styleNavActive。
 	styleRowSelected = lipgloss.NewStyle().Background(rowSelectedBg).Bold(true)
 	// styleGroupTitle 是列表里「未读 / 已读」这类分组小标题。
-	styleGroupTitle = lipgloss.NewStyle().Faint(true)
+	styleGroupTitle = lipgloss.NewStyle().Foreground(fgDim)
 
-	// styleInputRow 是浮起输入行的底色。
+	// styleInputRow 是浮起输入卡的底色。
 	styleInputRow = lipgloss.NewStyle().Background(inputRowBg)
-
-	// styleTabActive / styleTabIdle 是顶部会话标签页的两态。
+	// stylePlaceholder 是输入框没内容时那句提示。
 	//
-	// 当前那一页铺底色块（和列表选中同一块），其余淡着 —— 标签页是一排
-	// 并列的东西，靠底色指明「你在哪一页」比靠颜色更稳。
+	// 必须在**赋值时**就把它挂到 textinput 上（见 newTextInput）：它的
+	// 默认色是一个写死的 hex，降级到 256 色刚好撞上输入卡底色。
+	stylePlaceholder = lipgloss.NewStyle().Foreground(fgPlaceholder)
+
+	// styleTabActive / styleTabIdle 是会话栏顶部那排标签页的两态。
+	//
+	// 当前那一页铺底色块（和列表选中同一块），其余只留灰字、不铺底 ——
+	// 标签页是一排并列的东西，靠底色指明「你在哪一页」比靠颜色更稳。
 	styleTabActive = lipgloss.NewStyle().Bold(true).
 			Foreground(lipgloss.Color("141")).Background(rowSelectedBg)
-	styleTabIdle = lipgloss.NewStyle().Faint(true)
+	styleTabIdle = lipgloss.NewStyle().Foreground(fgMuted)
 
 	// styleScrollBar / styleScrollThumb 是会话正文右侧那条滚动条。
 	//
@@ -109,51 +201,111 @@ var (
 	styleScrollBar   = lipgloss.NewStyle().Foreground(scrollBarFg)
 	styleScrollThumb = lipgloss.NewStyle().Foreground(scrollThumbFg)
 
-	// stylePeerRow 是对方消息那几行的底色。
+	// stylePeerBubble 是对方消息那个气泡的底色。
 	//
-	// 只给**对方**的行铺灰底，自己的保持无底色 —— 自己那边靠右对齐、
-	// 名字用另一个颜色，已经够区分了。这样余光一扫就能分出「谁在说」，
-	// 不用去读名字。
+	// 只给**对方**铺，自己的保持无底色 —— 自己那边靠右对齐、名字用另一个
+	// 颜色，已经够区分了，余光一扫就能分出「谁在说」。
 	//
-	// 自适应深浅：浅色终端给浅灰，深色终端给深灰。写死一个灰，在另一种
-	// 背景的终端上要么糊成一片、要么刺眼。
-	stylePeerRow = lipgloss.NewStyle().Background(peerRowBg)
+	// 这不是「两边都铺就等于两边都没铺」的洁癖：气泡的作用是把一段话
+	// **圈起来**；两边都圈的话，一屏里就多出几十个框，边界反而看不出来了。
+	//
+	// ⚠️ 气泡**不再是通栏**的（见 renderMessage）：底色还铺满整行的那种
+	// 画法，会让短消息两侧留下大片空白，看着像表格的一行，看不出"这是一
+	// 段话"。现在气泡的宽度贴合内容，样式本身只负责染色。
+	stylePeerBubble = lipgloss.NewStyle().Background(peerBubbleBg)
 )
 
-// 分层用的底色（各区域自成一档，互不相同）。
+// 分层用的底色。
 //
-// 深色终端上是一条「越靠前越亮」的梯子：导航 235 < 对方的消息 236 <
-// 输入框 237 < 选中 238，都在背景之上，相邻两档只差一格 —— 差得出来、
-// 又不刺眼。浅色终端同理，只是方向反过来（越靠前越暗）。
+// 深色终端上是一条「越靠外越亮」的梯子：
+//
+//	终端背景（不铺）  最暗
+//	会话列表  235     #262626
+//	文件夹栏  237     #3a3a3a
+//	气泡      238     #444444
+//	抬升层    240     #585858  ← 输入卡 / 选中块 / 当前标签页
+//
+// 参照的是 VS Code 那种「活动栏 / 侧栏 / 编辑器」的三段关系 —— 最外那条
+// 栏最亮，内容区就是终端自己的背景。
+//
+// 深色终端上没法往背景**之下**再降（用户的背景本来就够暗了），所以层次
+// 只能朝上叠 —— 这也是为什么「内容区」恰好是不铺底色的那一个。
+//
+// ⚠️ 两条尺子，改任何一个数值之前先过一遍：
+//
+//  1. **相邻两块至少差 2 格。** 差 1 格在 256 色里只差十来个灰阶，隔着
+//     一层文字根本看不出来；看不出来就等于这两块面板没分家，于是又会有人
+//     想往回补一条竖线 —— 而那条竖线正是这一版要去掉的东西。
+//  2. **「抬升层」要离它脚下的那一层至少差 3 格。** 选中块压在列表（235）
+//     上是差 5 格，压在侧栏（237）上是差 3 格 —— 两个都够。（第一版把选中
+//     块定在 238，压在 237 的侧栏上只差 1 格，等于选中项没有底色。）
 var (
-	navBg         = lipgloss.AdaptiveColor{Light: "255", Dark: "235"}
-	inputRowBg    = lipgloss.AdaptiveColor{Light: "252", Dark: "237"}
-	rowSelectedBg = lipgloss.AdaptiveColor{Light: "250", Dark: "238"}
+	// 列表 235 与文件夹栏 237 差 2 格，所以它们紧挨着也分得开。
+	listBg = lipgloss.AdaptiveColor{Light: "255", Dark: "235"}
+	navBg  = lipgloss.AdaptiveColor{Light: "252", Dark: "237"}
+	// 输入卡和选中块**故意同值**：两者都是「在本来的表面上抬一层」，而且
+	// 一个在列表里、一个在屏幕底部，永远不会同时出现在视野中心。梯子上要
+	// 花心思拉开距离的是**相邻**的那几对，不是这一对。
+	inputRowBg    = lipgloss.AdaptiveColor{Light: "249", Dark: "240"}
+	rowSelectedBg = lipgloss.AdaptiveColor{Light: "249", Dark: "240"}
 )
 
-// peerRowBg 是对对方消息行铺的那个灰。
+// peerBubbleBg 是对方消息那个气泡的底色。
 //
-// 253 = 很浅的灰（浅色终端上刚刚看得出来），236 = 很深的灰（深色终端上
-// 同样只差一档）。两边都刻意贴着各自的背景走：这是**分区**用的底色，
-// 不是高亮，抢了正文的对比度就本末倒置了。
+// 它是**分区**用的底色，不是高亮 —— 抢了正文的对比度就本末倒置了。
+// 238 比终端背景亮 3 格出头，气泡的边界清楚，而正文（默认前景色）压在
+// 它上面仍然是最高的对比度。
 //
-// 它和 inputRowBg 各占梯子上的一格：两块灰离得很远（一封邮件 vs 底部
-// 输入区），共用一档本来也看不出来，但既然是一条要维护的梯子，就不留
-// 「这两个常量值一样，是巧合还是故意的」这种要靠猜的空档。
-var peerRowBg = lipgloss.AdaptiveColor{Light: "253", Dark: "236"}
+// ⚠️ 气泡在会话流里，**左沿会紧挨着列表栏的底色**（235）。虽然中间隔着
+// 一格不铺色的留白（见 renderMessage），差 3 格也算宽裕 —— 但这条是改
+// 数值时最容易忘的：把气泡底色降到 236，它就只比列表亮 1 格了。
+var peerBubbleBg = lipgloss.AdaptiveColor{Light: "253", Dark: "238"}
 
 // scrollBarFg / scrollThumbFg 是滚动条轨道与滑块的前景色。
 //
-// 两者都刻意和 stylePeerRow 的底色错开：轨道贴着背景（浅底给浅灰、
-// 深底给深灰），滑块反着来，这样一条细线在两种终端上都能看出「有」。
+// 两者都刻意和气泡底色错开：轨道贴着背景（浅底给浅灰、深底给深灰），
+// 滑块反着来，这样一条细线在两种终端上都能看出「有」。
 var (
-	scrollBarFg   = lipgloss.AdaptiveColor{Light: "250", Dark: "238"}
+	scrollBarFg   = lipgloss.AdaptiveColor{Light: "250", Dark: "239"}
 	scrollThumbFg = lipgloss.AdaptiveColor{Light: "243", Dark: "250"}
 )
 
-// peerRowBgSeq 返回当前终端上该用的底色序列；终端不支持颜色时返回空串。
-func peerRowBgSeq() string {
-	return bgSeqOf(stylePeerRow)
+// 列表行首的那两个标记字符。
+//
+// ⚠️ **只用 Block Elements 区（U+2580–259F）和 ASCII。**
+//
+// 这一条是拿截图换来的。原来用的是 ● (U+25CF) 和 ★ (U+2605) —— 两者的
+// 默认呈现确实是"文本"，看着很安全。但 Windows 上等宽字体（Cascadia
+// Code 这一族）**没有这两个字形**，Windows Terminal 于是回退到
+// Segoe UI Emoji，结果是列表里冒出一堆**不受 SGR 控制**的彩色图形：实测
+// 截图里那个星标被画成了黄绿色，跟整屏的灰阶体系当场打架。
+//
+// 补一个 VS15 (U+FE0E) 也救不了：字体栈里根本没有"文本呈现"的字形，
+// 选择器没有东西可选，回退照样发生。
+//
+// Block Elements 是终端字体的硬性覆盖范围（画框、画进度条都要用），
+// 而且这一个区**没有任何 emoji 变体**，不会触发回退。ASCII 同理。
+const (
+	// blockMark 是左半块（U+258C）。
+	//
+	// **同一个字符在两个地方用，语义不同**：侧栏里它是「你现在在这儿」
+	// 的标条，列表里它是「这条没读过」的标记。两者隔着一条完整的列表栏，
+	// 永远不会出现在同一行的同一列上，所以不会混淆 —— 也正是因为语义
+	// 不同，这里只留一个常量、两处各写各的意思，而不是造两个同名alias。
+	//
+	// 半块比全块轻：摆在行首像一条竖标条，不像一个方块。
+	blockMark = "▌"
+	// starMark 是星标会话的标记。用 ASCII 星号：星形字符全在
+	// Geometric Shapes 区，那个区里有 emoji 变体的成员不少，不值得赌。
+	starMark = "*"
+	// markWidth 是行首标记区的宽度（标记 + 一格间隔）。两个标记都靠
+	// 左摆在这个区里，于是有没有它们后面的名字都不会错位。
+	markWidth = 2
+)
+
+// peerBubbleBgSeq 返回当前终端上该用的气泡底色序列；不支持颜色时返回空串。
+func peerBubbleBgSeq() string {
+	return bgSeqOf(stylePeerBubble)
 }
 
 // navBgSeq 是导航列底色对应的序列。
@@ -195,7 +347,7 @@ func bgSeqOf(s lipgloss.Style) string {
 //
 // 这条做法依赖一个实测过的事实：渲染层吐出的重置序列只有 \x1b[0m 一种，
 // 其余都是 \x1b[1m / \x1b[3m / \x1b[38;5;Nm 这类「设参数」序列，不会反向
-// 清掉底色。TestChat_PeerRowsAreBandPainted 守着这一点。
+// 清掉底色。TestChat_PeerBubblePaintSurvivesResets 守着这一点。
 //
 // ⚠️ 还有一条：**这里铺的是「一行」，不是「一块」。** 末尾那个 \x1b[49m
 // 一出现，底色就断了 —— 想拿一个序列管住多行的话，只有第一行有底色，
@@ -210,9 +362,33 @@ func paintRowBg(line, seq string) string {
 	return seq + line + "\x1b[49m"
 }
 
-// paintPeerRow 给对方消息的整整一行铺上底色（右侧一直铺到版面边沿）。
-func paintPeerRow(line string) string {
-	return paintRowBg(line, peerRowBgSeq())
+// paintPeerBubble 给气泡的一块（若干行的其中一行）铺上底色。
+//
+// 传进来的行**已经补到气泡的宽度**了 —— 底色只负责染色，不管宽度。
+func paintPeerBubble(line string) string {
+	return paintRowBg(line, peerBubbleBgSeq())
+}
+
+// listBgSeq 是会话列表栏底色对应的序列。
+func listBgSeq() string {
+	return bgSeqOf(lipgloss.NewStyle().Background(listBg))
+}
+
+// paintPaneBg 给一整块（多行）的**每一行**铺上底色。
+//
+// ⚠️ 名字里的 "Pane" 说的是入参形态（一整块文本），不是"能一次铺满一块"。
+// 内部就是按行循环调 paintRowBg —— 终端里没有"铺一个矩形"这回事，而
+// 一个听起来像有的函数名，正是下一个人写出"只有第一行有底色"的 bug 的
+// 起点（见 paintRowBg 末尾那条）。
+func paintPaneBg(pane, seq string) string {
+	if seq == "" || pane == "" {
+		return pane
+	}
+	lines := strings.Split(pane, "\n")
+	for i, l := range lines {
+		lines[i] = paintRowBg(l, seq)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // hyperlink 把文本包成 OSC 8 终端超链接。
@@ -253,8 +429,13 @@ func hyperlink(url, text string) string {
 // senderPalette 是群聊里区分不同发言人的颜色。
 //
 // 挑的是在中深色终端背景上都能看清的中间调，避开接近黑和接近白的两端。
+//
+// ⚠️ **141 被排除在外了** —— 它是界面唯一的强调色（styleAccent），只用来
+// 说「你现在的位置」。某个发言人碰巧也叫 141 的话，一行名字就会被读成
+// 「这一行是选中项」，强调色的语义当场漏水。这也是"强调色只能有一个"
+// 那条规矩的唯一技术落点：调色板里不许再出现它。
 var senderPalette = []lipgloss.Color{
-	"42", "45", "51", "78", "87", "114", "141", "177", "213", "220",
+	"42", "45", "51", "78", "87", "114", "177", "183", "213", "220",
 }
 
 // senderStyle 按地址稳定地挑一个颜色。
@@ -266,6 +447,14 @@ func senderStyle(addr string) lipgloss.Style {
 	_, _ = h.Write([]byte(addr))
 	return lipgloss.NewStyle().Foreground(senderPalette[int(h.Sum32())%len(senderPalette)])
 }
+
+// maxCellW 是一个字符在终端里最多占的列数（CJK 汉字、全角标点、emoji 都是 2）。
+//
+// 它是一条**布局下限**的来源：折行的硬断点是以「一个字符」为单位推进的
+// （见 markdown.go 的 wrapLine，`end = start + 1`），所以宽度给到 1 列时
+// 一个汉字照样占满 2 列 —— 任何「至少要 N 列才画得出来的东西」都得把这个
+// 数算进去，否则会在极窄的窗口里多出一列。
+const maxCellW = 2
 
 // cellWidth 是一个字符在终端里占的列数（纯文本口径）。
 //
