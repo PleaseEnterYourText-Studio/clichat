@@ -134,7 +134,81 @@ func (ix *Index) Merge(headers []mail.Header) (added, updated int) {
 		ix.Headers = append(ix.Headers, h)
 		added++
 	}
+
+	// 自愈：同一 (文件夹, UID) 只留一条。
+	//
+	// 必须放在最后，而且**不能省**：没有 Message-ID 的邮件在上面那个循环里
+	// 没法按 Message-ID 命中，只能一路 append。取头那条路已经修了（见
+	// mail.applyRawHeaders），但已经写进 index.json 的重复还在，而且它们
+	// 每一条的 UID 在服务端都还活着 —— RemoveMissing 一个都不会删。
+	if m := ix.dedupeLocked(); m > 0 {
+		// 被合掉的那些**不算新增**：它们本来就在索引里（只是当时没有
+		// Message-ID 没法按它去重）。不扣掉的话，每次同步都会报「新增 N 条」
+		// 并把界面白刷一遍，而实际上一封新邮件都没有。
+		added -= m
+		if added < 0 {
+			added = 0
+		}
+	}
 	return added, updated
+}
+
+// dedupeLocked 把「同一个 (文件夹, UID) 出现多次」的条目合成一条，返回合掉的
+// 条数。调用方必须已持有 mu。
+//
+// # 凭什么敢删
+//
+// **(文件夹, UID) 就是「服务端上哪一封」的身份**，同一个身份出现两次一定是错的。
+// 2026-10-03 实测：126 的收件箱 196 封里有 13 封的 ENVELOPE 没有 Message-ID
+// （原始头里有），而 Merge 只按 Message-ID 去重 —— 于是每同步一轮就追加一份，
+// 攒到 86 条重复，索引 311 条而服务端只有 243 封。
+//
+// 合并规则：
+//   - 标志取**或**（任一副本已读即算已读，别把用户标过的已读弄丢）；
+//   - Message-ID 优先留**非空**的那个 —— 空的那个正是要被修掉的东西，
+//     补上之后下一轮 Merge 就能按它正常去重了。
+//
+// ⚠️ UID == 0 的不参与：那是本地刚发出、还没同步回来的乐观副本，它们本来
+// 就没有服务端身份，共用 (Sent, 0) 是正常的（见 RemoveMissing 的同一条注释）。
+func (ix *Index) dedupeLocked() int {
+	type key struct {
+		folder string
+		uid    uint32
+	}
+
+	at := make(map[key]int, len(ix.Headers))
+	kept := ix.Headers[:0]
+	merged := 0
+
+	for _, h := range ix.Headers {
+		if h.UID == 0 {
+			kept = append(kept, h)
+			continue
+		}
+		k := key{folder: h.Folder, uid: h.UID}
+		p, dup := at[k]
+		if !dup {
+			at[k] = len(kept)
+			kept = append(kept, h)
+			continue
+		}
+		merged++
+		dst := &kept[p]
+		dst.Seen = dst.Seen || h.Seen
+		dst.Flagged = dst.Flagged || h.Flagged
+		if dst.MessageID == "" && h.MessageID != "" {
+			dst.MessageID = h.MessageID
+			dst.InReplyTo = h.InReplyTo
+			dst.References = h.References
+		}
+	}
+
+	if merged == 0 {
+		return 0
+	}
+	ix.Headers = kept
+	ix.rebuildPos()
+	return merged
 }
 
 // All 返回索引里的全部头部（副本）。
@@ -283,6 +357,53 @@ func (ix *Index) RemoveMissing(folder string, alive []uint32) int {
 	ix.Headers = kept
 	ix.rebuildPos()
 	return removed
+}
+
+// CountFolder 返回某个文件夹里有 UID 的条数。
+//
+// ⚠️ **UID == 0 的乐观副本不算**：它们在服务端上还没有身份，拿它们去和
+// 「服务端上有几封」比，差值永远对不上（本地会比服务端多，而那正是
+// 「本地有幽灵」的反面，会让人往错的方向查）。
+func (ix *Index) CountFolder(folder string) int {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	n := 0
+	for _, h := range ix.Headers {
+		if h.Folder == folder && h.UID != 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// MissingMessageIDRange 返回某个文件夹里 **Message-ID 为空**的条目的 UID
+// 区间 [lo, hi]（含）。没有这样的条目时 ok=false。
+//
+// 存在的理由是「一次性自愈」：取头那条路 2026-10-03 才改成从原始头取
+// Message-ID（见 mail.applyRawHeaders），在那之前同步进来的条目 Message-ID
+// 是空的 —— 它们不能按 Message-ID 去重，也没法串会话。这些 UID 都在游标
+// 之下，正常增量同步永远不会再取到它们，只能照这个区间主动补一次。
+//
+// ⚠️ 返回的是**区间**不是集合：`Client.Headers` 只认区间。调用方必须自己
+// 限制跨度（见 app.maxHealRangeSpan）—— 区间太宽会顺手把整个文件夹拉下来。
+func (ix *Index) MissingMessageIDRange(folder string) (lo, hi uint32, ok bool) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	for _, h := range ix.Headers {
+		if h.Folder != folder || h.UID == 0 || h.MessageID != "" {
+			continue
+		}
+		if !ok || h.UID < lo {
+			lo = h.UID
+		}
+		if !ok || h.UID > hi {
+			hi = h.UID
+		}
+		ok = true
+	}
+	return lo, hi, ok
 }
 
 // Reset 清空索引。服务器重置 UID 空间时用。

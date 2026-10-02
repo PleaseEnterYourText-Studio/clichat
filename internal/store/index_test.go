@@ -236,3 +236,85 @@ func TestIndex_RewindKeepsValidityAndHeaders(t *testing.T) {
 		t.Error("Rewind 把已读状态弄丢了")
 	}
 }
+
+// 同一 (文件夹, UID) 只能留一条 —— 这是**自愈**，不是优化。
+//
+// 背景（2026-10-03 实测）：126 的收件箱 196 封里有 13 封的 ENVELOPE 没有
+// Message-ID（原始头里有），而 Merge 只按 Message-ID 去重 → 每同步一轮就
+// 追加一份，攒到 86 条重复：索引 311 条，服务端只有 243 封。取头那条路已经
+// 修了，但已经写进 index.json 的重复还在，而且它们每一条的 UID 在服务端都
+// 还活着 —— RemoveMissing 一个都不会删。所以 Merge 必须自己收口。
+func TestIndex_MergeDedupesByFolderAndUID(t *testing.T) {
+	ix, err := Open(t.TempDir() + "/index.json")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// 第一次同步：这封没有 Message-ID（就是那 13 封的样子）。
+	added, _ := ix.Merge([]mail.Header{{Folder: "INBOX", UID: 7, Subject: "甲"}})
+	if added != 1 {
+		t.Fatalf("第一次 added = %d，想要 1", added)
+	}
+
+	// 再同步两轮 —— 每轮都会把它当「没见过」再 append 一次。
+	added2, _ := ix.Merge([]mail.Header{{Folder: "INBOX", UID: 7, Subject: "甲"}})
+	added3, _ := ix.Merge([]mail.Header{{Folder: "INBOX", UID: 7, Subject: "甲"}})
+
+	if n := ix.Len(); n != 1 {
+		t.Errorf("索引里 %d 条，想要 1 —— 同一 (文件夹, UID) 又被追加了", n)
+	}
+	// ⚠️ 报出来的 added 也必须是 0：它驱动日志和「界面要不要重绘」。
+	// 不扣掉被合掉的那些，每次同步都会报「新增 N 条」并白刷一遍界面。
+	if added2 != 0 || added3 != 0 {
+		t.Errorf("重复同步报 added = %d / %d，想要 0（没有新邮件）", added2, added3)
+	}
+}
+
+// 合并时别把用户标过的状态弄丢，并且要把空 Message-ID 补上。
+func TestIndex_MergeDedupeKeepsFlagsAndFillsMessageID(t *testing.T) {
+	ix, err := Open(t.TempDir() + "/index.json")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	ix.Merge([]mail.Header{{Folder: "INBOX", UID: 9, Subject: "甲", Seen: true, Flagged: true}})
+	ix.Merge([]mail.Header{{
+		Folder: "INBOX", UID: 9, Subject: "甲",
+		MessageID:  "<now-known@x>",
+		References: []string{"<root@x>"},
+	}})
+
+	all := ix.All()
+	if len(all) != 1 {
+		t.Fatalf("索引里 %d 条，想要 1", len(all))
+	}
+	h := all[0]
+	if !h.Seen || !h.Flagged {
+		t.Errorf("标志丢了：Seen=%v Flagged=%v —— 合并要取或", h.Seen, h.Flagged)
+	}
+	if h.MessageID != "<now-known@x>" {
+		t.Errorf("Message-ID = %q，想要补上非空的那个", h.MessageID)
+	}
+	if len(h.References) != 1 {
+		t.Errorf("References = %v，想要跟着 Message-ID 一起补", h.References)
+	}
+}
+
+// UID == 0 的乐观副本不参与去重：它们共用 (Sent, 0) 是正常的，
+// 按 (文件夹, UID) 去重会把用户刚发出去的信合成一条。
+func TestIndex_MergeDedupeLeavesOptimisticCopiesAlone(t *testing.T) {
+	ix, err := Open(t.TempDir() + "/index.json")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	ix.Merge([]mail.Header{
+		{Folder: "Sent", UID: 0, MessageID: "<mine-1@x>", Subject: "刚发的 1"},
+		{Folder: "Sent", UID: 0, MessageID: "<mine-2@x>", Subject: "刚发的 2"},
+		{Folder: "Sent", UID: 0, MessageID: "<mine-3@x>", Subject: "刚发的 3"},
+	})
+
+	if n := ix.Len(); n != 3 {
+		t.Errorf("索引里 %d 条，想要 3 —— 乐观副本被当成重复合掉了", n)
+	}
+}

@@ -39,6 +39,12 @@ type App struct {
 	// 它是**可选**的：nil 时一切照旧，只是重启后要重新下载。这样测试
 	// 默认不碰磁盘（见 New），而落盘那条路自己有专门的判据。
 	cache *store.BodyCache
+
+	// once 记「这件一次性的事情做过了」，键带前缀（见 onceFlag）。
+	//
+	// 用一张表而不是每件事一个字段：这些都是「每个进程只做一次」的开关，
+	// 分开写只会让 App 的字段越堆越多，而它们的行为完全一样。
+	once map[string]bool
 }
 
 // Body 是一封邮件的正文，连同它是怎么来的。
@@ -246,6 +252,12 @@ func (a *App) syncFolder(folder string) (bool, error) {
 		changed = true
 	}
 
+	// 一次性自愈：老版本同步进来的条目 Message-ID 是空的（见
+	// healMissingMessageIDs）。放在 Merge 之后 —— 它自己也要 Merge 一次。
+	if a.healMissingMessageIDs(folder) {
+		changed = true
+	}
+
 	last := st.LastUID
 	for _, h := range headers {
 		if h.UID > last {
@@ -306,13 +318,25 @@ func (a *App) syncFolder(folder string) (bool, error) {
 	//   ② 收件箱里只有 90 天以前的信，被首次同步的时间窗口整批裁掉。
 	// 两种都表现为「配好了却一封信都看不到」，而日志里一个字都没有。
 	//
+	// ⚠️ 判据里必须有「**本地比服务端少**」这一条，光看「本次没新增」不行：
+	// 稳态下（没有新邮件）每次轮询都会命中，于是这条诊断每 30 秒刷一行 ——
+	// 而它本来只在「出事了」的时候才有意义。实测日志被它刷到 3149 行、
+	// 真正的线索全被埋掉（2026-10-03 用户拿日志来问的时候就是这样）。
+	//
+	// 而且**一个文件夹只报一次**：首次同步按窗口裁剪时「本地比服务端少」是
+	// 正常的（那是设计），每次轮询都重复报等于又造了一遍噪音。
+	//
 	// updated > 0 时不算：那时邮件本来就在索引里（自己刚发出去、
 	// 服务端副本回来补 UID），报「一条都没进索引」会让人以为丢了信。
-	if added == 0 && updated == 0 && f.Messages > 0 {
-		log.Printf("同步 %s: 服务端上有 %d 封，本次一条都没进索引（拉取区间 %d 起，"+
-			"首次同步=%v，非全量模式时会按 %d 天裁剪）—— 若是历史邮件，"+
-			"用「接收全部邮件」重新拉",
-			folder, f.Messages, from, firstSync, a.cfg.Sync.InitialDays)
+	if added == 0 && updated == 0 && f.Messages > 0 &&
+		uint32(a.index.CountFolder(folder)) < f.Messages &&
+		!a.onceFlag("notice:"+folder) {
+		log.Printf("同步 %s: 服务端上有 %d 封，本地只有 %d 封，本次一条都没进索引"+
+			"（拉取区间 %d 起，首次同步=%v，非全量模式时会按 %d 天裁剪）"+
+			"—— 若是历史邮件，用「接收全部邮件」重新拉；"+
+			"本地副本也可能因为 Message-ID 去重被记在别的文件夹下（正常）",
+			folder, f.Messages, a.index.CountFolder(folder), from, firstSync,
+			a.cfg.Sync.InitialDays)
 	}
 	return changed, nil
 }
@@ -328,6 +352,69 @@ func (a *App) reconcileDeleted(folder string) (int, error) {
 		return 0, err
 	}
 	return a.index.RemoveMissing(folder, alive), nil
+}
+
+// onceFlag 报告 key 是不是已经用过了；没用过就顺手记上。
+//
+// 给「每个进程只做一次」的事情用：一次性自愈（healMissingMessageIDs）
+// 和那条只该报一次的诊断日志。它们的行为完全一样，所以共用一张表。
+func (a *App) onceFlag(key string) bool {
+	if a.once == nil {
+		a.once = map[string]bool{}
+	}
+	if a.once[key] {
+		return true
+	}
+	a.once[key] = true
+	return false
+}
+
+// maxHealRangeSpan 是「补 Message-ID」那一次重取允许的最大 UID 跨度。
+//
+// 那个区间是为了自愈才重取的（见 healMissingMessageIDs），跨度取决于坏条目
+// 之间隔了多远 —— 数据坏得厉害时可能横跨整个文件夹，那就等于每次启动都把
+// 整个文件夹拉一遍。超过这个数就放弃自愈：条目按 (文件夹, UID) 去重仍然成立，
+// 只是它们串不成会话，不值得用一次全量拉取去换。
+const maxHealRangeSpan = 500
+
+// healMissingMessageIDs 把「本地有、但 Message-ID 是空的」那一段头重取一遍。
+//
+// 为什么需要：取头那条路 2026-10-03 才改成从**原始头**取 Message-ID（见
+// mail.applyRawHeaders）—— 在那之前同步进来的条目 Message-ID 是空的，而去重
+// 和会话串线都靠它。这些 UID 都在游标之下，正常增量同步**永远不会**再取到
+// 它们，只能照区间主动补一次。
+//
+// ⚠️ 一个文件夹每个进程只试一次。Message-ID 在 RFC 5322 里是**可选**的，
+// 所以「服务端真的没有」是可能的 —— 那时这段头会被反复重取而每次都补不上。
+// 试一次就够，别让它变成每轮的开销。
+func (a *App) healMissingMessageIDs(folder string) bool {
+	// 每个文件夹只试一次，**不管有没有要补的** —— 省掉每轮一次 O(n) 扫描，
+	// 也避免「服务端真的没有 Message-ID」（RFC 5322 里它是可选的）时反复重取。
+	if a.onceFlag("heal:" + folder) {
+		return false
+	}
+	lo, hi, ok := a.index.MissingMessageIDRange(folder)
+	if !ok {
+		return false
+	}
+
+	if hi-lo > maxHealRangeSpan {
+		log.Printf("同步 %s: 有 Message-ID 为空的条目，但补它的区间太宽"+
+			"（UID %d-%d，跨度 %d）—— 放弃自愈，这些条目会串不成会话",
+			folder, lo, hi, hi-lo)
+		return false
+	}
+
+	log.Printf("同步 %s: 有 Message-ID 为空的条目，重取 UID %d-%d 的头部补齐",
+		folder, lo, hi)
+	headers, err := a.client.Headers(folder, lo, hi)
+	if err != nil {
+		// 失败不重试：下次启动会再试一次（healed 是进程内的）。
+		log.Printf("同步 %s: 补 Message-ID 失败: %v", folder, err)
+		return false
+	}
+	added, updated := a.index.Merge(headers)
+	return added > 0 || updated > 0
 }
 
 // withinInitialWindow 按天数再裁一道。
