@@ -233,16 +233,23 @@ func newSampleModel(t *testing.T) Model {
 	// 这条的正文**在测试时由真实的生成器算出来**（HTMLToMarkdown 对一段
 	// 真 HTML 的产出），不是手抄的字符串。
 	//
-	// 刻意的形状：一个数据表 + 单元格里带 alt 的状态图标 —— 就是用户
-	// 截图里那封 DeepSeek 服务状态邮件的样子。改前这两样渲染器都不认，
+	// 刻意的形状：一个用 font-size 表达的标题 + 一个数据表 + 单元格里带
+	// alt 的状态图标 —— 就是用户截图里那封服务状态邮件的样子。
+	//
+	// 标题那条尤其要紧：真实邮件几乎不用 <h1>-<h6>（邮件客户端会把标题
+	// 标签的样式 strip 掉），而是把字号写进 style。生成器得从字号反推
+	// 层级，否则整封信的所有标题都会塌成同样大小的普通段落 —— 这正是
+	// 用户报的「上下文严重丢失」。同样，改前数据表和图片渲染器都不认，
 	// 屏幕上会出现 `!perational` 和 `| 组件 | 状态 |` 这种半截源码。
-	// 让它跟着真生成器走，截图就不可能和实际管线脱节。
+	//
+	// 让它全部跟着真生成器走，截图就不可能和实际管线脱节。
 	fake.AddMessage("INBOX", mail.Header{
 		MessageID: "<p14@x>", References: []string{"<p1@x>"},
 		From: "bob@example.com", FromName: "Bob", To: group,
 		Subject: "Re: 周五的产品评审", Date: base.Add(86 * time.Minute),
 	}, mail.HTMLToMarkdown(
-		`<p>上周的故障复盘我整理了一下：</p>`+
+		`<p style="font-size:22px;font-weight:bold">故障复盘</p>`+
+			`<p style="font-size:14px">涉及的三个组件，当前状态如下：</p>`+
 			`<table>`+
 			`<tr><th>组件</th><th>状态</th><th>影响</th></tr>`+
 			`<tr><td>API 接口</td>`+

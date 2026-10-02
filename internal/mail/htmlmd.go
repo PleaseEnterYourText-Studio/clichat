@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -57,7 +58,7 @@ func HTMLToMarkdown(src string) string {
 		root = doc
 	}
 
-	b := &blockBuilder{sep: "\n\n"}
+	b := &blockBuilder{sep: "\n\n", base: baseFontSize(root)}
 	b.blocks(root)
 	return tidyMarkdown(b.String())
 }
@@ -90,6 +91,10 @@ type blockBuilder struct {
 	// 做纯排版，两种都按「空行分开」处理会产生大量多余空行。
 	sep string
 
+	// base 是这封信的「正文字号」（px）。用它来判断某个块的字号是不是
+	// 「标题级」—— 见 headingLevel。0 表示没测出来，此时不做标题推断。
+	base float64
+
 	out    []string
 	inline strings.Builder
 	// pendSpace 表示「攒了一个空格待写」。HTML 的空白折叠规则：
@@ -97,6 +102,15 @@ type blockBuilder struct {
 	pendSpace bool
 	// inTable 为真时 | 必须转义，否则会把表格的列切错。
 	inTable bool
+}
+
+// sub 派生一个同上下文的子构造器，只换分隔符。
+//
+// 子构造器必须继承 base —— 标题推断是**整封信**的性质（比较的是本合同
+// 的字号和全文正文基准），不是某一段的性质。忘了传 base 的话，嵌套在
+// 表格/列表里的标题会静默地不再被识别。
+func (b *blockBuilder) sub(sep string) *blockBuilder {
+	return &blockBuilder{sep: sep, base: b.base, inTable: b.inTable}
 }
 
 // text 写入文本，按 HTML 规则折叠空白，并转义 Markdown 特殊字符。
@@ -219,21 +233,21 @@ func (b *blockBuilder) node(n *html.Node) {
 
 		case atom.Blockquote:
 			b.flush()
-			inner := renderChildrenBlocks(n, "\n\n")
+			inner := b.childrenBlocks(n, "\n\n")
 			if inner != "" {
 				b.push(prefixLines(inner, "> "))
 			}
 
 		case atom.Ul:
 			b.flush()
-			b.push(renderList(n, false))
+			b.push(b.renderList(n, false))
 		case atom.Ol:
 			b.flush()
-			b.push(renderList(n, true))
+			b.push(b.renderList(n, true))
 
 		case atom.Table:
 			b.flush()
-			b.push(renderTable(n))
+			b.push(b.renderTable(n))
 
 		// --- 明确要丢掉的东西 ---
 		case atom.Style, atom.Script, atom.Title, atom.Meta, atom.Link,
@@ -256,13 +270,25 @@ func (b *blockBuilder) node(n *html.Node) {
 }
 
 // container 渲染一个「容器型」块：它的子节点各自成块，用 sep 连接。
+//
+// 标题推断也在这里做，而不是在 node() 的 switch 里 —— 同一个 <td> 会从
+// 两条路过来：作为子节点（node → container）或作为表格单元格
+// （renderLayoutTable → cellBlocks）。放在 container/cellBlocks 这一层，
+// 两条路都覆盖得到。
 func (b *blockBuilder) container(n *html.Node, sep string) {
-	b.push(renderChildrenBlocks(n, sep))
+	if lv := b.headingLevel(n); lv > 0 {
+		b.flush()
+		if inner := renderInline(n); inner != "" {
+			b.push(strings.Repeat("#", lv) + " " + inner)
+		}
+		return
+	}
+	b.push(b.childrenBlocks(n, sep))
 }
 
-// renderChildrenBlocks 把子节点渲染成块，用 sep 连接。
-func renderChildrenBlocks(n *html.Node, sep string) string {
-	sub := &blockBuilder{sep: sep}
+// childrenBlocks 把子节点渲染成块，用 sep 连接。
+func (b *blockBuilder) childrenBlocks(n *html.Node, sep string) string {
+	sub := b.sub(sep)
 	sub.blocks(n)
 	return sub.String()
 }
@@ -322,9 +348,6 @@ func (b *blockBuilder) inlineNode(n *html.Node) {
 			b.inlineChildren(n)
 
 		default:
-			// 块级元素被塞进了行内上下文（HTML 不规范时很常见），
-			// 按块处理，别丢内容。
-			b.node(n)
 			// 块级元素被塞进了行内上下文（HTML 不规范时很常见），
 			// 按块处理，别丢内容。
 			b.node(n)
@@ -729,12 +752,12 @@ func maxBacktickRun(s string) int {
 // ---- 列表 ----
 
 // renderList 渲染 <ul>/<ol>。
-func renderList(n *html.Node, ordered bool) string {
-	return renderListAt(n, ordered, 0)
+func (b *blockBuilder) renderList(n *html.Node, ordered bool) string {
+	return b.renderListAt(n, ordered, 0)
 }
 
 // renderListAt 渲染一层列表。depth 只用来缩进嵌套项。
-func renderListAt(n *html.Node, ordered bool, depth int) string {
+func (b *blockBuilder) renderListAt(n *html.Node, ordered bool, depth int) string {
 	indent := strings.Repeat("  ", depth)
 	var lines []string
 	idx := 0
@@ -753,7 +776,7 @@ func renderListAt(n *html.Node, ordered bool, depth int) string {
 			marker = "1. "
 		}
 
-		body, nested := listItemParts(c)
+		body, nested := b.listItemParts(c)
 		if body == "" && nested == "" {
 			continue
 		}
@@ -775,13 +798,13 @@ func renderListAt(n *html.Node, ordered bool, depth int) string {
 //
 // 拆开是必要的：嵌套列表必须顶格另起，不能挂在标记后面，
 // 否则 Markdown 会把子列表当成父项文字的一部分。
-func listItemParts(li *html.Node) (body, nested string) {
-	sub := &blockBuilder{sep: "\n"}
+func (b *blockBuilder) listItemParts(li *html.Node) (body, nested string) {
+	sub := b.sub("\n")
 	var nestedParts []string
 
 	for c := li.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.ElementNode && (c.DataAtom == atom.Ul || c.DataAtom == atom.Ol) {
-			if s := renderListAt(c, c.DataAtom == atom.Ol, 0); s != "" {
+			if s := sub.renderListAt(c, c.DataAtom == atom.Ol, 0); s != "" {
 				nestedParts = append(nestedParts, s)
 			}
 			continue
@@ -846,7 +869,7 @@ func prefixLines(s, prefix string) string {
 // 真正的数据表（有 <th>、行列数整齐）转成 Markdown 表格才好读。
 //
 // 判据：有 <th> 行，或者各行单元格数一致且 ≥2 列 —— 当成数据表。
-func renderTable(n *html.Node) string {
+func (b *blockBuilder) renderTable(n *html.Node) string {
 	rows := collectRows(n)
 	if len(rows) == 0 {
 		return ""
@@ -854,7 +877,7 @@ func renderTable(n *html.Node) string {
 
 	// 布局表：不是数据表就按「一行一块」铺开，别再套表格语法。
 	if !looksLikeDataTable(rows) {
-		return renderLayoutTable(rows)
+		return b.renderLayoutTable(rows)
 	}
 
 	var lines []string
@@ -862,7 +885,7 @@ func renderTable(n *html.Node) string {
 	for i, row := range rows {
 		cells := make([]string, 0, len(row))
 		for _, cell := range row {
-			cells = append(cells, cellText(cell))
+			cells = append(cells, b.cellText(cell))
 		}
 		if len(cells) > cols {
 			cols = len(cells)
@@ -891,12 +914,12 @@ func renderTable(n *html.Node) string {
 // 把正文整个包起来。压成一行的话，标题、段落、列表、段内换行会全糊在
 // 同一行里，可读性直接归零。压成一行是「数据表单元格」的规矩
 // （Markdown 表格的一行就是一个单元格），不是布局表的。
-func renderLayoutTable(rows [][]*html.Node) string {
+func (b *blockBuilder) renderLayoutTable(rows [][]*html.Node) string {
 	var parts []string
 	for _, row := range rows {
 		var cells []string
 		for _, cell := range row {
-			if s := cellBlocks(cell); strings.TrimSpace(s) != "" {
+			if s := b.cellBlocks(cell); strings.TrimSpace(s) != "" {
 				cells = append(cells, s)
 			}
 		}
@@ -908,8 +931,15 @@ func renderLayoutTable(rows [][]*html.Node) string {
 }
 
 // cellBlocks 按块渲染一个单元格，保留它内部的段落/标题/列表结构。
-func cellBlocks(cell *html.Node) string {
-	sub := &blockBuilder{sep: "\n\n"}
+func (b *blockBuilder) cellBlocks(cell *html.Node) string {
+	// 单元格自己可能就是标题（`<td style="font-size:28px">`）——
+	// 这正是营销邮件表达标题的标准写法，得在这里再判一次。
+	if lv := b.headingLevel(cell); lv > 0 {
+		if inner := renderInline(cell); inner != "" {
+			return strings.Repeat("#", lv) + " " + inner
+		}
+	}
+	sub := b.sub("\n\n")
 	sub.blocks(cell)
 	return sub.String()
 }
@@ -969,13 +999,248 @@ func hasHeaderCell(row []*html.Node) bool {
 }
 
 // cellText 渲染一个单元格的内容，并把 | 转义掉（否则会切错列）。
-func cellText(cell *html.Node) string {
-	sub := &blockBuilder{sep: "\n", inTable: true}
+//
+// 这里**不**做标题推断：数据表的单元格会被压成一行，标题语法
+// （"#" 开头）在表格行里不成立，写出来只会是一段带 # 的普通文字。
+func (b *blockBuilder) cellText(cell *html.Node) string {
+	sub := b.sub("\n")
+	sub.inTable = true
 	sub.blocks(cell)
 	s := sub.String()
 	// 单元格里不能有换行，压成一行。
 	s = strings.ReplaceAll(s, "\n", " ")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// ---- 标题推断 ----
+
+// headingLevel 从一个元素的**行内样式**推断它在原邮件里的标题级别（1-6），
+// 判断不出来返回 0。
+//
+// # 为什么需要这个
+//
+// 营销邮件和通知邮件几乎不用 <h1>-<h6>。原因是邮件客户端（Outlook 尤其）
+// 会把标题标签自带的样式 strip 掉，发件人为了「所见即所得」，宁可把字号
+// 直接写进 <td>/<div>/<p> 的 style：
+//
+//	<td style="font-family:Arial;font-size:28px;font-weight:bold">
+//	  我们的网络正在提升 yzjtian.cn 的速度和安全性
+//	</td>
+//
+// 不认识这一条，整封信的层级就在转换时全塌了 —— 用户看到的是一串同样
+// 大小的段落，分不出哪句是小节标题、哪句是正文。这不是「少了个 # 号」，
+// 是**读不下去**。
+//
+// # 判据
+//
+//  1. 元素得是排版单元（td/div/p/caption/center/dt/dd），且内容是纯行内
+//     内容 —— 里面有块级子元素、链接、按钮或图片的，是版式块或按钮，
+//     不是标题。按钮尤其容易长得像标题：大字号、加粗、白字，全都符合，
+//     只有「里面是个 <a>」这一条能把它挡开。
+//  2. 它必须**自己声明** font-size。继承来的不算 —— 标题一定会自己写
+//     字号（否则邮件客户端一改默认字号，标题就没了），跟着父级继承的
+//     则是正文。
+//  3. 字号要明显大于正文基准，按倍数分档。
+func (b *blockBuilder) headingLevel(n *html.Node) int {
+	switch n.DataAtom {
+	case atom.Td, atom.Th, atom.Div, atom.P, atom.Caption, atom.Center,
+		atom.Dt, atom.Dd:
+	default:
+		return 0
+	}
+	if b.base <= 0 {
+		return 0
+	}
+	size := styleFontSizePx(n)
+	if size <= b.base {
+		return 0
+	}
+	if !headingContent(n) {
+		return 0
+	}
+
+	// 分档用「占正文字号的倍数」而不是绝对 px：正文是 14px 还是 16px，
+	// 会整体平移这封信里的所有字号，绝对分档换一封信就全错。
+	switch ratio := size / b.base; {
+	case ratio >= 1.9:
+		return 1
+	case ratio >= 1.65:
+		return 2
+	case ratio >= 1.4:
+		return 3
+	case ratio >= 1.2:
+		// 这一档和正文只差一点，只有加粗才分得出是标题 ——
+		// 16px 的正文段落和 16px 的加粗小标题，光看字号分不开。
+		if styleBold(n) {
+			return 4
+		}
+	}
+	return 0
+}
+
+// headingContent 判断一个元素的内容像不像标题：得有文字，且整棵子树里
+// 没有块级元素、链接、按钮或图片。
+func headingContent(n *html.Node) bool {
+	hasText := false
+
+	var walk func(*html.Node) bool
+	walk = func(x *html.Node) bool {
+		for c := x.FirstChild; c != nil; c = c.NextSibling {
+			switch c.Type {
+			case html.TextNode:
+				if strings.TrimSpace(c.Data) != "" {
+					hasText = true
+				}
+			case html.ElementNode:
+				if skipElement(c) {
+					continue
+				}
+				if isBlockElement(c) {
+					return false
+				}
+				switch c.DataAtom {
+				case atom.A, atom.Button, atom.Img, atom.Input:
+					return false
+				}
+				if !walk(c) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return walk(n) && hasText
+}
+
+// isBlockElement 是「会另起一块」的标签。
+//
+// 只用来判断标题内容是否纯粹，所以列的是 HTML 里真正按块排版的标签，
+// 不必和 node() 的分派一一对应。
+func isBlockElement(n *html.Node) bool {
+	switch n.DataAtom {
+	case atom.Div, atom.P, atom.Table, atom.Tr, atom.Td, atom.Th,
+		atom.Tbody, atom.Thead, atom.Tfoot, atom.Ul, atom.Ol, atom.Li,
+		atom.Section, atom.Article, atom.Header, atom.Footer, atom.Main,
+		atom.Aside, atom.Nav, atom.Blockquote, atom.H1, atom.H2, atom.H3,
+		atom.H4, atom.H5, atom.H6, atom.Hr, atom.Pre, atom.Form,
+		atom.Fieldset, atom.Address, atom.Details, atom.Summary,
+		atom.Figure, atom.Figcaption, atom.Center, atom.Dl:
+		return true
+	}
+	return false
+}
+
+// styleFontSizePx 取元素行内样式里的 font-size，换算成 px。
+//
+// 认不出来一律返回 0：不是 px 的（em / % / rem / 关键字）不猜 ——
+// 猜错会把正文当标题铺成 # 号，那比漏掉一个标题糟得多。
+func styleFontSizePx(n *html.Node) float64 {
+	v := strings.ToLower(strings.TrimSpace(styleValue(attr(n, "style"), "font-size")))
+	if !strings.HasSuffix(v, "px") {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(v, "px")), 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return f
+}
+
+// styleBold 判断元素有没有显式声明加粗。
+func styleBold(n *html.Node) bool {
+	switch strings.ToLower(strings.TrimSpace(styleValue(attr(n, "style"), "font-weight"))) {
+	case "bold", "bolder", "600", "700", "800", "900":
+		return true
+	}
+	return false
+}
+
+// styleValue 从 style 属性里取一条声明的值。
+func styleValue(style, key string) string {
+	for _, decl := range strings.Split(style, ";") {
+		k, v, ok := strings.Cut(decl, ":")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k), key) {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// baseFontSize 估出这封信的「正文字号」。
+//
+// 按**文字量**加权，而不是按元素个数：正文是长篇，标题是短句，所以
+// 「哪种字号承载的字最多，它就是正文字号」。按元素个数会栽在一封短通知上 ——
+// 三个小节标题（20px）加一个短正文（14px），个数是 3:1，标题反客为主
+// 成了基准，于是正文全部「不达标」、整封信反过来更乱。
+//
+// 每个元素只按「最内层声明」计入一次：外层 div 和它内层的 p 都写了
+// font-size 时，字是内层那个字号渲染的，外层不该重复计入文字量。
+//
+// 次数并列时取较小的那个，而且这个 tie-break 必须是确定性的：map 的
+// 遍历顺序是随机的，写成「先遇到谁算谁」会让同一封信两次转换给出不同
+// 结果，判据也就没法写了。
+func baseFontSize(root *html.Node) float64 {
+	weights := map[float64]int{}
+	collectFontWeights(root, weights)
+
+	best, bestWeight := 0.0, 0
+	for size, weight := range weights {
+		if weight > bestWeight || (weight == bestWeight && size < best) {
+			best, bestWeight = size, weight
+		}
+	}
+	return best
+}
+
+// collectFontWeights 累积「每种字号承载了多少字」，返回这棵子树里有没有
+// 元素自己声明了 font-size。
+//
+// 后序遍历，一遍算完：只有**最内层**的声明才计入文字量 —— 外层 div 和
+// 它内层的 p 都写了 font-size 时，字是内层那个字号渲染的，外层不该重复算。
+func collectFontWeights(n *html.Node, weights map[float64]int) bool {
+	if n.Type != html.ElementNode || skipElement(n) {
+		return false
+	}
+
+	inner := false
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if collectFontWeights(c, weights) {
+			inner = true
+		}
+	}
+	if inner {
+		// 更内层已经有人声明了，文字量记在那些元素上。
+		return true
+	}
+	if size := styleFontSizePx(n); size > 0 {
+		weights[size] += ownTextWeight(n)
+		return true
+	}
+	return false
+}
+
+// ownTextWeight 数一个元素的子树里有多少字（0 表示这棵子树没有可读文字）。
+func ownTextWeight(n *html.Node) int {
+	count := 0
+	var walk func(*html.Node)
+	walk = func(x *html.Node) {
+		switch x.Type {
+		case html.TextNode:
+			count += len([]rune(strings.TrimSpace(x.Data)))
+		case html.ElementNode:
+			if skipElement(x) {
+				return
+			}
+			for c := x.FirstChild; c != nil; c = c.NextSibling {
+				walk(c)
+			}
+		}
+	}
+	walk(n)
+	return count
 }
 
 // ---- 元素筛选 ----

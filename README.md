@@ -137,9 +137,10 @@ and the process list.
 - Group conversations detected automatically; each sender gets a stable colour,
   so the same person is the same colour in every session
 - HTML mail converted to Markdown: links and buttons come through as clickable
-  addresses, and tables, lists and code blocks keep as much of their shape as
-  they can; quoted history trimmed — this is a chat view, and quoting is noise
-  in it. See [HTML mail, turned into
+  addresses, tables, lists and code blocks keep as much of their shape as
+  they can, and headings are recovered from **font size** (real mail styles
+  them, it does not tag them); quoted history trimmed — this is a chat view,
+  and quoting is noise in it. See [HTML mail, turned into
   Markdown](#html-mail-turned-into-markdown) for how
 - …and that Markdown is rendered back into terminal styling — headings lose
   their hashes, list items get real numbers, tables come out as aligned columns,
@@ -209,6 +210,19 @@ emitting Markdown. The rules it follows:
   row, or an equal column count across rows, means data: a Markdown table.
   Otherwise it is layout, and the cells are rendered as stacked blocks.
   Flattening a layout table would collapse the entire mail into one line.
+- **Headings are recovered from font size, not just from `<h1>`-`<h6>`.** Real
+  mail barely uses heading tags — clients strip their built-in styling, so
+  senders write the size straight into the markup instead:
+  `<td style="font-size:28px;font-weight:bold">`. Trust only the tags and the
+  hierarchy of the whole mail collapses in conversion: title, section headings
+  and body all come out as the same-sized paragraphs. So we first estimate the
+  message's **body size** (the most frequent explicit `font-size`, ties going
+  to the smaller one), then map markedly larger sizes onto `#`-`######` in
+  bands. The test is deliberately strict: the element must declare its own
+  `font-size` (inherited does not count), and its content must hold no block
+  element, link, button or image — buttons are the most title-like thing there
+  is (big, bold, white on colour), and only "it is an `<a>` inside" tells them
+  apart.
 - **Body text is escaped.** A message containing `2*3` or `[TODAY]` should not
   come out italic, or open a link nobody wrote.
 - **Quoted history is dropped.** In a chat view, re-quoting the thread you just
