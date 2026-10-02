@@ -186,12 +186,16 @@ func TestLayout_NarrowTerminalHasNoRail(t *testing.T) {
 
 // ---- 浮起的输入区 ----
 
-// 输入框要「浮起」：上下各一整行空白，那一行自己铺着底色。
+// 输入区靠**上下各一整行空白**被认出来 —— 它自己不铺底色，也没有边框。
 //
-// 那两行留白是**这个方案成立的前提**：终端里没有圆角、没有阴影、没有
-// z 轴，把留白去掉，输入框就退回成又一条贴底的横带。所以这条判据量的
-// 不是「好不好看」，是「浮起还在不在」。
-func TestInputBlock_FloatsWithBlankLinesAround(t *testing.T) {
+// 上一版这条量的是「那两行除了分隔竖线没有别的内容」外加「中间那行铺着
+// 输入卡底色」。输入卡和分隔竖线都撤掉之后，同一件事变得更纯粹：上下那
+// 两行必须**整行空白**，中间那行才有内容。
+//
+// 它守的仍然不是「好不好看」，是「输入区还在不在」：三行挤成两行、或者
+// 留白被别的内容占了，输入框就退回成又一条贴底的横带 —— 而那种变化在
+// 宽终端上一点也不显眼。
+func TestInputBlock_IsSurroundedByBlankLines(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.measureLayout()
@@ -201,39 +205,22 @@ func TestInputBlock_FloatsWithBlankLinesAround(t *testing.T) {
 	}
 	lines := viewLines(m)
 
-	// ⚠️ 量的是「**除竖线那一列之外**」是不是空白。
-	//
-	// 竖线按设计要贯到底（见 viewTwoPane 里 withRail 那段说明），留白行
-	// 也不例外，所以这些行上本来就有且只有那一列是可见字符。整行
-	// TrimSpace 一把梭的话，判据会把「设计如此」当成故障 —— 而它要守的
-	// 其实是另一件事：那两行**没有别的任何内容**，输入框才浮得起来。
+	// ⚠️ 竖线撤掉之后这里可以**整行** TrimSpace 一把梭了。上一版不行：
+	// 竖线按设计要贯到底，整行量会把「设计如此」当成故障（当时的注释里
+	// 记着这一条）。现在那一列是空白，整行本来就该干净。
 	for _, off := range []int{0, 2} {
-		row := lines[l.inputTop+off]
-		left := plainText(ansiSlice(row, 0, l.ruleX))
-		right := plainText(ansiSlice(row, l.ruleX+1, m.width))
-		if got := strings.TrimSpace(left + right); got != "" {
-			t.Errorf("输入框上/下那行除了竖线还有内容：%q", got)
-		}
-		if got := plainText(ansiSlice(row, l.ruleX, l.ruleX+1)); got != ruleMark {
-			t.Errorf("输入框上/下那行的第 %d 列是 %q，want %q —— 竖线在这里断了",
-				l.ruleX, got, ruleMark)
+		if got := strings.TrimSpace(plainText(lines[l.inputTop+off])); got != "" {
+			t.Errorf("输入框上/下那行还有内容：%q", got)
 		}
 	}
 
-	row := lines[l.inputTop+1]
-	if !strings.Contains(row, bgSeqOf(styleInputRow)) {
-		t.Error("输入那一行没有铺底色，浮不起来")
+	// 中间那行得**真的画出输入框**。少了这一条，「三行空白」也能让上面
+	// 那两条全绿 —— 正是本仓库反复吃亏的「负向断言恒真」。
+	if got := strings.TrimSpace(plainText(lines[l.inputTop+1])); got == "" {
+		t.Error("输入那一行是空的 —— 输入框没画出来")
 	}
-	// 底色块不许贴到终端右边缘：留出那一格，它才像一块浮着的东西，
-	// 而不是一条从边到边的横带。
-	if w := lipgloss.Width(row); w >= m.width {
-		t.Errorf("输入那一行铺到了第 %d 列（终端 %d 列），右边没留出边距", w, m.width)
-	}
-	// 分隔竖线要贯到这一行 —— 断在输入区上面的话，看着像一条画了一半的线。
-	if got := plainText(ansiSlice(row, l.ruleX, l.ruleX+1)); got != ruleMark {
-		t.Errorf("第 %d 列（分隔竖线）是 %q，want %q —— 竖线在输入区这一行断了",
-			l.ruleX, got, ruleMark)
-	}
+	// （「输入行不铺底色」由 TestPanes_AreNotPainted 一起守着：它按列量
+	// 底色，比在这里整行扫一遍序列更准。）
 }
 
 // 终端太矮时，留白让给正文：输入区退回单行贴底。
@@ -252,9 +239,13 @@ func TestInputBlock_FallsBackToASingleLineWhenShort(t *testing.T) {
 	}
 }
 
-// 列表模式没有输入框，那一行就**不该**铺输入框的底色 —— 铺了等于告诉
-// 用户那里可以打字。
-func TestInputBlock_NoCapsuleInListMode(t *testing.T) {
+// 列表模式没有输入框，那一行就得像**提示**，不能像**输入框**。
+//
+// 上一版比的是底色（"别铺输入卡的底色"）。输入卡撤掉之后底色这条线没了，
+// 判据改成比**内容**：那一行该报快捷键（列表界面上真正能用的是哪几个键），
+// 而不是会话里那句「输入消息，回车发送」的占位提示 —— 后者出现在列表里，
+// 用户会开始打字，而那时候打字什么也不会发生。
+func TestInputRow_ListModeShowsHintsNotAnInput(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
 	if m.mode != modeList {
@@ -262,11 +253,15 @@ func TestInputBlock_NoCapsuleInListMode(t *testing.T) {
 	}
 
 	l := m.measureLayout()
-	if strings.Contains(viewLines(m)[l.inputTop+1], bgSeqOf(styleInputRow)) {
-		t.Error("列表模式的那一行铺了输入框的底色")
+	row := plainText(viewLines(m)[l.inputTop+1])
+	if !strings.Contains(row, "q") {
+		t.Errorf("列表模式下这一行应该是常驻快捷键提示，实际是 %q", row)
 	}
-	if !strings.Contains(viewLines(m)[l.inputTop+1], "q") {
-		t.Error("列表模式下这一行应该是常驻快捷键提示")
+	// 会话里那句占位提示不许出现在这里。按**当前**的占位文案比，不写死
+	// 字面量：文案改了这条不该跟着红（假红和假绿一样贵）。
+	if ph := m.input.Placeholder; ph != "" && strings.Contains(row, ph) {
+		t.Errorf("列表模式这一行里出现了会话的占位提示 %q —— 看着能打字，其实不能",
+			ph)
 	}
 }
 
@@ -291,37 +286,47 @@ func TestInputLine_FillsItsWidth(t *testing.T) {
 	}
 }
 
-// 侧栏和列表栏是两条**通到屏幕底**的面板带。
+// 两栏之间那一格从顶到底都是**空白**，而且每一行的内容都从同一列起步。
 //
-// 底下那几行（输入区的留白行、输入行、状态栏行）不走 renderNav /
-// renderThreadList，得由 withPaneStrip 一格格补上底色。漏了的话列表栏
-// 那层 235 在输入区凭空消失，看着像列表栏被输入框截掉了一截 —— 而这种
-// 事在截图里只会觉得「下面有点怪」，说不出怪在哪。
-// 分隔竖线要从顶贯到底 —— 包括底部那三行（输入区 / 状态栏）。
+// 这一条是从上一版的「分隔竖线要从顶贯到底」改过来的。竖线撤掉之后，
+// 那个位置仍然承担两件事：
 //
-// 上一版这条判据量的是「侧栏和列表栏的底色带有没有铺到屏幕底部」。两块
-// 面板底色都被撤掉之后，同一件事改由那条线承担：一条只画了上半截的
-// 分界线，读起来是"画错了"，不是"到底了"。
+//   - **不许有别的字符**。那一格被收掉（两栏贴在一起）或者被谁写了个
+//     字符进去，两栏的边界就糊了；
+//   - **对齐不能断**。标签页 / 输入区 / 状态栏这三行**不走** renderThreadList，
+//     而是各自拼出来的，很容易忘了补左边那一截（withRail 就是干这个的）。
+//     漏了的话，只有主体区是齐的，而只看主体区的判据全绿。
 //
-// 它挡的是一类很隐蔽的漏项：标签页 / 输入区 / 状态栏这三行**不走**
-// renderThreadList，而是各自被拼出来的，很容易忘了补左边那一截。
-// 症状是线在主体区底部忽然断掉，而只看主体区的判据全绿。
-func TestRail_ReachesTheBottomOfTheScreen(t *testing.T) {
+// 上一版这条判据靠「那一列是不是 │」同时守住了这两件事；现在那一列是
+// 空格，得**分开量**：既量它是空格，也量它右边的正文确实从 chatX 起步。
+func TestRail_IsBlankAndAlignedAllTheWayDown(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.measureLayout()
 	rows := viewLines(m)
 
-	// 从标签页那一行（如果有）一直到状态栏，一列都不能断。
 	from := l.bodyTop
 	if l.tabsRow >= 0 {
 		from = l.tabsRow
 	}
 	for y := from; y <= l.statusRow; y++ {
-		got := plainText(ansiSlice(rows[y], l.ruleX, l.ruleX+1))
-		if got != ruleMark {
-			t.Errorf("第 %d 行的第 %d 列（分隔竖线）是 %q，want %q —— 竖线在这里断了",
-				y, l.ruleX, got, ruleMark)
+		if got := plainText(ansiSlice(rows[y], l.ruleX, l.ruleX+1)); got != " " {
+			t.Errorf("第 %d 行的第 %d 列（两栏之间那一格）是 %q，want 一格空格 —— "+
+				"分区靠留白，那一格不许有字符", y, l.ruleX, got)
+		}
+	}
+
+	// 底部那几行**不走** renderThreadList，左边那一截是 withRail 补的。
+	// 漏补的话它们会整体左移 paneX 列，和上面的内容错开 —— 那种错在宽
+	// 终端上一点也不显眼（都是空白），只有把左边缘量出来才看得见。
+	//
+	// 这里**不**量整行宽度：标签页那一行本来就只画到最后一个 chip，宽度
+	// 天然短于屏宽（量它会得到一条永远红的判据）。输入行的宽度由
+	// TestInputLine_FillsItsWidth 单独守着。
+	for y := l.inputTop; y <= l.statusRow; y++ {
+		if got := strings.TrimSpace(plainText(ansiSlice(rows[y], 0, l.paneX))); got != "" {
+			t.Errorf("第 %d 行（底部，不走 renderThreadList）的左 %d 列有内容 %q —— "+
+				"withRail 没补上，这一行整体左移了", y, l.paneX, got)
 		}
 	}
 }
@@ -354,73 +359,66 @@ func TestPanes_AreNotPainted(t *testing.T) {
 				y, x, got)
 		}
 	}
-	// 正文栏这一侧只量**一定是空白的**那几行：输入卡上下那两行留白和
-	// 状态栏。输入卡自己那一行本来就有底色（它是"这里能打字"的信号），
-	// 混进来量就成了一条永远红的判据。
-	for _, y := range []int{l.inputTop, l.inputTop + l.inputRows - 1, l.statusRow} {
+	// 正文栏这一侧量**输入区那三行 + 状态栏**。上一版这里要跳过输入行
+	// （当时它铺着输入卡底色，是"这里能打字"的信号）—— 输入卡撤掉之后
+	// 没有例外了，那一行也必须干净，于是这条判据顺带守住了「输入区不再
+	// 是一块实心色」，这正是用户要的「去掉输入卡底色的重感」。
+	for y := l.inputTop; y <= l.statusRow; y++ {
 		if got := bgAtFirstCell(ansiSlice(rows[y], l.paneX, l.paneX+1)); got != "" {
-			t.Errorf("第 %d 行第 %d 列（正文栏，该是空白）铺了底色 %q", y, l.paneX, got)
+			t.Errorf("第 %d 行第 %d 列（正文栏）铺了底色 %q —— 输入卡和面板底色都撤掉了",
+				y, l.paneX, got)
 		}
 	}
 }
 
-// 浮起的输入卡只在**正文栏**里，两侧各留一格不放色。
+// 输入行只在**正文栏**里，不越到左边的列表栏去。
 //
-// 通栏的输入框是这一版之前的样子，两个毛病：没有左右留白可以依托（"浮起"
-// 也就无从谈起，它读起来就是又一条贴底的横带），以及把列表栏从中间截断。
-// 这两条都是看在眼里才想得起来的，所以钉成判据。
-func TestInputCapsule_LivesInsideTheChatPane(t *testing.T) {
+// 通栏的输入框是这一版之前的样子。输入卡撤掉之后"浮起"无从谈起，但这条
+// 判据守的那件事还在：输入区只属于正文栏，左边列表栏的列必须干净 ——
+// 越过去的话，两栏的分界（现在只剩留白）就断了，而且点列表会点到输入框上。
+func TestInputLine_LivesInsideTheChatPane(t *testing.T) {
 	forceColor(t)
 	m := openTwoPane(t)
 	l := m.measureLayout()
 	row := viewLines(m)[l.inputTop+1]
 
-	capBg := bgParamOf(bgSeqOf(styleInputRow))
-	// 输入卡底色拿不到时，下面「不该出现」的那三条会**恒真**——判据变成空壳还
-	// 一路绿着。这是负向断言特有的坑，必须在入口堵住。
-	if capBg == "" {
-		t.Fatal("拿不到输入卡底色的序列 —— 这个用例大概忘了 forceColor")
-	}
-	for _, probe := range []struct {
-		x    int
-		name string
-	}{
-		{0, "列表栏左沿"},
-		{l.listX + l.listW/2, "列表栏"},
-		{l.paneX - paneInset, "输入卡左沿那一格留白"},
-	} {
-		if got := bgAtFirstCell(ansiSlice(row, probe.x, probe.x+1)); got == capBg {
-			t.Errorf("第 %d 列（%s）铺上了输入卡的底色 —— 它只该出现在正文栏里",
-				probe.x, probe.name)
-		}
+	// 列表栏那几列必须一点内容都没有。整段 TrimSpace 一把梭：列表栏在
+	// 输入区那几行本来就是空的（withRail 补的是空格）。
+	left := plainText(ansiSlice(row, 0, l.paneX))
+	if got := strings.TrimSpace(left); got != "" {
+		t.Errorf("输入行越到正文栏左边去了（第 0–%d 列是 %q）", l.paneX, got)
 	}
 
-	if got := bgAtFirstCell(ansiSlice(row, l.paneX, l.paneX+1)); got != capBg {
-		t.Errorf("第 %d 列（正文栏内容左边缘）的底色是 %q，want %q —— 输入卡没和正文左边缘对齐",
-			l.paneX, got, capBg)
+	// 反过来，正文栏里得真的有东西 —— 否则上面那条会因为「整行都空」
+	// 而恒真，判据变成空壳却一路绿。
+	if got := strings.TrimSpace(plainText(ansiSlice(row, l.paneX, m.width))); got == "" {
+		t.Error("正文栏里没有输入框 —— 这条判据量不到东西")
 	}
 }
 
-// 输入框里那句占位提示，不能和它自己的底色同色。
+// 输入框里那句占位提示，必须**真的画出来**，而且挂在我们配的样式上。
 //
-// 这就是**「字在，但看不见」**那类 bug 的判据。实际情况：textinput 的
-// PlaceholderStyle 默认是一个写死的 hex，降级到 256 色正好是 240，而
-// 输入卡底色（inputRowBg）也是 240 —— 两者一撞，「输入消息，回车发送」
-// 八个字在界面上整个消失，只剩一个孤零零的提示符。
+// 这就是「字在，但看不见」那类 bug 的判据。原来的实际情况：textinput 的
+// PlaceholderStyle 默认是一个写死的 hex，降级到 256 色正好是 240，而输入卡
+// 底色（inputRowBg）也是 240 —— 两者一撞，「输入消息，回车发送」八个字在
+// 界面上整个消失，只剩一个孤零零的提示符。
 //
-// 这类失败最麻烦的地方是**代码怎么读都是对的**：Placeholder 设了、
-// 输入框渲染了、宽度也没算错，只有截图上看不见几个字。所以判据必须
-// 量颜色，光看代码是看不出来的。
+// ⚠️ 这一版把「比色」那一段（前景 ≠ 脚下底色）**删掉了**，不是忘了写：
+// 输入卡撤掉之后，占位提示不再坐在任何一块我们铺的底色上（判据
+// TestPanes_AreNotPainted 守着"正文栏不许铺底色"），那个撞色不可能再发生。
+// 留着一段「前景 ≠ 底色」的比较只会比到两个常量，看着有牙齿其实是空转。
 //
-// 判据绑的是**关系**（前景 ≠ 背景），不是具体色号 —— 以后改配色它不会
-// 变成一条假红，而"撞色"这件事它一直盯着。
-func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
+// 剩下这两条仍然有分辨力：一是那句提示确实被画在了输入行上（文案改了、
+// 布局挤没了，都会红 —— 所以按当下的 Placeholder 文案比，不写字面量）；
+// 二是它用的是 stylePlaceholder 而不是 bubbles 的默认色（这一点即使底色
+// 没了也仍然要紧：它是"我们统一在 newTextInput 里配样式"的唯一落点）。
+func TestPlaceholder_IsDrawnWithOurStyle(t *testing.T) {
 	forceColor(t)
 	m, _ := newFeatureModel(t)
 	m, _ = update(m, keyMsg("enter"))
 	m = loadBodies(t, m)
 
-	// 一、那句话得真的画出来。按**当前**的 Placement 文案去找，不写字面量：
+	// 一、那句话得真的画出来。按**当前**的 Placeholder 文案去找，不写字面量：
 	// 文案改了这条不该跟着红（假红和假绿一样贵）。
 	ph := m.input.Placeholder
 	if ph == "" {
@@ -432,8 +430,8 @@ func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
 			ph, plainText(row))
 	}
 
-	// 二、它得挂在**我们配的**那个样式上。少了这一条，下面比色是在比两个
-	// 常量：PlaceholderStyle 根本没设、bubbles 用默认色渲染，判据照样绿。
+	// 二、它得挂在**我们配的**那个样式上。少了这一条，bubbles 用默认色
+	// 渲染、我们那个 stylePlaceholder 根本没被用上，判据照样绿。
 	want := bgSeqOf(stylePlaceholder)
 	if want == "" {
 		t.Fatal("拿不到占位提示的样式序列 —— 这个用例大概忘了 forceColor")
@@ -441,19 +439,6 @@ func TestPlaceholder_ReadsOnItsOwnBackground(t *testing.T) {
 	if !strings.Contains(row, want) {
 		t.Errorf("输入行里没有出现占位提示该有的样式 %q —— "+
 			"这一行多半不是用 stylePlaceholder 画的（检查 newTextInput）", want)
-	}
-
-	// 三、前景和脚下的底色不能是同一个色。
-	fg := sgrColorOf(want, "38")
-	bg := sgrColorOf(bgSeqOf(styleInputRow), "48")
-	if fg == "" || bg == "" {
-		t.Fatalf("取不到色号（前景 %q / 底色 %q）—— 终端没颜色时判据会退化成空壳",
-			fg, bg)
-	}
-	if fg == bg {
-		t.Errorf("占位提示的前景和底色是同一个色（%s）—— 字在那儿，但一个像素也看不见。"+
-			"\n多半是 PlaceholderStyle 没设，用了 bubbles 的默认灰。"+
-			"\n输入框统一由 newTextInput() 造，别在别处直接 textinput.New()。", fg)
 	}
 }
 
@@ -1307,7 +1292,7 @@ func TestMouse_EveryBodyColumnBelongsToAPane(t *testing.T) {
 	}{
 		{0, hitList},                     // 列表第一列
 		{l.ruleX - 1, hitList},           // 列表最后一列 —— 中间不许有缝
-		{l.ruleX, hitChat},               // 分隔竖线那一列，归正文
+		{l.ruleX, hitChat},               // 两栏之间那一格（现在是空白），归正文
 		{l.ruleX + 1, hitChat},           // 正文第一列
 		{l.chatX + l.chatW - 1, hitChat}, // 正文最后一列
 	} {
@@ -1736,38 +1721,6 @@ func applyBgParam(cur, params string) string {
 	return cur
 }
 
-// sgrColorOf 从一条 SGR 序列里取出**某一路**颜色（38 = 前景，48 = 底色），
-// 返回 "5;N" / "2;R;G;B" 这样的参数尾巴；没有返回 ""。
-//
-// 比色的时候只关心"两路颜色是不是同一个"，所以把前缀（38/48）摘掉、
-// 只留参数更省事：两个不同的样式序列，只要参数尾巴一样就是同色。
-func sgrColorOf(seq string, kind string) string {
-	body, ok := strings.CutPrefix(seq, "\x1b[")
-	if !ok {
-		return ""
-	}
-	body, ok = strings.CutSuffix(body, "m")
-	if !ok {
-		return ""
-	}
-	toks := strings.Split(body, ";")
-	for i := 0; i+1 < len(toks); i++ {
-		if toks[i] != kind {
-			continue
-		}
-		switch toks[i+1] {
-		case "5": // 38;5;N / 48;5;N
-			if i+2 < len(toks) {
-				return "5;" + toks[i+2]
-			}
-		case "2": // 38;2;R;G;B / 48;2;R;G;B
-			if i+4 < len(toks) {
-				return "2;" + strings.Join(toks[i+2:i+5], ";")
-			}
-		}
-	}
-	return ""
-}
 
 // selectedBg 是「选中」那一块的底色参数，顺便把「终端根本没颜色」这件事
 // 变成一条明确的失败。

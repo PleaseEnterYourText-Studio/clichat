@@ -44,7 +44,10 @@ clichat just looks at it differently: **treat mail as messages.**
 while yours are right-aligned. Every name shares a single style (bold, terminal
 foreground) rather than a per-sender colour: who said it is already answered by
 that alignment, and keeping one accent colour means the screen stays quiet. The
-`HTML` marker in a message head means that body was converted from an HTML mail:
+`HTML` marker in a message head means that body was converted from an HTML mail.
+Note that nothing is boxed in: the two panes meet at a column of blank space
+(no `│`), and the input line is just a prompt on two blank lines — no filled
+card, nothing pulling your eye to the bottom of the screen:
 
 [![Conversation view](docs/images/01-chat.png)](docs/images/01-chat.png)
 
@@ -211,17 +214,19 @@ and the process list.
   The conversion is lossy (buttons, tables and font-size headings all get
   re-flowed); the marker is there so "the layout differs from the original mail"
   has an explanation instead of looking like a rendering bug
-- **Two panes, one ladder**: the conversation list on the left, the conversation
+- **Two panes, one quiet gap**: the conversation list on the left, the conversation
   on the right. Folders are not a third column — they cost a whole pane of width
   to show four names and an unread count, so they are summoned when you want them
-  (`Tab` or `Ctrl+G`) instead of standing there. There is no full-width rule
-  anywhere: the panes are separated by one **vertical line** and blank space, and
-  the input box floats on the content with a blank line above and below it. Under
-  96 columns it collapses to a single pane
+  (`Tab` or `Ctrl+G`) instead of standing there. There is no full-width rule and
+  **no divider glyph** anywhere: the panes are separated by a single column of
+  blank space, and the input line sits alone with a blank line above and below it.
+  Under 96 columns it collapses to a single pane
 - **Background means exactly one thing: "this is a thing you can act on right
-  now."** The selected list row, the input card, the current tab. Nothing else
-  gets a background — the panes used to sit on a ladder of three greys, and at
-  that distance the screen read as three cut-apart slabs rather than one window
+  now."** The selected list row, and the current tab. Nothing else gets a
+  background — the panes used to sit on a ladder of three greys, and at that
+  distance the screen read as three cut-apart slabs rather than one window. The
+  input line and the pane gap both lost their fills in the same pass: one screen
+  should not have to shout to say where you can type
 - **The other side's reply is marked with a vertical bar**, not a background
   block. One bar per message, next to the text, so a one-line message still looks
   like a one-line message. A block of colour around someone else's words is loud

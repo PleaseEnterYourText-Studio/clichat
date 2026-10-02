@@ -242,7 +242,7 @@ func (m Model) footerLine(left string, style lipgloss.Style, width int) string {
 //
 // 三种排版各有一行页脚，起点各不相同：
 //
-//	两栏       statusRow，起点 paneX（列表栏 + 竖线 + 1 格内缩之后）
+//	两栏       statusRow，起点 paneX（列表栏 + 1 格留白 + 1 格内缩之后）
 //	单栏       statusRow，起点 0
 //	帮助/选择器  屏幕最后一行，起点 0（自己占满一屏，不走 layout）
 //	Zen        屏幕最后一行，起点 frame.left（居中那一列的左沿）

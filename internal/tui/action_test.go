@@ -244,7 +244,7 @@ func TestAction_ListModeHasNoFooterButtons(t *testing.T) {
 
 // 按钮画在哪一列，就必须能在那一列点到。两者走的是同一份 actionSpans，
 // 但**起点**（页脚内容从第几列开始）是另一回事 —— 两栏模式下它就是那只
-// 「列表栏 + 竖线 + 1 格内缩」的偏移，少减或多减一次，症状都是「差一列点
+// 「列表栏 + 1 格留白 + 1 格内缩」的偏移，少减或多减一次，症状都是「差一列点
 // 不中」，而且只在某一种窗口宽度下出现。
 func TestAction_RenderedBarSitsWhereClicksLand(t *testing.T) {
 	screens := []struct {
