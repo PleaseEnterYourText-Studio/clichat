@@ -69,15 +69,6 @@ func threadMatches(th thread.Thread, query string) bool {
 
 // firstUnread 从 start 开始（含）朝 dir 方向找第一个未读会话的下标。
 // 找不到返回 -1。dir 只能是 +1 或 -1。
-//
-// 列表顺序现在是**稳定的时间序**（不再按未读分区，见 refreshVisible），
-// 所以「跳到下一条未读」必须靠**找**，不能靠「往下走一格」。这正是这个
-// 函数存在的理由，也是 `u` 键比 `↓` 好用的原因：一屏已读里按 `↓` 要按
-// 很多下，按 `u` 一步就到。
-//
-// （这里原本还有一个 groupUnreadFirst，把未读稳定地挪到前面。删掉它的
-// 理由见 refreshVisible 的注释：**分组必然带来重排**，而重排发生在用户
-// 正在操作的列表上，代价比「未读浮到顶上」那点好处大得多。）
 func firstUnread(list []thread.Thread, start, dir int) int {
 	for i := start; i >= 0 && i < len(list); i += dir {
 		if list[i].Unread > 0 {

@@ -110,34 +110,10 @@ type Model struct {
 	// activeFolder 为空串表示不按文件夹过滤。
 	activeFolder string
 
-	// openTabs 是打开着的会话 ID，**按打开先后的顺序**（先开的在前）。
-	//
-	// 顶部那几个标签页从这里来。用「打开过的」而不是「列表里最上面的」：
-	// 标签页回答的是「我在跟谁说话」，那是操作历史；按时间排是左边列表
-	// 已经在做的事，在顶上再抄一遍等于没有信息量。
-	//
-	// ⚠️ 它是**追加**进去的，不在切换时重排 —— 就是浏览器标签页的规矩。
-	// 早先这里叫 recent、是 MRU 序（切到哪个哪个就挪到最前），结果是
-	// 「点一下标签，它自己跑到第一个位置」，标签的位置记不住。
-	// 位置稳定比「最近用过的在最前」重要得多：一排会自己重排的标签页，
-	// 每次点都得重新找一遍。
-	openTabs []string
-
 	// helpScroll 是帮助页的滚动位置（从顶部算起的行数）。
 	helpScroll int
 	// helpReturn 记录帮助页是从哪个界面打开的，关掉时退回去。
 	helpReturn mode
-	// folderReturn 记录文件夹选择器是从哪个界面打开的，**取消**时退回去。
-	//
-	// 和 helpReturn 同一个规矩，但只用在「取消」上：选了一个文件夹是要去
-	// 看那个文件夹的列表，退回列表才对（见 applyFolderPick）。
-	//
-	// 少了它，「在会话里点一下列表标题 → 弹出选择器 → 按 Esc」会把人踢到
-	// 列表上：只取消了一次弹窗，却离开了会话。
-	//
-	// ⚠️ mode 的零值是 modeUnlock（不是 modeList），所以取值一律走
-	// folderReturnMode()，不要直接读这个字段。
-	folderReturn mode
 
 	// confirmKind 描述待确认的操作；pendingID 是它作用的会话 ID。
 	// 转发也复用它来记住目标会话。
@@ -147,24 +123,6 @@ type Model struct {
 	activeID string
 	bodies   map[string]app.Body
 	replyAll bool
-
-	// previews 是左侧列表副行用的正文摘要，key 是**那条会话最后一条消息的
-	// Message-ID**，不是会话 ID。
-	//
-	// 用 Message-ID 当键，是为了让「对方又来了一封」自动作废旧摘要：新消息
-	// 的 Message-ID 不在表里，于是它会被重新拉一次。用会话 ID 当键的话，
-	// 得再存一份「这份摘要对应的是哪一封」才能判断过期 —— 两处状态必然漂。
-	//
-	// ⚠️ **有键但值是空串**是有意义的：这一封已经问过，但没正文可用
-	// （拉失败、或者它本来就没有正文）。它让副行退回显示主题，同时对
-	// 「还要不要再拉」给出答案：不要。
-	//
-	// 这个记号**只在结果回来时才写**（见 previewsResultMsg），不在发请求
-	// 时抢先占位。抢占位能把并发的重复请求挡掉，但那个空位只有在命令真的
-	// 被执行时才会被结果兑现 —— 命令一旦没跑成，那几条会话就永久停在
-	// 「没有摘要」上，而且不报错。宁可多要一次，也不要一个说不清什么时候
-	// 会卡住的状态（见 previewsCmd）。
-	previews map[string]string
 
 	// lastSentText 暂存发送失败的那条消息，供重发用。
 	lastSentText string
@@ -206,17 +164,6 @@ type bodiesResultMsg struct {
 	err    error
 }
 
-// previewsResultMsg 是「列表副行的正文摘要」那一批的回执。
-type previewsResultMsg struct {
-	// want 是这一轮请求的消息的 Message-ID，而 texts 是拉到的正文。
-	//
-	// 两个都要带上：texts 里**没有**的键分不出「没拉到」和「没请求过」，
-	// 而处理时要给请求过的每一个都落一个记号（哪怕是空串），否则下一轮
-	// 会再去要一遍 —— 拉失败的那些就会一直重试（见 Model.previews）。
-	want  []string
-	texts map[string]string
-}
-
 // refreshMsg 让界面重新从 app 拉一次会话列表。
 type refreshMsg struct{}
 
@@ -236,8 +183,6 @@ type actionResultMsg struct {
 type foldersResultMsg struct {
 	folders []string
 	err     error
-	// open 表示这次拉取是为了打开 Tab 选择器（见 foldersCmd）。
-	open bool
 }
 
 // allMailResultMsg 是「接收全部邮件」开关切换完成的回执。
@@ -252,26 +197,13 @@ type allMailResultMsg struct {
 // pollTickMsg 是轮询定时器到点的信号。
 type pollTickMsg time.Time
 
-// newTextInput 造一个配好样式的输入框。
-//
-// 存在的理由很实际：`textinput.New()` 的零值里 PlaceholderStyle 是一个
-// 写死的 hex，降级到 256 色正好是 240 —— 和输入卡底色同色，那句提示会
-// 整个消失。而**散在两处** new 出来的话，迟早有一处漏配（这次就是），
-// 症状还极难查：代码全对，只有截图上看不见几个字。
-// 收成一个构造函数，样式就只有一处可漏了。
-func newTextInput() textinput.Model {
-	in := textinput.New()
-	in.Prompt = "> "
-	in.CharLimit = 0
-	in.PlaceholderStyle = stylePlaceholder
-	return in
-}
-
 // New 构造界面模型。
 //
 // 配置完整且凭据存在时进入解锁；否则进入配置向导。
 func New(cfg *config.Config) Model {
-	in := newTextInput()
+	in := textinput.New()
+	in.Prompt = "> "
+	in.CharLimit = 0
 
 	m := Model{
 		cfg:      cfg,
@@ -295,7 +227,9 @@ func New(cfg *config.Config) Model {
 //
 // 只给测试用 —— 让界面层的测试能直接跑在内存假数据上，不碰真实邮箱。
 func NewWithApp(cfg *config.Config, a *app.App) Model {
-	in := newTextInput()
+	in := textinput.New()
+	in.Prompt = "> "
+	in.CharLimit = 0
 
 	m := Model{
 		cfg:      cfg,
@@ -316,12 +250,7 @@ func (m Model) Init() tea.Cmd {
 	if m.mode != modeList && m.mode != modeChat {
 		return textinput.Blink
 	}
-	// 文件夹列表要开机就拉：左侧导航里的「已发送 / 已删除」是**规范名**
-	// （SENT / TRASH），各家服务端上真正的写法可能是 Sent、已发送邮件……
-	// 列表没到手之前，那两项会被原样当成 "SENT" 去过滤，点进去永远是空的。
-	// 以前只有 Tab 选择器用得到它，按一下 Tab 就有了；现在导航一开机就
-	// 把那两项摆在那儿，所以得在开机时把它取回来。
-	return tea.Batch(m.syncCmd(), m.foldersCmd(false), m.pollCmd(), textinput.Blink)
+	return tea.Batch(m.syncCmd(), m.pollCmd(), textinput.Blink)
 }
 
 // ---- 命令 ----
@@ -459,196 +388,12 @@ func (m Model) copyLastBodyCmd(th thread.Thread) tea.Cmd {
 	}
 }
 
-// foldersCmd 生成一个「问服务端要文件夹列表」的命令。
-//
-// open 表示这次拉取的目的是**打开选择器**（Tab）：只有这条路才需要转圈、
-// 才该把失败报给用户。开机那一次是后台补齐，安静地做就行 —— 服务端不支
-// 持 LIST 的时候，不值得为一件用户没要求的事弹一条错。
-func (m Model) foldersCmd(open bool) tea.Cmd {
+func (m Model) foldersCmd() tea.Cmd {
 	a := m.app
 	return func() tea.Msg {
 		f, err := a.Folders()
-		return foldersResultMsg{folders: f, err: err, open: open}
+		return foldersResultMsg{folders: f, err: err}
 	}
-}
-
-// listVisibleRange 是「列表上现在看得见的那几条」在 m.visible 上的下标范围
-// [from, to)，窗口是空的时返回 (0, 0)。
-//
-// 两套版式各算各的：Zen 的列表是**一行一条**、没有副行、也没有分组标题，
-// 它的窗口由 zenListTop / zenListRoom 定；Normal 的列表是「标题 + 副行」
-// 一对两行、还夹着分组标题，窗口由 listRows / listWindow 定。
-//
-// ⚠️ 这里必须跟着**当前版式**走。拿 Normal 的几何去算 Zen 的窗口，取到的
-// 是屏幕上另外那几条 —— 拉了一堆看不见的摘要，而看得见的那几条一直空着。
-//
-// 它同时也是摘要请求量的**唯一上界**（见 wantedPreviews）。
-func (m Model) listVisibleRange() (int, int) {
-	if len(m.visible) == 0 {
-		return 0, 0
-	}
-	if m.zenActive() {
-		room := m.zenListRoom()
-		top := m.zenListTop(room)
-		bottom := top + room
-		if bottom > len(m.visible) {
-			bottom = len(m.visible)
-		}
-		return top, bottom
-	}
-
-	rows := m.listRows()
-	start, end := m.listWindow(rows, m.bodyHeight())
-	from, to := -1, -1
-	for _, r := range rows[start:end] {
-		if r.idx < 0 {
-			continue // 分组标题行
-		}
-		if from < 0 {
-			from = r.idx
-		}
-		if r.idx+1 > to {
-			to = r.idx + 1
-		}
-	}
-	if from < 0 {
-		return 0, 0
-	}
-	return from, to
-}
-
-// listPreviewID 是会话 th 在摘要表里的键 —— 它**最后一条消息**的
-// Message-ID；没有消息时是空串。
-func listPreviewID(th thread.Thread) string {
-	if len(th.Messages) == 0 {
-		return ""
-	}
-	return th.Messages[len(th.Messages)-1].MessageID
-}
-
-// wantedPreviews 是「列表**当前窗口**里还没拉过摘要」的那些会话的最后一条
-// 消息，按列表顺序（列表最上面那条在最前）。
-//
-// ⚠️ 只算窗口里的，不是整张列表：用户看不到的行不该花流量，而列表可能
-// 有几百条。窗口跟着光标走，所以往下翻的时候由 handleListKey 的尾巴
-// 再发一轮（见那个函数的末尾）。
-//
-// # 为什么这里没有「一轮最多几条」
-//
-// 这里曾经截断到 8 条（previewBatch）。那个数是在**窗口本身就是上界**这件
-// 事落地之前留下的：那时怕的是「一个几千封的邮箱一次发出几千个 FETCH」。
-// 现在源头已经只取可见窗口，一屏就是十几条，8 反而变成了纯粹的速度限制 ——
-// 窗口里第 9 条往后要等下一轮，而 app.LastBodyTexts 本来就会把整批合并成
-// 「每个文件夹一条 FETCH」（见 loadBodies），多带几条几乎不花钱。
-//
-// 所以上界交给 listVisibleRange：**请求量由「看得见多少」决定，不由一个
-// 写死的数字决定**。将来谁把窗口算法改成整张列表，请求量会跟着涨 ——
-// 那是窗口那一侧的问题，不该在这里用另一个数字盖住。
-func (m Model) wantedPreviews() []thread.Header {
-	if m.app == nil {
-		return nil
-	}
-	from, to := m.listVisibleRange()
-
-	var out []thread.Header
-	seen := map[string]bool{}
-	for i := from; i < to; i++ {
-		th := m.visible[i]
-		id := listPreviewID(th)
-		if id == "" || seen[id] {
-			continue
-		}
-		// 有键就是「这一封已经排上队了」（不管是在拉、拉到了、还是拉空了）。
-		if _, done := m.previews[id]; done {
-			continue
-		}
-		seen[id] = true
-		out = append(out, th.Messages[len(th.Messages)-1])
-	}
-	return out
-}
-
-// previewsCmd 为窗口里还没拉过摘要的会话拉最后一条消息的正文。
-//
-// 结果回来时会再调一次本函数，于是「还没拉完」这件事自己会接着往下走 ——
-// 少了那条链，它只在列表恰好变化的那一次被触发，而「列表没变」正是
-// 最常见的情况。
-//
-// 没有任何东西要拉时返回 nil，可以放心在任何地方调。
-//
-// ⚠️ 它**不修改模型** —— 「已经拉过（或问过）了没有」这件事只在结果回来时
-// 才落表（见 previewsResultMsg）。曾经试过在这一步先给这一批占个空位，好把
-// 「连按方向键把同一封正文要好几遍」挡掉：那确实挡得住，但代价是这个空位
-// **只有在命令真的被执行时才会被结果替换掉**。命令一旦没跑成（测试里手工
-// 调 update 就会丢掉返回值，将来重构也可能），那几条会话就永久停在
-// 「没有摘要」上 —— 一个安静且不报错的错误状态。
-//
-// 现在的取舍是：宁可多要一次（几次并发请求会被 app 的正文缓存摊薄），
-// 也不要一个说不清什么时候会卡住的状态。重复请求的上界是「一屏 8 条」。
-func (m Model) previewsCmd() tea.Cmd {
-	want := m.wantedPreviews()
-	if len(want) == 0 {
-		return nil
-	}
-	a := m.app
-	ids := make([]string, 0, len(want))
-	for _, h := range want {
-		ids = append(ids, h.MessageID)
-	}
-	return func() tea.Msg {
-		return previewsResultMsg{want: ids, texts: a.LastBodyTexts(want)}
-	}
-}
-
-// adoptPreviewFromBodies 把「刚打开这个会话时拉到的正文」里最后一条
-// 顺手喂给列表摘要。
-//
-// 这份正文已经在这儿了 —— 让它为了列表上那一行小字再走一次网络，纯属
-// 白跑：用户点进去看一眼、退回列表，那一行本该立刻就是对的。
-//
-// msg.err 非空时整批作废：那时 app 给拉失败的那几封填的是「（正文加载
-// 失败）」（见 app.Bodies），把它当成摘要写进列表，列表上就会有若干个
-// 会话的副行写着同一句错误提示。宁可退回显示主题，下一轮再正常拉一次。
-func (m *Model) adoptPreviewFromBodies(msg bodiesResultMsg) {
-	if msg.err != nil {
-		return
-	}
-	th, ok := m.threadByID(msg.id)
-	if !ok || len(th.Messages) == 0 {
-		return
-	}
-	id := listPreviewID(th)
-	b, ok := msg.bodies[id]
-	if !ok || b.Text == "" {
-		return
-	}
-	if m.previews == nil {
-		m.previews = map[string]string{}
-	}
-	m.previews[id] = markdownPreview(b.Text)
-}
-
-// prunePreviews 丢掉已经不在这张列表上的摘要。
-//
-// 不清的话，一个开一整天的窗口会把每一封收到过的邮件正文都留一份在内存里，
-// 而其中绝大多数早就被滚出列表了。清空的时机就是「列表变成另一张列表」
-// 的那一刻（refreshVisible），那时才知道谁还留在场上。
-//
-// ⚠️ 换文件夹会连带清掉别的文件夹的摘要，下次切回去要重拉一遍 —— 那一步
-// 走的是 app 的正文缓存，不再有网络往返，所以这个代价可以接受；而留着
-// 它们的代价（一份不封顶的内存）是不可接受的。
-func (m *Model) prunePreviews() {
-	keep := make(map[string]string, len(m.visible))
-	for _, th := range m.visible {
-		id := listPreviewID(th)
-		if id == "" {
-			continue
-		}
-		if v, ok := m.previews[id]; ok {
-			keep[id] = v
-		}
-	}
-	m.previews = keep
 }
 
 // allMailCmd 切换「接收全部邮件」模式（同时落盘）。
@@ -674,23 +419,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 帮助页同理（帮助内容的行数只取决于宽度），两处一起收。
 		m.clampChatScroll()
 		m.clampHelpScroll()
-		// 输入框自己也得有个宽度上限：它的 Width 为 0 时完全不裁剪。
-		//
-		// 两条路在这里收口，顺序不能换：
-		//
-		//  1. Zen 的正文列比终端窄，宽度得跟着 zenContentWidth 走（见
-		//     syncInputWidth），否则从大窗口缩到小窗口之后，敲到一半的字
-		//     会顶出正文列。非 Zen 时它把 Width 归零 —— 表示"不限制"。
-		//  2. 归零之后再补上整页视图（解锁、配置向导）那个粗上限。这两个
-		//     页面里输入框独占一整行，给个略小于终端宽度的值就够了。
-		//
-		// 会话里那个浮起输入框**不走这里**：它的宽度要精确到列，由
-		// renderInputLine 按那一行实际剩多少现算（它才知道提示要占多宽），
-		// 走的是 sizedInput 里的临时副本，不碰 m.input.Width。
+		// Zen 的正文列宽度跟着窗口走，输入框的可用宽度也得跟着重算，
+		// 否则从大窗口缩到小窗口之后，敲到一半的字会顶出正文列。
 		m.syncInputWidth()
-		if m.input.Width == 0 {
-			m.input.Width = m.pageInputWidth()
-		}
 		return m, nil
 
 	case pollTickMsg:
@@ -710,11 +441,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 左边的列表里（未读标记、时间、主题都会变），右边那一屏却停在
 		// 上一轮的内容上 —— 看上去就是「刷新没用」。轮询路径原先只更新了
 		// 列表，这就是本轮修的那个 bug。
-		//
-		// 列表变了，副行那句「最新一条说了什么」也得跟着变 —— 它和主题
-		// 一样是列表的一部分；只有主题更新而摘要停在上一条，读起来就是
-		// 两封不同的邮件。
-		return m, tea.Batch(m.reloadBodiesIfChanged(msg), m.previewsCmd())
+		return m, m.reloadBodiesIfChanged(msg)
 
 	case sendResultMsg:
 		m.busy = false
@@ -736,9 +463,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 新会话在发出去之前不存在于列表里，发完才出现 —— 把视图切过去。
 		if msg.id != "" {
 			m.activeID = msg.id
-			m.openTab(msg.id)
 		}
-		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd(), m.previewsCmd())
+		return m, tea.Batch(m.syncCmd(), m.loadActiveBodiesCmd())
 
 	case bodiesResultMsg:
 		if msg.id != m.activeID {
@@ -752,31 +478,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 一些，scroll 就留在了界外 —— 收敛一次，免得用户从头按到底都
 		// 「没反应」（画面靠 tailWindow 兜住了，但这个余数很难察觉）。
 		m.clampChatScroll()
-		m.adoptPreviewFromBodies(msg)
 		return m, nil
-
-	case previewsResultMsg:
-		if m.previews == nil {
-			m.previews = map[string]string{}
-		}
-		// 请求过的**每一个**都要落定，包括没拉到正文的那些（落空串）。
-		// 空串在这里是一个记号，不是「没有数据」—— 见 Model.previews。
-		// 一条也不记的话，拉不到的那几封会在每一轮里被重新请求，而每次
-		// 都要等一次网络往返（或者超时），列表就永远补不完。
-		//
-		// 落表也顺手把「这一批不用再要了」这件事记下来 —— 重复请求的
-		// 抑制靠的就是它（而不是发命令时先占位，见 previewsCmd）。
-		for _, id := range msg.want {
-			m.previews[id] = msg.texts[id]
-		}
-		// 结果到了就排下一批 —— 这是让链子往前走的唯一齿轮。
-		return m, m.previewsCmd()
 
 	case refreshMsg:
 		if m.app != nil {
 			m.setThreads(m.app.Threads())
 		}
-		return m, m.previewsCmd()
+		return m, nil
 
 	case actionResultMsg:
 		m.busy = false
@@ -801,38 +509,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case foldersResultMsg:
+		m.busy = false
 		if msg.err != nil {
-			// 开机那次拉不到就安静地算了（导航会退回按规范名过滤，
-			// 和以前一样）；按 Tab 才需要告诉用户为什么选择器没开。
-			if msg.open {
-				m.busy = false
-				m.status = "取文件夹列表失败：" + shortErr(msg.err)
-			}
+			m.status = "取文件夹列表失败：" + shortErr(msg.err)
 			return m, nil
 		}
 		m.folders = msg.folders
-		if !msg.open {
-			return m, nil
-		}
-		m.busy = false
 		// 打开选择器时把光标停在当前选中的那一项上，而不是从头开始。
 		m.folderCursor = 0
-		for i, it := range m.folderPickerItems() {
-			if it.folder == m.activeFolder {
+		for i, name := range m.folderChoices() {
+			if name == m.activeFolder {
 				m.folderCursor = i
 				break
 			}
-		}
-		// 记下从哪儿打开的，取消时退回去。
-		//
-		// 在这里赋值而不是在发命令时：命令是异步的，等结果回来的这段时间
-		// 用户可能已经换到别处去了（比如点了另一个会话）。以**结果到达时**
-		// 的位置为准，取消才会退回他此刻在的地方。
-		//
-		// 已经开着的话不要覆盖 —— 覆盖成 modeFolder 之后，取消会「退回」
-		// 选择器自己，屏幕上看起来就是 Esc 没反应。
-		if m.mode != modeFolder {
-			m.folderReturn = m.mode
 		}
 		m.mode = modeFolder
 		return m, nil
@@ -1046,90 +735,36 @@ func (m Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleFolderKey 处理文件夹选择器。方向键选，回车确定。
-//
-// Esc 和 Tab 都能退出去。留着 Tab 是因为**它就是打开选择器的那一步**：
-// 按 Tab 进来、按 Tab 出去，同一个键在原位切换，不需要记第二个键。
 func (m Model) handleFolderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	n := len(m.folderPickerItems())
+	choices := m.folderChoices()
 
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
 	case "esc", "tab":
-		// 退回来处（见 folderReturn）。
-		m.mode = m.folderReturnMode()
+		m.mode = modeList
 		return m, nil
 	case "up", "k":
 		if m.folderCursor > 0 {
 			m.folderCursor--
 		}
 	case "down", "j":
-		if m.folderCursor < n-1 {
+		if m.folderCursor < len(choices)-1 {
 			m.folderCursor++
 		}
 	case "home", "g":
 		m.folderCursor = 0
 	case "end", "G":
-		m.folderCursor = n - 1
+		m.folderCursor = len(choices) - 1
 	case "enter":
-		return m.applyFolderPick(m.folderCursor)
-	}
-	return m, nil
-}
-
-// folderReturnMode 是取消选择器时该退回去的那个 mode。
-//
-// 只在确实是个内容屏时才用 folderReturn：它的零值是 modeUnlock，直接
-// 采信会把人送到解锁页去。退回列表比退回解锁页合理 —— 列表永远是安全的
-// 落脚点。
-func (m Model) folderReturnMode() mode {
-	switch m.folderReturn {
-	case modeList, modeChat, modeNewChat:
-		return m.folderReturn
-	}
-	return modeList
-}
-
-// clampFolderCursor 把选择器光标收进合法范围。
-func (m *Model) clampFolderCursor() {
-	if n := len(m.folderPickerItems()); m.folderCursor >= n {
-		m.folderCursor = n - 1
-	}
-	if m.folderCursor < 0 {
-		m.folderCursor = 0
-	}
-}
-
-// clickFolderPicker 处理文件夹选择器里的一次左键点击。
-//
-// 点在某一项上：**直接切过去**，不是"选中它、再回车"。鼠标用户点一下
-// 就是要那个结果，让他再去找回车是把键盘的操作模型硬套上去。
-// 点在其他任何地方（组标题、空行、留白、页脚）：取消。
-//
-// 「取消」这一条是刻意的：Esc 是键盘那边唯一的出路，而鼠标必须有一条
-// 等价的 —— 否则一个用鼠标打开选择器的人，会卡在一个只能靠键盘离开的
-// 界面里。
-func (m Model) clickFolderPicker(x, y int) (tea.Model, tea.Cmd) {
-	idx, ok := m.pickerItemAt(x, y)
-	if !ok {
+		if m.folderCursor >= 0 && m.folderCursor < len(choices) {
+			m.activeFolder = choices[m.folderCursor]
+		}
+		m.refreshVisible()
+		m.cursor = 0
 		m.mode = modeList
 		return m, nil
 	}
-	return m.applyFolderPick(idx)
-}
-
-// applyFolderPick 采纳选择器里第 i 项，并退回列表。
-//
-// 走 setFolder 而不是直接写 activeFolder：那一步要重新算 visible、把光标
-// 收回列表顶部、再做一次越界收敛。少了其中任何一步，症状都是"切过去之后
-// 光标停在一条和刚才毫无关系的会话上"。
-func (m Model) applyFolderPick(i int) (tea.Model, tea.Cmd) {
-	items := m.folderPickerItems()
-	if i < 0 || i >= len(items) {
-		return m, nil
-	}
-	m.setFolder(items[i].folder)
-	m.mode = modeList
 	return m, nil
 }
 
@@ -1259,28 +894,6 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "R":
 		return m.openActive(true)
 
-	// Ctrl+G 循环切换文件夹。用「循环」而不是给每一项配键：
-	// 见 cycleNav 的说明。
-	case "ctrl+g":
-		m.cycleNav()
-
-	// Esc 一次收起一层筛选：先退掉文件夹，再退掉搜索词。两层都干净时
-	// 什么也不做 —— 列表模式下没有「上一层」可退，凭空把光标挪回顶部
-	// 只会让人以为按错了。
-	//
-	// 这两层筛选**都必须有键盘退路**：导航是可以点出来的（鼠标），
-	// 搜索词是回车保留的（键盘），只进不出就成了死胡同。
-	case "esc":
-		switch {
-		case m.activeFolder != "":
-			m.setFolder("")
-		case m.query != "":
-			m.query = ""
-			m.refreshVisible()
-			m.cursor = 0
-			m.clampCursor()
-		}
-
 	case "n":
 		m.mode = modeNewChat
 		m.input.EchoMode = textinput.EchoNormal
@@ -1304,7 +917,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// 文件夹列表要问服务端，所以先转个圈再开选择器。
 		m.busy = true
-		return m, m.foldersCmd(true)
+		return m, m.foldersCmd()
 
 	case "r":
 		if m.app != nil {
@@ -1361,16 +974,7 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 	}
-
-	// 列表模式的任何一次按键之后，都顺手看一眼「窗口里还有谁的摘要没拉」。
-	//
-	// 放在这个唯一的总出口，而不是散在换文件夹 / 清搜索 / 挪光标那几处：
-	// 列表面临的变化太多了（Esc 收筛选、Ctrl+G 循环文件夹、↑↓ 翻窗口、
-	// 以后还会加），每处接一次就有 N 个漏掉的机会，而漏掉的表现只是
-	// 「滚下去的那几条一直没有摘要」—— 安静的、看起来像"还没加载完"的错。
-	//
-	// 没有东西要拉时它返回 nil，所以这里不会平白多出命令。
-	return m, m.previewsCmd()
+	return m, nil
 }
 
 // openActive 打开光标所在的会话。
@@ -1433,9 +1037,6 @@ func (m Model) enterThread(th thread.Thread, solo, keepDraft bool) (tea.Model, t
 		m.input.SetValue("")
 	}
 	m.input.Focus()
-	// 记进「打开着的标签页」。顺序就是打开先后的顺序，切到别处再回来
-	// 不会把它挪到前面 —— 一排会自己重排的标签页，每次点都得重新找一遍。
-	m.openTab(th.ID)
 
 	return m, tea.Batch(
 		textinput.Blink,
@@ -1683,28 +1284,8 @@ func (m *Model) setThreads(list []thread.Thread) {
 }
 
 // refreshVisible 按当前文件夹与搜索词重算要显示的会话。
-//
-// # 顺序是**稳定的时间序**，和已读状态无关
-//
-// 这里原来还套了一层 groupUnreadFirst（未读排前面）。那个设计看着合理，
-// 实际是一串连锁的「逻辑不通」：
-//
-//   - **打开一条会话 = 把它标成已读 = 它立刻跳到「已读」那一段**，于是
-//     光标底下换成了另一条。用户按一下回车，选中的东西变了；再按一下，
-//     开的是另一条 —— 一路走下来像在原地打转，还会重复打开同一条。
-//   - 列表在用户脚下重排，「按顺序把未读过一遍」这条动线根本走不通。
-//   - 光标、鼠标命中、滚动窗口全都建立在 visible 的下标上，而它在用户
-//     操作的过程中被重排 —— 三者随时可能指向不同的会话。
-//
-// 现在位置不再承载状态：**顺序只由时间决定（最新在前），未读靠行内的强调色
-// 和计数表示**。判据在 listorder_test.go。
-//
-// 顺序仍然只在这一处定下来（filterThreads 之后不再重排），因为列表分组、
-// 光标索引、滚动窗口都依赖它 —— 重排和「不重排」必须发生在同一个地方，
-// 否则「按一下 ↓ 跳到哪儿」和「屏幕上第几行亮」会对不上。
 func (m *Model) refreshVisible() {
 	m.visible = filterThreads(m.threads, m.activeFolder, m.query)
-	m.prunePreviews()
 }
 
 // currentThread 返回光标所在的会话。
@@ -1715,16 +1296,16 @@ func (m Model) currentThread() (thread.Thread, bool) {
 	return m.visible[m.cursor], true
 }
 
-// 注：这里原本有个 folderChoices()，把选择器的选项拼成 []string（空串
-// 打头代表「全部」，后面跟服务端上那一串真名）。它被删掉了：
+// folderChoices 返回文件夹选择器的选项，第一项固定是「全部」。
 //
-//   - 那份列表和 navGroups 里的固定入口**两套并存**（一个用空串+真名，
-//     一个用解析过的规范名+人读的标签），也就是同一件事有两个出处；
-//   - 选项里没有未读计数 —— 而"这个文件夹里还有几封没读"恰恰是选文件夹
-//     时唯一想知道的数字。
-//
-// 现在统一走 folderPickerItems()（见 nav.go）：带标签、带计数、带两级
-// 分组，且和 Ctrl+G 循环用的是同一批项。
+// 用空串表示「全部」，界面上渲染成「（全部文件夹）」。这样选项值可以
+// 直接赋给 activeFolder，不需要额外的哨兵常量，也不会和真实文件夹名撞车
+// —— 真实文件夹名不会是空串。
+func (m Model) folderChoices() []string {
+	out := make([]string, 0, len(m.folders)+1)
+	out = append(out, "")
+	return append(out, m.folders...)
+}
 
 func (m *Model) clampCursor() {
 	if m.cursor >= len(m.visible) {
@@ -1807,14 +1388,11 @@ func (m Model) maxChatScroll() int {
 // 注释里记着同一个坑）。
 func (m Model) chatViewport() int {
 	if m.zenInChat() {
-		// 页脚那一行现在是**恒在**的：动作栏恒住在屏幕最后一行，所以
-		// zenChromeHeight 之外永远再占掉 1 行。
-		//
-		// 上一版这里是「有状态文字才扣 1 行」—— 那是页脚只装状态时的算法。
-		// 现在页脚同时装着出路，它不可能再"没有"了，再按状态文字判就会少
-		// 扣一行：正文多算一行，滚到底会差半行，而现象只在「刚进 Zen、
-		// 还没有任何状态」的时候出现。
-		if h := m.height - zenChromeHeight - 1; h > 1 {
+		statusH := 0
+		if m.renderZenStatus(zenContentWidth(m.width)) != "" {
+			statusH = 1
+		}
+		if h := m.height - zenChromeHeight - statusH; h > 1 {
 			return h
 		}
 		return 1
@@ -1857,331 +1435,55 @@ func (m *Model) moveCursor(dir int) {
 	m.clampCursor()
 }
 
-// ---- 鼠标 ----
-
-// hitRegion 是屏幕上一块可交互的区域。
-type hitRegion int
-
-// 注：这里原本还有个 hitNav（那 14 列常驻导航栏）和一个 hitDivider（栏与
-// 栏之间那根线所在的列）。两个都没有存在的理由了：导航栏整个删掉（改成
-// 按需唤出的选择器），而那条线现在是**列表栏和正文栏之间实打实的一列**，
-// 归正文栏 —— 留着死区的话，那一列会变成"点了没反应"，而它明明在两栏
-// 中间，用户不会觉得那里不该有反应。
-const (
-	hitNone hitRegion = iota
-	// hitListHeader 是列表栏**标题行**（当前文件夹那一行）。点它换文件夹。
-	hitListHeader
-	hitTabs
-	hitList
-	hitChat
-	hitInput
-	hitStatus
-)
-
-// hitTest 判断一个坐标落在哪一块。
+// handleMouse 处理鼠标事件。
 //
-// 判断全部走 measureLayout()，和画界面用的是同一份几何。这是本轮「点得到」
-// 能算数（而不是「差不多能点」）的唯一原因：只要画的时候用的是这份
-// 几何，点的时候也用这份，两者就不可能漂移。
-func (m Model) hitTest(x, y int) (hitRegion, layout) {
-	l := m.measureLayout()
-	if x < 0 || y < 0 || x >= m.width || y >= m.height {
-		return hitNone, l
-	}
-
-	switch {
-	case l.tabsRow >= 0 && y == l.tabsRow:
-		// 标签页占的是正文栏那一行；左边那一截是列表栏的**留白**
-		// （列表栏的第 0 行要等 bodyTop 才出现，见 renderThreadList），
-		// 点它什么也不该发生。
-		if x < l.contentX {
-			return hitNone, l
-		}
-		return hitTabs, l
-
-	case y >= l.inputTop && y < l.inputTop+l.inputRows:
-		return hitInput, l
-
-	case y == l.statusRow:
-		return hitStatus, l
-
-	// 列表栏的标题行：**整行**（左起第一列到那条竖线之前）都可以点，
-	// 不是只有标题文字那几个字。空格子也是那个入口的一部分 —— 让"点得到"
-	// 依赖文字的宽度，改个字就会莫名其妙失灵。
-	case l.twoPane && y == l.bodyTop && x < l.ruleX:
-		return hitListHeader, l
-
-	case y >= l.bodyTop && y < l.bodyTop+l.bodyH:
-		// ⚠️ 边界是 ruleX，不是 chatX。
-		//
-		// 那条竖线是**两栏之间**的一列：它不属于任何一栏，但必须要有个
-		// 归属。归给列表的话，正文里靠左的一片空白会有一列点下去变成
-		// 「选中列表项」；而用户在那儿点，想的是正文。归给正文则相反 ——
-		// 正文本来就"点哪儿都没反应"，多一列没反应的一格不算退步。
-		//
-		// 这块地方原来写的 `x < l.chatX`，于是竖线那一列落进了列表 ——
-		// 判据 TestMouse_EveryBodyColumnBelongsToAPane 就是照这个抓出来的。
-		if x < l.ruleX {
-			return hitList, l
-		}
-		return hitChat, l
-	}
-	return hitNone, l
-}
-
-// handleMouse 处理鼠标事件：滚轮滚动，左键点击。
+// 只认滚轮。左键点击（点一条会话、点一个按钮）需要先把每一行对应回
+// 是哪条消息，那是另一件事 —— 半吊子的点击比没有点击更让人困惑。
 //
-// 滚轮按**指针落在哪一栏**分流：在导航或列表上挪光标，在会话流上滚正文。
-// 这就是「聚焦」在鼠标这一侧的正解 —— 指针在哪，滚轮就管哪，不用先按
-// 一个键把焦点挪过去。
-//
-// 左边那一栏也归滚轮管（而不是「只要进了会话，滚轮就只滚正文」）：
-// 用户看着某一条会话想往下挪，手自然会放到那一条上面。
+// 「滚谁」按指针落在哪一栏定：双栏时在左栏挪光标（不打开，打开是回车
+// 或点击的事），在右栏滚正文；单栏只有一栏，按当前看的是列表还是会话
+// 来分。这正是「聚焦」在鼠标这一侧的正解 —— 指针在哪，滚轮就管哪，
+// 不用先按一个键把焦点挪过去。
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	// 只认「按下」这一下。滚轮的松开事件也带着同一个 Button，不挡掉的话
-	// 一格滚轮会滚两格。
 	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
-
-	// 动作栏（见 action.go）排在**所有**分支之前。
-	//
-	// 它承载的是「怎么离开这一屏」，是一条压过其它交互的出路，所以先判它
-	// 不会抢走任何东西 —— 它只在屏幕最后一行，和别的可点区域不重叠。
-	// 反过来写（放在各 mode 分支后面）的话，每加一个界面就要记得接一次，
-	// 而漏掉的那一次表现是「这一屏的按钮点了没反应」：一个只会让人觉得
-	// 「鼠标坏了」的 bug。
-	if msg.Button == tea.MouseButtonLeft {
-		if a, ok := m.actionAt(msg.X, msg.Y); ok {
-			return m.runAction(a.kind)
-		}
+	var dir int
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		dir = 1
+	case tea.MouseButtonWheelDown:
+		dir = -1
+	default:
+		return m, nil
 	}
 
 	// 帮助页自己占满一屏、有自己的滚动位置，单独处理。
 	// 少了这一条的话，在帮助页上滚滚轮会去动底下那个列表的光标 ——
 	// 屏幕上看不见任何变化，用户只会觉得轮子坏了。
 	if m.mode == modeHelp {
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.helpScroll -= wheelStep
-			m.clampHelpScroll()
-		case tea.MouseButtonWheelDown:
-			m.helpScroll += wheelStep
-			m.clampHelpScroll()
-		}
+		m.helpScroll -= dir * wheelStep
+		m.clampHelpScroll()
 		return m, nil
 	}
 
-	// 文件夹选择器同理：它占满一屏、自己的几何也是自己一套，走通用的
-	// hitTest 会拿正文栏那套坐标去判，点哪儿都错。
-	if m.mode == modeFolder {
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			m.folderCursor--
-			m.clampFolderCursor()
-		case tea.MouseButtonWheelDown:
-			m.folderCursor++
-			m.clampFolderCursor()
-		case tea.MouseButtonLeft:
-			return m.clickFolderPicker(msg.X, msg.Y)
-		}
-		return m, nil
-	}
-
-	// Zen 是另一套版式：没有列表栏、没有状态栏，那一套 hitTest 算的是
-	// Normal 的几何。用错几何的后果不是"点不中"，而是**点中了看不见的
-	// 东西** —— 宽窗口下左四分之一归列表栏，在 Zen 里点那里会挪光标，
-	// 而屏幕上什么都不会变（见 Zen 那一屏的介绍：它是另一个世界）。
-	// 所以 Zen 自己接，只做屏幕上有反应的那几件事。
-	if m.zenActive() {
-		return m.handleZenMouse(msg)
-	}
-
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		return m.handleWheel(1, msg.X, msg.Y)
-	case tea.MouseButtonWheelDown:
-		return m.handleWheel(-1, msg.X, msg.Y)
-	case tea.MouseButtonLeft:
-		return m.handleClick(msg.X, msg.Y)
-	}
-	return m, nil
-}
-
-// handleWheel 处理滚轮。up>0 表示向上滚。
-func (m Model) handleWheel(up, x, y int) (tea.Model, tea.Cmd) {
-	region, _ := m.hitTest(x, y)
-
-	switch m.mode {
-	case modeChat, modeNewChat:
-		if region == hitList || region == hitListHeader {
-			m.moveCursor(-up)
+	switch {
+	case m.mode == modeChat || m.mode == modeNewChat:
+		// 在会话里。单栏时整幅都是会话；双栏时指针在左栏就挪光标 ——
+		// 「左边那一栏也归滚轮管」比「只要进了会话，滚轮就只滚正文」
+		// 更符合指针在哪滚哪的直觉。
+		if m.width >= singlePaneWidth && msg.X < m.listWidth() {
+			m.moveCursor(-dir)
 		} else {
-			m.scrollChat(up * wheelStep)
+			m.scrollChat(dir * wheelStep)
 		}
-	case modeList:
-		m.moveCursor(-up)
+	case m.mode == modeList:
+		m.moveCursor(-dir)
 	}
-	// 其余模式（搜索、确认框、配置向导、解锁）不接管滚轮：它们要么是弹在
-	// 最上面的一小条，要么在等一个明确的答复，让滚轮去改背后那些状态只会
-	// 造出「屏幕上没变、底下却变了」的怪事。（文件夹选择器在上面那个分支
-	// 里就已经被接走了 —— 它有自己的几何。）
+	// 其余模式（搜索、文件夹选择、确认框、配置向导、解锁）不接管滚轮：
+	// 它们要么是弹在最上面的一小条，要么在等一个明确的答复，
+	// 让滚轮去改背后那些状态只会造出「屏幕上没变、底下却变了」的怪事。
 	return m, nil
-}
-
-// listIsCurrent 报告左侧列表是不是当前界面上「能直接操作的那一块」。
-//
-// 三种模式算：列表本身、会话内、新建会话内。
-//
-// ⚠️ 会话内那两种**以前是挡着的**（`if m.mode != modeList { return }`），
-// 理由是「输入框拿着焦点」。那个理由站不住：输入框有焦点只说明键盘敲的字
-// 要进输入框，不代表鼠标要失效。挡着的表现是「在会话里点左侧列表没反应」，
-// 而用户看不出是被挡了 —— 只会以为鼠标坏了，于是去按 Esc 退出来再点。
-// 一个打字的人不该为了换个会话先退出。
-//
-// 点进去照旧用 keepDraft=true（见 handleClick 的说明）：打了一半的字
-// 不该因为点到别处就没了。
-//
-// 模态层（确认框 / 搜索 / 转发 / 解锁 / 向导）不算：它们在最上面一层等
-// 一个明确的答复，点穿到背后去切会话，会把那个待答复的问题连人一起扔掉。
-func (m Model) listIsCurrent() bool {
-	switch m.mode {
-	case modeList, modeChat, modeNewChat:
-		return true
-	}
-	return false
-}
-
-// handleClick 处理左键点击。
-//
-// 会话内的点击一律用 keepDraft=true 进新会话：点击比回车「手滑」得多，
-// 打了一半的字不该因为点到别处就没了。草稿跨会话保留本来就是这个界面
-// 已有的行为（Ctrl+↑/↓ 走的就是它）。
-// clickTab 处理「点了顶部标签行里某一列」。
-//
-// 两种情况：点在真标签上 → 切过去；点在溢出指示符（"‹" / "›"）上 →
-// 切到那一侧被藏起来的最近一个。指示符按「一次一格」走，因为开满
-// tabLimit 个会话时一侧可能压着好几个，得能一个个走到。
-//
-// 窗口是跟着当前标签走的（见 tabChips），所以切过去之后它自己就滚进
-// 可见范围 —— 这里不需要维护任何滚动偏移，那种状态存了就会和窗口打架。
-func (m Model) clickTab(x int, l layout) (tea.Model, tea.Cmd) {
-	chip, ok := m.tabChipAt(l, x)
-	if !ok {
-		return m, nil
-	}
-
-	target := chip.id
-	if chip.marker != "" {
-		target = ""
-		tabs := m.tabThreads()
-		for i, th := range tabs {
-			if th.ID != m.activeID {
-				continue
-			}
-			if chip.marker == "‹" && i > 0 {
-				target = tabs[i-1].ID
-			} else if chip.marker == "›" && i+1 < len(tabs) {
-				target = tabs[i+1].ID
-			}
-			break
-		}
-		if target == "" {
-			return m, nil
-		}
-	}
-
-	if target == m.activeID {
-		return m, nil
-	}
-	th, ok := m.threadByID(target)
-	if !ok {
-		return m, nil
-	}
-	return m.enterThread(th, false, true)
-}
-
-func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
-	region, l := m.hitTest(x, y)
-
-	switch region {
-	case hitTabs:
-		return m.clickTab(x, l)
-
-	case hitListHeader:
-		// 标题行就是「换文件夹」那个入口。它和 Tab 走的是同一条路：
-		// 先把文件夹列表要回来（可能还没拉过），拿到之后由 foldersMsg
-		// 把选择器打开、并把光标停在当前那一项上。
-		if !m.listIsCurrent() {
-			return m, nil
-		}
-		return m, m.foldersCmd(true)
-
-	case hitList:
-		if !m.listIsCurrent() {
-			return m, nil
-		}
-		idx, ok := m.listRowAt(l.listW, l.bodyH, y-l.bodyTop)
-		if !ok {
-			return m, nil
-		}
-		m.cursor = idx
-		return m.enterThread(m.visible[idx], false, true)
-
-	case hitChat:
-		if m.mode != modeChat && m.mode != modeNewChat {
-			return m, nil
-		}
-		// 点在正文最右那一列（滚动条那一列）上就跳过去。
-		if x == l.chatX+l.chatW-1 {
-			m.scrollToBar(y - l.bodyTop - 1)
-		}
-	}
-	return m, nil
-}
-
-// scrollToBar 把正文滚到滚动条上第 row 行对应的位置。
-//
-// 换算里带那个 -1 的 offset，是因为正文第一行是会话标题，滚动条从
-// 标题下面才开始（renderChat 里画的就是这样）。少了它，点最上面
-// 一格会差一行 —— 看着「点到底了还差一点」。
-func (m *Model) scrollToBar(row int) {
-	total := m.chatBodyLines()
-	viewH := chatViewHeight(m.bodyHeight())
-	max := total - viewH
-	if max <= 0 {
-		return
-	}
-	if row < 0 {
-		row = 0
-	}
-	if row >= viewH {
-		row = viewH - 1
-	}
-	// 滑块顶端在滚动条上的位置：off = row * (max) / (viewH - 1)。
-	// viewH 为 1 时没有可插值的地方，直接滚到底。
-	off := 0
-	if viewH > 1 {
-		off = row * max / (viewH - 1)
-	}
-	m.scroll = max - off
-	m.clampChatScroll()
-}
-
-// pageInputWidth 是整页视图里那个独占一行的输入框的上限。
-//
-// textinput 的 Width 为 0 时**不裁剪**：用户敲一长句就会把这一行顶出屏幕。
-// 解锁页和配置向导的输入框自己占一整行，给它一个略小于终端宽度的上限
-// 就够了 —— 不需要精确，因为那一行没有别的东西要跟它分地方。
-//
-// 会话里那个浮起输入框走的是另一条路（renderInputLine 现算宽度），
-// 因为它要和右侧的提示文字分同一行，宽度必须精确到列。
-func (m Model) pageInputWidth() int {
-	w := m.width - 6
-	if w < 10 {
-		w = 10
-	}
-	return w
 }
 
 // activeThread 返回当前打开的会话。
@@ -2214,8 +1516,14 @@ func (m *Model) attach(client mail.Client) error {
 		return err
 	}
 
-	// 正文缓存打不开不算错误（见 store.OpenBodyCache）—— 它只是缓存，
-	// 最坏情况是这次启动把刚看过的那些重新下载一遍。
+	// 正文缓存（见 store/bodycache.go）。
+	//
+	// ⚠️ 这一处**不是前端的事**，是后端优化落在界面层的接线：缓存的实现、
+	// 上限、LRU 全在 store 里，但「谁去把它打开、交给 App」只有这里能做。
+	// 前端回退到 main 那一版时它被一起带走了 —— 结果是 app.cache 永远是 nil，
+	// 正文缓存整个变成死代码（重启后照旧把眼前那一屏重新下载一遍）。
+	//
+	// 打不开不算错误：它只是缓存，最坏情况是这次启动把刚看过的重新下载一遍。
 	var cache *store.BodyCache
 	if cachePath, err := config.BodyCachePath(); err == nil {
 		cache = store.OpenBodyCache(cachePath, store.DefaultBodyCacheBytes)

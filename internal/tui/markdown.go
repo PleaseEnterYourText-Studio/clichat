@@ -203,23 +203,13 @@ type mdTheme struct {
 	Rule       lipgloss.Color
 }
 
-// defaultMDTheme 是 Normal 模式的配色。
-//
-// ⚠️ 标题和代码原先各有自己的色相（紫 141 / 蓝 110 / 琥珀 180），这一版
-// **全部换成明度**，和 Zen 走同一条路（见 zenMDTheme）：标题靠"比正文更亮
-// + 加粗"分档，代码压暗一档当引文。层级还在，颜色没了。
-//
-// 其中 141 那一处是**必须**改的，不只是收敛：141 是界面唯一的强调色，
-// 它的全部说服力来自"只表示你现在的位置"。标题也用它，等于把强调色撒进
-// 每一封信的正文里 —— 强调色的语义当场漏水（同一个病，senderPalette
-// 那边是靠注释躲开的，这里躲不掉）。
-//
-// 链接保留一点强调色：它是唯一一个"点得动"的东西，值得破例。
+// defaultMDTheme 是 Normal 模式的配色。数值和主题化之前逐字节一致 ——
+// 抽主题不该顺手改 Normal 的样子。
 var defaultMDTheme = mdTheme{
-	Code:       "243",
+	Code:       "180",
 	Quote:      "245",
-	HeadStrong: "255",
-	HeadMid:    "252",
+	HeadStrong: "141",
+	HeadMid:    "110",
 	Link:       "45",
 	Rule:       "240",
 }
@@ -296,91 +286,6 @@ func renderMarkdownThemed(src string, width int, th mdTheme) []string {
 		i++
 	}
 	return out
-}
-
-// markdownPreview 把一段正文压成**一行不带样式的纯文本**，给列表副行用。
-//
-// 走的是和正文同一个解析器（parseMarkdown），只是不做上色那一步。
-// 为什么不自己写一把「去掉 # 和 *」的正则：这套语法是生成端和渲染端
-// **共同**约定的一个封闭集合（见文件头），正则等于第三份实现，改一次
-// 语法就会漂成「列表里还挂着 **，正文里已经加粗了」。
-//
-// 只取**第一段**：一份正文的第一段就是写信的人最先说的事。
-//
-// 一段是「连续的几行直到空行为止」，不是「头一行」—— 纯文本邮件的身
-// 体是**硬折行**的（每行七十来个字），只取头一行会把它拦腰截断：
-//
-//	周三下午三点
-//	在 3 楼会议室
-//
-// 头一行是「周三下午三点」，读起来是个没说完的句子。标题、引用、列表项
-// 都算内容（它们都是「对方说了什么」）；空行和分隔线（`---`）不算，遇到
-// 它们这一段就结束了。表格是个例外：只取表头那一行 —— 表头就是「这封信
-// 在说什么」，后面全是数据，拼进来只会把摘要占满。
-//
-// 结果里的空白**全部压成单个空格**：换行、缩进、表格的列间隔在列表里
-// 都只剩一行的宽度，留着它们只会让截断位置提前。
-func markdownPreview(src string) string {
-	var parts []string
-	for _, ln := range parseMarkdown(src) {
-		switch ln.kind {
-		case blockTableRow:
-			// 表头之后就是数据行。走到这里说明表头已经收进来了，到此为止。
-			return joinPreview(parts)
-		case blockRule:
-			// 分隔线是「这一段说完了」，不是内容本身。
-			if len(parts) > 0 {
-				return joinPreview(parts)
-			}
-			continue
-		}
-
-		text := previewLineText(ln)
-		if strings.TrimSpace(text) == "" {
-			// 空行：第一段到此为止。开头的空行只是排版，接着往下找。
-			if len(parts) > 0 {
-				return joinPreview(parts)
-			}
-			continue
-		}
-		parts = append(parts, text)
-	}
-	return joinPreview(parts)
-}
-
-// previewLineText 是一行在列表摘要里的样子。
-//
-// 列表项留着项目符号（"• 第一项"）—— 那个符号本身就说明「这是一串里的
-// 一条」，去掉就看不出是列表了。引用的 ">" 反过来要去掉：它只是「我转
-// 述别人的话」的排版记号，不是内容。表格按格拼成一句。
-func previewLineText(ln mdLine) string {
-	if len(ln.cells) > 0 {
-		parts := make([]string, 0, len(ln.cells))
-		for _, c := range ln.cells {
-			if s := plainSpans(c); strings.TrimSpace(s) != "" {
-				parts = append(parts, s)
-			}
-		}
-		return strings.Join(parts, " ")
-	}
-	if ln.kind == blockBullet {
-		return ln.prefix + plainSpans(ln.spans)
-	}
-	return plainSpans(ln.spans)
-}
-
-// joinPreview 把攒下来的几行接成一行，空白全部压成单个空格。
-func joinPreview(parts []string) string {
-	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
-}
-
-// plainSpans 把一段行内片段接成纯文本（丢掉样式和链接地址）。
-func plainSpans(spans []span) string {
-	var b strings.Builder
-	for _, sp := range spans {
-		b.WriteString(sp.text)
-	}
-	return b.String()
 }
 
 // ---- 解析 ----

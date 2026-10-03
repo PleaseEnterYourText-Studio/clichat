@@ -1,25 +1,23 @@
-package tui
-
 // 真机判据：**只在 CLICHAT_LIVE_PW 有值时跑**（CI 里没有这个变量，会 Skip）。
 //
-//	CLICHAT_LIVE_PW=<主密码> go test ./internal/<pkg>/ -run TestLive -v
+//	CLICHAT_LIVE_PW=<主密码> go test ./internal/tui/ -run TestLive -v
 //
-// 为什么需要它们：有一类 bug **只在真实服务端上出现** —— 进程内那个假服务端
-// （go-imap 的 memory 后端）造不出真实服务商的取舍。实测过的三个：
+// 它守的是**后端那条转换链**（mail.CleanBody → HTMLToMarkdown → 渲染），
+// 而不是界面本身：把真实邮箱里**每一封**的正文都过一遍，看有没有哪一封会让
+// 转换或渲染崩掉。
 //
-//   - 网易 126 的 ENVELOPE 不给 Message-ID（196 封里有 13 封），而原始头里有
-//     （见 mail.applyRawHeaders）；
-//   - 126 登录后必须先发 ID 命令，否则 EXAMINE 回「Unsafe Login」；
-//   - 真实 HTML 邮件里 `<center>` 之类两边白名单都不认的元素会把渲染器
-//     带进互相递归（见 htmlmd.go 的 node/inlineNode）。
+// 为什么非要有这一条：真实 HTML 邮件里有一种东西**只有真邮箱里才有** ——
+// `<center>` 之类「生成端和渲染端白名单都不认」的元素。2026-10-03 就是它把
+// 渲染器带进互相递归、栈溢出（fatal error，recover 抓不到），用户看到的
+// 是「打开这封邮件，程序刷屏退出」。构造出来的用例能覆盖已知的那几种，
+// 但**只有真邮箱能证明它真的会发生**。
 //
-// 这三类在端到端测试里永远不会出现，所以只能对真邮箱跑一遍。
-//
-// ⚠️ **只读**：EXAMINE + BODY.PEEK。不要在这里调 MarkRead / Delete / Send ——
-// 那是对用户真实邮箱的写操作。主密码从环境变量来，不写进任何文件。
+// ⚠️ **只读**：EXAMINE + BODY.PEEK。刻意**不走 enterThread** —— 那条路会调
+// app.MarkRead，对真实邮箱是写操作，扫一遍就把人家整个收件箱标成已读了。
+// 主密码从环境变量来，不写进任何文件。
+package tui
 
 import (
-	"fmt"
 	"os"
 	"runtime/debug"
 	"testing"
@@ -29,15 +27,10 @@ import (
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 )
 
-// 真机探针：只在 CLICHAT_LIVE_PW 有值时跑（CI 里没有这个变量，会跳过）。
-//
-// ⚠️ **刻意不走 enterThread。** 那条路会调 app.MarkRead —— 对真实邮箱
-// 是**写操作**，扫一遍 277 个会话就把人家整个收件箱标成已读了。
-// 这里只驱动渲染路径：activeID + bodies + View()，全是只读的。
 func TestLive(t *testing.T) {
 	pw := os.Getenv("CLICHAT_LIVE_PW")
 	if pw == "" {
-		t.Skip("没有 CLICHAT_LIVE_PW，跳过真机探针")
+		t.Skip("没有 CLICHAT_LIVE_PW，跳过真机判据")
 	}
 
 	cfg, err := config.Load()
@@ -56,12 +49,11 @@ func TestLive(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = m.app.Close() })
 
-	// ---- 1. 同步 ----
 	changed, err := m.app.Sync()
 	m, _ = update(m, syncResultMsg{changed: changed, err: err})
 	t.Logf("同步完成：changed=%v err=%v，会话 %d 个", changed, err, len(m.visible))
 
-	// ---- 2. 列表渲染 + 摘要链（自环就在这里）----
+	// 列表本身也要能画（回退之后这一屏是别人的代码，但崩了同样是我们的锅）。
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -71,35 +63,6 @@ func TestLive(t *testing.T) {
 		_ = m.View()
 	}()
 
-	for round := 0; ; round++ {
-		if round > 60 {
-			t.Errorf("摘要链跑了 60 轮还没停 —— 自环（每轮都在重复要同一批）")
-			break
-		}
-		cmd := m.previewsCmd()
-		if cmd == nil {
-			t.Logf("摘要链 %d 轮后停下", round)
-			break
-		}
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Errorf("摘要第 %d 轮 panic：%v\n%s", round, r, debug.Stack())
-				}
-			}()
-			m = runCmd(t, m, cmd)
-		}()
-	}
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Errorf("拉完摘要后列表视图 panic：%v\n%s", r, debug.Stack())
-			}
-		}()
-		_ = m.View()
-	}()
-
-	// ---- 3. 逐个会话打开渲染（刷屏退出的元凶在这里）----
 	ids := make([]string, 0, len(m.visible))
 	for _, th := range m.visible {
 		ids = append(ids, th.ID)
@@ -120,13 +83,6 @@ func TestLive(t *testing.T) {
 				}
 			}()
 
-			m.mode = modeList
-			for i, v := range m.visible {
-				if v.ID == id {
-					m.cursor = i
-					break
-				}
-			}
 			m.activeID = th.ID
 			m.mode = modeChat
 			m.scroll = 0
@@ -137,11 +93,6 @@ func TestLive(t *testing.T) {
 			}
 			m.bodies = bodies
 			_ = m.View()
-			// 会话内滚动（只用不会触发网络写操作的键）
-			for _, k := range []string{"pgup", "pgdown", "up", "down"} {
-				m, _ = update(m, keyMsg(k))
-				_ = m.View()
-			}
 		}()
 		if n%40 == 39 {
 			t.Logf("已扫 %d/%d 个会话，panic %d，正文失败 %d", n+1, len(ids), panics, bodyFail)
@@ -151,5 +102,4 @@ func TestLive(t *testing.T) {
 	if panics > 0 {
 		t.Errorf("%d 个会话渲染时 panic", panics)
 	}
-	_ = fmt.Sprint()
 }

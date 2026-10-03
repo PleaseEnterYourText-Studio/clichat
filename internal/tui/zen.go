@@ -533,33 +533,14 @@ func (m Model) viewZenHome() string {
 	}
 
 	// 提示单独钉在底部，不参与上面那块居中 —— 否则它一出现整块就会往上跳。
-	lines = m.zenAppendFooter(lines, f)
+	if status := m.renderZenStatus(f.contentW); status != "" {
+		for len(lines) < m.height-1 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, f.indent(status))
+	}
 
 	return f.fit(lines, m.height)
-}
-
-// zenAppendFooter 把「状态 + 那一格出路」钉在屏幕最后一行。
-//
-// 三屏共用，因为它们共用同一个页脚位置。上一版只有首页做了这件事
-// （`for len(lines) < m.height-1`），列表和会话屏随内容浮动 —— 结果是
-// 「底部提示」在三个屏上落在三个不同的行上，而这一版它上面还多了一格
-// 能点的按钮：位置一浮动，就变成「这一屏的出路在这儿，那一屏的在那儿」。
-//
-// 少了这一钉还有个更细的问题：**页脚只要跟着状态文字的有无上下跳**。
-// Zen 平时没有状态（见 renderZenStatus：它只在真的有事时才说话），
-// 于是"出路"平时根本不在屏幕上，只有出错的时候才冒出来 —— 恰好是最需要
-// 它的时候看不见。
-func (m Model) zenAppendFooter(lines []string, f zenFrame) []string {
-	for len(lines) < m.height-1 {
-		lines = append(lines, "")
-	}
-	return append(lines, f.indent(m.renderZenFooter(f.contentW)))
-}
-
-// renderZenFooter 是 Zen 页脚那一行：左边状态（有才画），右边动作栏。
-func (m Model) renderZenFooter(contentW int) string {
-	room := m.actionRoom(contentW)
-	return m.withActions(m.renderZenStatus(room), contentW)
 }
 
 // viewZenList 是会话列表。
@@ -581,28 +562,26 @@ func (m Model) viewZenList() string {
 		return f.fit(lines, m.height)
 	}
 
-	// 正文区能放几行：扣掉上面 3 行（空行 / 标题 / 空行）和底下那一行页脚。
-	room := m.zenListRoom()
+	// 正文区能放几行：扣掉上面 3 行和底部 2 行（空行 + 提示）。
+	room := m.height - 5
+	if room < 1 {
+		room = 1
+	}
 	top := m.zenListTop(room)
 
-	for i := top; i < len(m.visible) && len(lines) < m.height-1; i++ {
+	for i := top; i < len(m.visible) && len(lines) < m.height-2; i++ {
 		th := m.visible[i]
 		selected := i == m.cursor
 
-		// 一行装下「谁 · 现在讲到哪儿」。
+		// 一行装下「谁 · 在聊什么」。
 		//
-		// Normal 的列表是两行（名字一行、副行一行），这里压成一行：Zen 的
-		// 列表是「挑一个进去读」，不是「逐个核对」。但后半句不能省 —— 只写
+		// Normal 的列表是两行（名字一行、主题一行），这里压成一行：Zen 的
+		// 列表是「挑一个进去读」，不是「逐个核对」。但主题不能省 —— 只写
 		// 参与者的话，一眼扫过去根本不知道哪个会话是哪个（实测截图里
 		// 十条全是人名，等于没有信息）。
-		//
-		// 后半句走的是和 Normal 副行**同一个** listSubLine（最新一条的正文
-		// 摘要，拉不到才退回主题）。两套版式在「列表上写什么」这件事上
-		// 只该有一个答案 —— 各写一套的话，同一个会话在两边会显示两句话，
-		// 按 F2 来回切一次就能看见，而用户没有任何依据判断哪边是对的。
 		label := threadTitle(th)
-		if sub := m.listSubLine(th); sub != "" {
-			label += " · " + sub
+		if th.Subject != "" {
+			label += " · " + th.Subject
 		}
 
 		if !selected && th.Unread == 0 {
@@ -622,39 +601,11 @@ func (m Model) viewZenList() string {
 		lines = append(lines, f.indent(style.Render(truncate(marker+label, f.contentW))))
 	}
 
-	lines = m.zenAppendFooter(lines, f)
+	if status := m.renderZenStatus(f.contentW); status != "" {
+		lines = append(lines, "")
+		lines = append(lines, f.indent(status))
+	}
 	return f.fit(lines, m.height)
-}
-
-// zenListHeadRows 是列表里「条目之前」那几行：空行 / 「会话」标题 / 空行。
-//
-// 渲染和鼠标命中**共用这一个数**：各写一个 3 的话，改版式（比如把标题
-// 挪个位置）时只会改一处，表现是「点的位置和选中的条目差一行」。
-const zenListHeadRows = 3
-
-// zenListRoom 是列表一次能放下几条。
-//
-// 页脚恒占最后一行，所以条目能用到的是它上面的那些行。
-func (m Model) zenListRoom() int {
-	room := m.height - zenListHeadRows - 1
-	if room < 1 {
-		room = 1
-	}
-	return room
-}
-
-// zenListRowAt 把列表里一行的屏幕行号换算成会话下标。
-func (m Model) zenListRowAt(y int) (int, bool) {
-	room := m.zenListRoom()
-	j := y - zenListHeadRows
-	if j < 0 || j >= room {
-		return 0, false
-	}
-	idx := m.zenListTop(room) + j
-	if idx < 0 || idx >= len(m.visible) {
-		return 0, false
-	}
-	return idx, true
 }
 
 // zenListTop 是列表当前该从第几条开始画（跟随光标滚动）。
@@ -681,6 +632,7 @@ func (m Model) zenListTop(room int) int {
 func (m Model) viewZenChat() string {
 	f := m.zenFrame()
 
+	status := m.renderZenStatus(f.contentW)
 	// 可见行数走 chatViewport()，和 maxChatScroll / chatPageStep 用的是
 	// 同一个数 —— 各算一遍迟早对不上，表现是「滚到底还差半行」。
 	msgH := m.chatViewport()
@@ -720,9 +672,9 @@ func (m Model) viewZenChat() string {
 	lines = append(lines, f.indent(zenRule.Render(strings.Repeat("─", f.contentW))))
 	lines = append(lines, "")
 	lines = append(lines, f.indent(m.input.View()))
-
-	// 页脚自己钉在最后一行，和另外两屏同一个位置。
-	lines = m.zenAppendFooter(lines, f)
+	if status != "" {
+		lines = append(lines, f.indent(status))
+	}
 
 	return f.fit(lines, m.height)
 }
@@ -814,16 +766,7 @@ func (m Model) renderZenItem(it zenItem, body []string, width int) []string {
 	out := make([]string, 0, len(body)+3)
 
 	if it.GroupStart {
-		// 时间走 shortTime 那条降精度梯子（今天给时分、昨天 / 月日 / 年月），
-		// 和左侧列表用的是同一条规则。
-		//
-		// 上一版这里写死 `Format("15:04")`：一条三天前的消息显示 `02:25`，
-		// 看着像今天凌晨发的。别处都能省，这一处不能 —— 消息头是独立一行，
-		// 没有任何上下文能纠正它。
-		head := it.Sender
-		if stamp := shortTime(it.Time); stamp != "" {
-			head += " · " + stamp
-		}
+		head := it.Sender + " · " + it.Time.Local().Format("15:04")
 		if it.HTML {
 			// HTML 标记留着。它是「为什么这段排版和邮件原文不一样」的
 			// 答案，属于内容来源，不是界面装饰 —— 去掉了用户看到排版差异
@@ -869,59 +812,6 @@ func (m Model) renderZenStatus(contentW int) string {
 		return zenFaint.Render(truncate(zenHintFor(m.zenScreen), contentW))
 	}
 	return ""
-}
-
-// handleZenMouse 处理 Zen 里的鼠标。
-//
-// ⚠️ **只做屏幕上看得出反应的事。** 通用的 handleMouse / hitWheel 走的是
-// Normal 那套几何（左四分之一归列表栏、底部三行归输入区区），在 Zen 里
-// 拿它去判会挪动一个**看不见的**光标 —— 屏幕纹丝不动、底下却变了，
-// 正是 handleWheel 的注释里点名要避免的那种怪事。Zen 的版面简单到可以
-// 只手接两条规则：滚轮滚当前这一屏，左键只认列表里的条目。
-//
-// 页脚那一格不在这里 —— 它在 handleMouse 的最前面就被接走了，因为
-// 「怎么离开这一屏」对所有界面都是同一件事。
-func (m Model) handleZenMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		return m.zenWheel(1)
-	case tea.MouseButtonWheelDown:
-		return m.zenWheel(-1)
-
-	case tea.MouseButtonLeft:
-		// 首页只有一个输入框，会话屏的正文点哪儿都没有对应动作 ——
-		// 这两屏点空白处什么也不做。列表不一样：那是一排「挑一个进去读」，
-		// 点一条就该进去，否则鼠标用户到了这一屏就只能再去找键盘。
-		if m.zenScreen != zenList {
-			return m, nil
-		}
-		idx, ok := m.zenListRowAt(msg.Y)
-		if !ok {
-			return m, nil
-		}
-		m.cursor = idx
-		m.clampCursor()
-		// ⚠️ 走回车那条路，不在这里重写一遍「打开」。
-		//
-		// 打开一条会话除了 enterThread 还要把 zenScreen 切到会话屏
-		// （`goZen(zenChat)`，见 handleZenListKey），抄漏那一步的表现是
-		// 「点了没反应，只有行首那个 › 跳了一下」—— 一个看起来像卡住的界面。
-		// 和 runAction 转发给按键处理函数是同一条规矩。
-		return m.handleZenListKey(enterKey())
-	}
-	return m, nil
-}
-
-// zenWheel 是 Zen 里的一次滚轮，up>0 表示向上滚。
-func (m Model) zenWheel(up int) (tea.Model, tea.Cmd) {
-	switch m.zenScreen {
-	case zenList:
-		m.moveCursor(-up)
-	case zenChat:
-		m.scrollChat(up * wheelStep)
-	}
-	// 首页不接管：那一屏只有一个输入框，滚轮没有任何对应得上动作。
-	return m, nil
 }
 
 // ---- 按键 ----

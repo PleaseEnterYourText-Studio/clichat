@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -69,64 +68,7 @@ func newFeatureModel(t *testing.T) (Model, *mail.Fake) {
 	m := NewWithApp(cfg, app.New(cfg, fake, idx))
 	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = syncOnce(t, m)
-	// 开机时那条「拉文件夹列表」的命令也要跑一遍。左侧导航里的「已发送 /
-	// 已删除」用的是规范名，得靠这份列表解析成服务端上真实的写法；夹具里
-	// 少了这一步，导航就会指着一个不存在的文件夹，点进去永远是空的 ——
-	// 而这正是启动时该发生的事（见 Model.Init）。
-	m = runCmd(t, m, m.foldersCmd(false))
 	return m, fake
-}
-
-// manyThreadsModel 造一个有 n 条会话的模型。
-//
-// 默认夹具只有 3 条，测不出「标签页放不下」那一类情况 —— 那才是标签行
-// 里真正容易错的地方（窗口往哪边滚、当前标签会不会被滚出屏幕）。
-//
-// ⚠️ 对方名字**刻意取得长**（「项目经理 0 号」，13 列）。
-//
-// 不是凑数：标签格子宽 = 名字宽 + 2，而删掉那条常驻导航列之后，最窄的
-// 双栏终端（96 列）也有 69 列的正文栏 —— 名字叫 "Peer0" 的话 8 个标签
-// 才 63 列，**放得下**，「放不下时窗口往哪滚」那段代码一行都走不到，
-// 判据却一直是绿的（正是 TestTabs_WindowFollowsActiveThread 报过的
-// 「前提不成立」）。名字长到接近 tabLabelMax 才是有代表性的情况。
-func manyThreadsModel(t *testing.T, n int) Model {
-	t.Helper()
-
-	cfg := testConfig(t)
-	cfg.Account.Email = "me@example.com"
-	cfg.Account.DisplayName = "我"
-	cfg.IMAP.Host = "imap.example.com"
-	cfg.SMTP.Host = "smtp.example.com"
-	cfg.Sync.InitialDays = 0
-
-	now := time.Now()
-	fake := mail.NewFake()
-	for i := 0; i < n; i++ {
-		// 全部标成 Seen。开着会话会把那条**标成已读**，而已读的会被分区
-		// 到列表后半段 —— 一路 Ctrl+↓ 开下去的话，光标每开一个就被底下的
-		// 重排撞一下，走出来的是一条乱序且会重复的路线。预置成已读，
-		// 列表从头到尾就是一个稳定的组，标签的打开顺序才可预期。
-		fake.AddMessage("INBOX", mail.Header{
-			MessageID: fmt.Sprintf("<many%d@x>", i),
-			From:      fmt.Sprintf("peer%d@example.com", i),
-			FromName:  fmt.Sprintf("项目经理 %d 号", i),
-			To:        []string{"me@example.com"},
-			Subject:   fmt.Sprintf("会话 %d", i),
-			Date:      now.Add(time.Duration(-i) * time.Hour),
-			Seen:      true,
-		}, fmt.Sprintf("第 %d 句", i))
-	}
-
-	idx, err := store.Open(filepath.Join(t.TempDir(), "index.json"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-
-	m := NewWithApp(cfg, app.New(cfg, fake, idx))
-	m, _ = update(m, tea.WindowSizeMsg{Width: 100, Height: 30})
-	m = syncOnce(t, m)
-	m = runCmd(t, m, m.foldersCmd(false))
-	return m
 }
 
 // runCmd 执行一个 tea.Cmd 并把结果喂回模型。
@@ -161,12 +103,6 @@ func TestHelp_DocumentsCoreActions(t *testing.T) {
 		"ctrl+y", "ctrl+u", "ctrl+t", "ctrl+d",
 		"f1",
 		"上一个", "下一个",
-		// 空间布局那一轮加的东西：不写进帮助页，用户就不知道它们存在。
-		//
-		// 这里原来要求的是 "侧栏"，而侧栏已经去掉了（文件夹不占一栏，改成
-		// 按需弹出）—— 留着它就成了「帮助页里必须提到一个界面上不存在的
-		// 东西」，而且会在改掉那句过时文案时变成假红。
-		"ctrl+g", "两栏", "标签页", "滚轮",
 	}
 	for _, want := range required {
 		if !strings.Contains(help, strings.ToLower(want)) {
@@ -244,11 +180,6 @@ func TestHelp_LinesFitWidth(t *testing.T) {
 //
 // 这就是本次改动的起因：功能早就有了，界面上却一个字都不提，
 // 用户只能靠猜。判据落在「有没有提示」上，不绑具体文案。
-//
-// ⚠️ 期望的键里原本有「文件夹」（Tab 那个选择器）。它已经从这一行里删掉了：
-// 双栏最窄的终端（96 列）减掉侧栏只剩 82 列，而带 Tab 的版本要 90 列 ——
-// 末尾那个「q 退出」**从来没显示出来过**。所以这里换成断言「退出」，
-// 它正是被截掉的那一个，留着当哨兵。见 help.go 里 hintKeys 的说明。
 func TestListMode_ShowsShortcutHints(t *testing.T) {
 	m, _ := newFeatureModel(t)
 	if m.mode != modeList {
@@ -256,7 +187,7 @@ func TestListMode_ShowsShortcutHints(t *testing.T) {
 	}
 
 	view := m.View()
-	for _, want := range []string{"帮助", "新建", "搜索", "退出"} {
+	for _, want := range []string{"帮助", "新建", "搜索", "文件夹"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("列表底部提示里没有 %q:\n%s", want, view)
 		}
@@ -332,10 +263,9 @@ func TestFolderPicker_FiltersList(t *testing.T) {
 	if m.mode != modeFolder {
 		t.Fatalf("Tab 应该打开文件夹选择器, mode=%v", m.mode)
 	}
-	// 选项就是左栏原来那四个固定入口，光标从「全部」起步。
-	items := m.folderPickerItems()
-	if len(items) != 4 || items[0].folder != "" || items[0].label != "全部" {
-		t.Fatalf("选项不对: %+v", items)
+	// 选项是 ["", INBOX, Sent, Trash]，光标从「全部」起步。
+	if got := m.folderChoices(); len(got) != 4 || got[0] != "" {
+		t.Fatalf("选项不对: %v", got)
 	}
 
 	m, _ = update(m, keyMsg("down"))
@@ -351,56 +281,8 @@ func TestFolderPicker_FiltersList(t *testing.T) {
 		t.Errorf("INBOX 里应该有 2 个会话, 实际 %d（总共 %d）", len(m.visible), all)
 	}
 	// 标题上必须写明当前在哪个文件夹，否则用户会以为邮件丢了。
-	//
-	// 绑的是**标签**（「收件箱」）而不是服务端真名 INBOX：文件夹那一列被
-	// 删掉之后，这一行是用户唯一能确认「我在哪儿」的地方，而 INBOX 这种
-	// 机器名对他没有意义。
-	if !strings.Contains(m.View(), "收件箱") {
+	if !strings.Contains(m.View(), "INBOX") {
 		t.Error("列表标题没显示当前文件夹")
-	}
-}
-
-// 选择器里的每一项都要带未读计数。
-//
-// 这是它接替左栏导航之后唯一会丢的东西（那一列上每项右边都有一个数字）。
-// 选文件夹时想知道的就是「那边还有几封没读」，丢了的话选择器就退化成
-// 一串光秃秃的名字。
-func TestFolderPicker_ShowsUnreadCounts(t *testing.T) {
-	m, _ := newFeatureModel(t)
-
-	// 夹具里 INBOX 有一个未读；先确认这一点，否则下面的判据是空转的。
-	byFolder := map[string]int{}
-	for _, it := range m.folderPickerItems() {
-		byFolder[it.folder] = it.unread
-	}
-	if byFolder["INBOX"] == 0 {
-		t.Fatalf("前提不成立：夹具里 INBOX 该有一个未读，实际 %v", byFolder)
-	}
-
-	m, cmd := update(m, keyMsg("tab"))
-	m = runCmd(t, m, cmd)
-
-	// 量**画出来的那几行**，不是结构体里的字段 —— 数字在字段里而没画出来
-	// 正是这条判据要挡的东西。
-	view := plainText(m.View())
-	for _, it := range m.folderPickerItems() {
-		if it.unread == 0 {
-			continue
-		}
-		line := ""
-		for _, l := range strings.Split(view, "\n") {
-			if strings.Contains(l, it.label) {
-				line = l
-				break
-			}
-		}
-		if line == "" {
-			t.Errorf("选择器里找不到 %q 那一行", it.label)
-			continue
-		}
-		if !strings.Contains(line, fmt.Sprint(it.unread)) {
-			t.Errorf("%q 那一行没画未读数 %d：%q", it.label, it.unread, line)
-		}
 	}
 }
 
@@ -493,14 +375,8 @@ func TestStar_TogglesAndShowsMarker(t *testing.T) {
 		t.Error("星标没生效")
 	}
 	// 列表上要看得见，否则用户不知道按了有没有用。
-	//
-	// 两处刻意的地方：绑 starMark 常量而不是写死字符（上一版写死的是 "★"，
-	// 而那个字符在 Windows 上会走 emoji 回退、被换成 "*" —— 于是判据成了
-	// 假红，见 styles.go 里那条规矩）；以及在**那一行**上找，不在整个 View
-	// 上找 —— 底部提示里也印着 "*"，整个 View 上找的话按不按都绿。
-	row := listRowOf(t, m, threadTitle(m.visible[0]))
-	if !strings.Contains(row, starMark) {
-		t.Errorf("星标没画在这条会话的行上：%q", plainText(row))
+	if !strings.Contains(m.View(), "★") {
+		t.Error("列表里没有星标标记")
 	}
 
 	m, cmd = update(m, keyMsg("*"))
@@ -515,89 +391,29 @@ func TestStar_TogglesAndShowsMarker(t *testing.T) {
 func TestUnread_MarksFromList(t *testing.T) {
 	m, _ := newFeatureModel(t)
 
-	// 挑一条**已读**的会话来标记：列表按未读排在前面分组，所以「第 0 个」
-	// 一定是未读的那条，不再是以前那个「Sent 里最新的一条」。
-	// 位置也不能拿来断言（标记完它会被挪走），只认主题。
-	idx := -1
-	for i, th := range m.visible {
-		if th.Unread == 0 {
-			idx = i
-			break
-		}
+	// 光标在第 0 个（Sent 里那条，本来就是已读）。
+	if m.visible[0].Unread != 0 {
+		t.Fatalf("前提不成立：Unread=%d", m.visible[0].Unread)
 	}
-	if idx < 0 {
-		t.Fatal("前提不成立：列表里一条已读的都没有")
-	}
-	m.cursor = idx
-	victim := m.visible[idx].Subject
 
 	m, cmd := update(m, keyMsg("u"))
 	m = runCmd(t, m, cmd)
 
-	got, ok := threadBySubject(m.visible, victim)
-	if !ok {
-		t.Fatalf("标记未读之后 %q 不见了", victim)
+	if m.visible[0].Unread != 1 {
+		t.Errorf("标记未读没生效, Unread=%d", m.visible[0].Unread)
 	}
-	if got.Unread != 1 {
-		t.Errorf("标记未读没生效, %q 的 Unread=%d", victim, got.Unread)
-	}
-}
-
-// threadBySubject 按主题在列表里找一条会话。
-//
-// 按主题而不是按下标：列表会随着未读状态重排（未读浮到前面），
-// 任何「第 N 条」的断言在这次重排之后量的都是另一条会话。
-func threadBySubject(list []thread.Thread, subject string) (thread.Thread, bool) {
-	for _, th := range list {
-		if th.Subject == subject {
-			return th, true
-		}
-	}
-	return thread.Thread{}, false
-}
-
-// listRowOf 从**画出来的列表**里挑出含某段文字的那一行（带样式，原样）。
-//
-// 找的是列表栏自己的渲染结果，不是整幅 View：主题文字在会话流的标题行上
-// 也会出现一次，在整幅里找会挑到错的那一行。
-func listRowOf(t *testing.T, m Model, want string) string {
-	t.Helper()
-	for _, ln := range strings.Split(m.renderThreadList(m.listWidth(), m.bodyHeight()), "\n") {
-		if strings.Contains(plainText(ln), want) {
-			return ln
-		}
-	}
-	t.Fatalf("列表里没有含 %q 的行", want)
-	return ""
 }
 
 func TestNextUnread_JumpsToUnread(t *testing.T) {
 	m, _ := newFeatureModel(t)
 
-	// 起点自己挑一条**已读**的：光标初始位置本来就是未读的话，按 ] 只是
-	// 原地不动，量不出「它会跳」。
-	//
-	// ⚠️ 不能靠「末尾那条是已读的」这种间接前提 —— 那成立过是因为未读
-	// 被排到了前面（groupUnreadFirst），而顺序已经改成稳定时间序了。
-	// 靠顺序的判据会在顺序调整时变成「前提不成立」的空转。
-	start := -1
-	for i, th := range m.visible {
-		if th.Unread == 0 {
-			start = i
-			break
-		}
+	if m.visible[m.cursor].Unread != 0 {
+		t.Fatal("前提不成立：起点应该是已读的")
 	}
-	if start < 0 {
-		t.Fatal("前提不成立：列表里没有已读会话")
-	}
-	m.cursor = start
 
 	m, _ = update(m, keyMsg("]"))
-	if m.cursor == start {
-		t.Fatalf("] 之后光标没动（还停在 %d）—— 从已读出发就该跳到未读上", start)
-	}
-	if got := m.visible[m.cursor]; got.Unread == 0 {
-		t.Errorf("] 应该跳到未读会话上，实际停在 %q（已读）", got.Subject)
+	if m.visible[m.cursor].Unread == 0 {
+		t.Errorf("] 应该跳到未读会话上，实际停在 %q", m.visible[m.cursor].Subject)
 	}
 }
 
