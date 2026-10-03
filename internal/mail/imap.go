@@ -271,6 +271,10 @@ func headerFromMessage(msg *imap.Message, folder string, section *imap.BodySecti
 // 两个字段（见 headerSection）。
 //
 // References 只从原始头取 —— ENVELOPE 里根本没有这一项。
+//
+// clichat 的身份信息也在这里取：它是个自定义头，ENVELOPE 里同样没有。
+// 解不出来就是 nil ——「这封不是 clichat 发的」和「头被中间环节弄坏了」
+// 在这里是同一件事，都退回普通邮件处理，不报错（见 DecodeChatMeta）。
 func applyRawHeaders(h *Header, raw string) {
 	h.References = ParseReferences(headerValue(raw, "References"))
 	if v := strings.TrimSpace(headerValue(raw, "Message-ID")); v != "" {
@@ -279,6 +283,7 @@ func applyRawHeaders(h *Header, raw string) {
 	if v := strings.TrimSpace(headerValue(raw, "In-Reply-To")); v != "" {
 		h.InReplyTo = v
 	}
+	h.Clichat = DecodeChatMeta(headerValue(raw, ChatMetaHeader))
 }
 
 // Bodies 批量拉取一个文件夹里若干封邮件的正文。
@@ -534,19 +539,25 @@ func addressesOf(addrs []*imap.Address) []string {
 //     完整头部（甚至正文）拉下来，在几千封的邮箱上是灾难。
 //
 // Envelope 已经给了 From / To / Cc / Subject / Date / Message-ID /
-// In-Reply-To，唯独 References 不在里面，所以只需要补这一个。
+// In-Reply-To，剩下的都得自己点名要。
+//
+// 每多要一个字段都是在**每一封**邮件上加字节，所以这里只列真的有人读的：
+//
+//   - References 用来串会话（ENVELOPE 里根本没有这一项）；
+//   - Message-ID / In-Reply-To 用来去重和挂引用链。这俩不能只靠
+//     ENVELOPE，见 headerFromMessage 的注释：实测 126 的收件箱里 196 封
+//     有 13 封的 ENVELOPE 没有 Message-ID；
+//   - X-Clichat-Meta 是 clichat 之间的身份信息。它列在这里而不是等打开
+//     会话时再从正文里取，是为了让**列表**能认出「这个会话里有 clichat
+//     消息」而不必把每封正文都拉一遍 —— 完整理由见 chatmeta.go 的
+//     ChatMetaHeader 注释（那里也写了它的代价）。
 func headerSection() *imap.BodySectionName {
 	return &imap.BodySectionName{
 		// Specifier 挂在嵌入的 BodyPartName 上，不能用提升字段名
 		// 直接在 BodySectionName 字面量里初始化。
 		BodyPartName: imap.BodyPartName{
 			Specifier: imap.HeaderSpecifier,
-			// References 用来串会话；Message-ID / In-Reply-To 用来**去重**。
-			//
-			// ⚠️ 这两个不能只靠 ENVELOPE 拿，见 headerFromMessage 的注释：
-			// 实测 126 的收件箱里 196 封有 13 封的 ENVELOPE 没有 Message-ID。
-			// 多要两个字段的代价接近零 —— 这一段头**本来就要取**。
-			Fields: []string{"References", "Message-ID", "In-Reply-To"},
+			Fields:    []string{"References", "Message-ID", "In-Reply-To", ChatMetaHeader},
 		},
 		Peek: true,
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/oauth"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 
 	"github.com/emersion/go-message/charset"
 )
@@ -69,7 +70,8 @@ func (c *liveClient) Send(msg Outgoing) (string, error) {
 		}
 	}
 
-	raw, msgID, err := BuildMessage(c.cfg.Account.DisplayName, c.auth.User, msg)
+	raw, msgID, err := BuildMessage(c.cfg.Account.DisplayName, c.auth.User, msg,
+		chatIdentityOf(c.cfg))
 	if err != nil {
 		return "", err
 	}
@@ -148,7 +150,14 @@ func dialSMTP(ep config.Endpoint) (*smtp.Client, error) {
 //
 // 第二个返回值是生成的 Message-ID。调用方需要它做两件事：
 // 和 Sent 文件夹里的副本对上（去重），以及作为后续回复的 In-Reply-To。
-func BuildMessage(displayName, from string, msg Outgoing) ([]byte, string, error) {
+//
+// me 是发信人自己的身份卡（见 chatIdentityOf），会写进 X-Clichat-Meta
+// 头。它和 displayName / from 属于同一类东西 —— 都是「关于发信人」的，
+// 所以并排当参数传，而不是塞进 msg：Outgoing 里全是**这一封信**的内容，
+// 身份不是内容的一部分。
+//
+// me.Version 为空时不会写出那个头，这封信在对方那里就是普通邮件。
+func BuildMessage(displayName, from string, msg Outgoing, me thread.ClichatMeta) ([]byte, string, error) {
 	msgID := GenerateMessageID(from)
 
 	var buf bytes.Buffer
@@ -177,6 +186,16 @@ func BuildMessage(displayName, from string, msg Outgoing) ([]byte, string, error
 	write("Content-Type", `text/plain; charset="utf-8"`)
 	write("Content-Transfer-Encoding", "quoted-printable")
 	write("X-Mailer", "clichat")
+
+	// clichat 之间的身份信息。挨着 X-Mailer 放：读起来也是「关于这个
+	// 客户端」的一类信息。
+	//
+	// ⚠️ 这一行**不能**走上面的 write()：那个函数会把值里的换行压成空格
+	// （见 SanitizeHeaderValue），而 foldHeaderValue 折出来的多行正是靠
+	// 换行成立的。
+	if meta := EncodeChatMeta(me); meta != "" {
+		buf.WriteString(foldHeaderValue(ChatMetaHeader, meta))
+	}
 	buf.WriteString("\r\n")
 
 	qp := quotedprintable.NewWriter(&buf)

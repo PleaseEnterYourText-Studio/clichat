@@ -6,6 +6,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
 // 终端宽度低于这个值就从两栏降级成单栏。
@@ -29,6 +31,13 @@ var (
 	// 不是状态、更不是警告，亮起来会跟发件人名字抢注意力。灰色却仍然
 	// 看得见，足够了。
 	styleTag = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	// styleChatTag 是消息头上那个「clichat」标记。
+	//
+	// 和 styleTag 同为只读说明，但不共用颜色：这两个标记回答的是两件
+	// 不同的事（「排版被重排过」vs「对面也是这个客户端」），一眼要能分开。
+	// 用 141 而不是更亮的色 —— 名字本身已经按发件人上色，标记再抢就乱了。
+	styleChatTag = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 
 	// styleScrollBar / styleScrollThumb 是会话正文右侧那条滚动条。
 	//
@@ -100,6 +109,54 @@ func senderStyle(addr string) lipgloss.Style {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(addr))
 	return lipgloss.NewStyle().Foreground(senderPalette[int(h.Sum32())%len(senderPalette)])
+}
+
+// chatForeground 把对方随信带来的颜色翻译成终端能画的前景色。
+//
+// 传 nil（这封不是 clichat 发的）或对方没给颜色，都返回空串，调用方
+// 退回默认配色。
+//
+// ⚠️ 合法性**不在这里判** —— 收信那侧已经过了一遍 mail.cleanChatColor，
+// 到这里的值一定是 #rgb / #rrggbb / #rrggbbaa 之一。这里只负责翻译：
+// 终端的前景色没有透明度这个概念，所以八位写法要丢掉后两位，否则
+// termenv 解析不出来，结果是「对方设了颜色却什么都没发生」。
+//
+// 刻意**不**校验对比度：不知道对方终端的底色，也不知道「我」这边是亮底
+// 还是暗底，没有能算的基准（判成「太暗就不显示」反而会把亮底终端上
+// 正常的深色名字误杀）。代价是对方能把名字设成和背景同色 —— 但那只让
+// 人认不出是谁，正文和时间戳还在，骗不了人去做别的。
+func chatForeground(m *thread.ClichatMeta) lipgloss.Color {
+	if m == nil {
+		return ""
+	}
+	s := m.NameColor
+	switch len(s) {
+	case 4, 7: // #rgb / #rrggbb，直接能用
+	case 9: // #rrggbbaa，丢掉 alpha
+		s = s[:7]
+	default:
+		return ""
+	}
+	return lipgloss.Color(s)
+}
+
+// chatNameStyle 是渲染一条消息的发送者名字要用的样式。
+//
+// 优先级：对方带来的 nameColor > 自己的固定色 / 按地址稳定挑的色。
+//
+// nameColor 排最前，因为它的用途就是这个 —— 它跟着 meta 传过来，为的
+// 就是让「我是谁」在别人的屏幕上长得一样。自己发出去的消息也用它：
+// 那才是对方看到的样子，两边不一致的话，用户会以为颜色没生效。
+func chatNameStyle(msg thread.Header, mine bool) lipgloss.Style {
+	if c := chatForeground(msg.Clichat); c != "" {
+		// 自己的名字保持加粗：对齐方向 + 加粗是「这是我说的」的主要线索，
+		// 而颜色是对方挑的，不能假定它一定比对方的名字显眼。
+		return lipgloss.NewStyle().Foreground(c).Bold(mine)
+	}
+	if mine {
+		return styleMine
+	}
+	return senderStyle(msg.From)
 }
 
 // cellWidth 是一个字符在终端里占的列数（纯文本口径）。

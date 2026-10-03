@@ -174,14 +174,26 @@ func (m Model) renderThreadList(width, height int) string {
 			marker = "● "
 		}
 
-		// 星标紧跟在未读标记后面：两个标记的列宽都是两列，
+		// 星标紧跟在未读标记后面：这两个标记的列宽都是两列，
 		// 所以有没有星标都不会让后面的名字错位。
 		star := "  "
 		if th.IsStarred() {
 			star = "★ "
 		}
 
-		title := truncate(marker+star+threadTitle(th), width-2)
+		// clichat 标记再跟在后面，同样占两列。
+		//
+		// 它是**来源**标记，和上面两个（状态标记）不是一类东西，所以
+		// 排在最后、紧挨着名字 —— 读起来是「这几个状态 + 这个人是从
+		// clichat 来的」。用 @ 而不是某个图标：这个字形在任何终端、
+		// 任何 locale 下都恰好一列宽，而图形字符（尤其 East Asian
+		// Ambiguous 那批）在两把宽度尺子下会不一致，名字就会错位。
+		chat := "  "
+		if th.HasClichat() {
+			chat = "@ "
+		}
+
+		title := truncate(marker+star+chat+threadTitle(th), width-2)
 		// 副行是「现在在聊什么」—— 会话里最新一条的主题。一个会话可以
 		// 横跨很多话题，所以它和标题（对方的名字）回答的是两个问题。
 		subject := th.Subject
@@ -216,6 +228,12 @@ func (m Model) listHeader() string {
 	if m.activeFolder != "" {
 		title += " · " + m.activeFolder
 	}
+	// 过滤开着的时候标题里必须写出来：列表变短了却不说为什么，用户会
+	// 以为邮件丢了。这和空列表的提示（emptyListHint）是同一件事的两面
+	// —— 那条解释「为什么一条都没有」，这条解释「为什么少了」。
+	if m.chatOnly {
+		title += " · 只看 clichat"
+	}
 
 	unread := 0
 	for _, th := range m.visible {
@@ -234,6 +252,11 @@ func (m Model) emptyListHint() string {
 	switch {
 	case m.query != "":
 		return "没有匹配「" + m.query + "」的会话"
+	case m.chatOnly:
+		// 这一条排在被文件夹过滤之前：两个都开着的时候，「按 c 就能
+		// 看到别的」是用户下一步真正要做的事，比「这个文件夹是空的」
+		// 有用（而且那个文件夹多半并不空，只是没有 clichat 消息）。
+		return "这里还没有 clichat 消息，按 c 看全部"
 	case m.activeFolder != "":
 		return m.activeFolder + " 里还没有会话"
 	default:
@@ -374,6 +397,42 @@ func (m Model) chatTitle() string {
 	return threadTitle(th)
 }
 
+// chatBadge 是消息头上「这条来自 clichat」的标记文字。
+//
+// 消息头上写完整单词，列表里只用一个 @（见 renderThreadList）：列表里每个
+// 会话只占两行，还挤着未读和星标两个标记，放不下五个字母；而消息头上
+// 有地方写清楚，写清楚就不该让人去猜一个符号的意思。两处指的是同一件事，
+// 帮助页里并排列出。
+//
+// 用完整单词还有个好处：「clichat」在普通邮件里几乎不可能自然出现，
+// 所以判据可以直接断言它出现 / 不出现，不需要造一个不会误伤的样本。
+const chatBadge = "clichat"
+
+// msgTag 是消息头上一个小标记：文字 + 它的样式。
+//
+// 两者放在一起而不是两个平行切片：平行切片的下标一旦对不上（比如只往
+// 一边 append），画出来的就是「HTML」配 clichat 的颜色，而屏幕上错色
+// 很难让人联想到是下标错位。
+//
+// 文字和样式分开仍是要的：宽度必须按**纯文本**算 —— 上色之后
+// lipgloss.Width 才知道真实列宽，而截断必须发生在更早的那一步。
+type msgTag struct {
+	text  string
+	style lipgloss.Style
+}
+
+// renderTags 把若干标记渲染成一行，标记之间留一个空格。
+func renderTags(tags []msgTag) string {
+	var b strings.Builder
+	for i, tag := range tags {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(tag.style.Render(tag.text))
+	}
+	return b.String()
+}
+
 // renderMessage 把一个消息渲染成若干行。
 func (m Model) renderMessage(msg thread.Header, width int) []string {
 	mine := msg.From == m.cfg.Self()
@@ -392,36 +451,53 @@ func (m Model) renderMessage(msg thread.Header, width int) []string {
 		body.Text = "…"
 	}
 
-	// 消息头 = 谁 + 什么时候 [+ HTML 标记]。
+	// 消息头 = 谁 + 什么时候 [+ 标记]。标记排在最后，紧挨着时间。
 	//
-	// 那个标记是「为什么这段排版和邮件原文不一样」的答案：HTML 邮件在
-	// 入库前被转成了 Markdown（见 mail.HTMLToMarkdown），按钮、表格、
-	// 标题都被重排过。没有它的话，用户看到排版差异只会以为是我们
-	// 渲染坏了，然后去提一个查不出来源的 bug。
-	tag := ""
+	// 标记回答的都是「这封和普通邮件有什么不一样」：
+	//
+	//   - HTML：正文排版被重排过（见 mail.HTMLToMarkdown）。按钮、表格、
+	//     标题都动过。没有它的话，用户看到排版差异只会以为是我们渲染坏了，
+	//     然后去提一个查不出来源的 bug。
+	//   - clichat：对面也是用这个客户端发的。这条比「来源」多一点意思 ——
+	//     它同时说明发件人名字的颜色、昵称都是对方**自己设的**（见
+	//     chatNameStyle），而不是我们按地址随机挑的。列表里那个 @ 是它的
+	//     缩略形态（那里放不下五个字母），两处指同一件事。
+	var tags []msgTag
 	if body.HTML {
-		tag = "HTML"
+		tags = append(tags, msgTag{"HTML", styleTag})
+	}
+	if msg.FromClichat() {
+		tags = append(tags, msgTag{chatBadge, styleChatTag})
+	}
+
+	// 标记占的宽度按**纯文本**算：截断必须发生在上色之前（styles.go 里
+	// 那条硬约束），而 textWidth 的契约就是「纯文本的口径」。
+	tagW := 0
+	for _, tag := range tags {
+		if tagW > 0 {
+			tagW++ // 标记之间的那个空格
+		}
+		tagW += textWidth(tag.text)
 	}
 
 	name := displayName(msg, mine) + "  " + msg.Date.Local().Format("15:04")
 	// 先按可用宽度截断**再**上色 —— 反过来的话 lipgloss 会把转义序列
 	// 算进宽度，右边的边框就歪了（styles.go 里那条硬约束）。显示名是
 	// 对方自己写的，长度没有上限，所以这一步不是多余的。
+	//
+	// 标记一起占预算：宁可把名字截短，也不能让标记被挤出画面 ——
+	// 它恰恰在最长的那几个名字（营销邮件、系统通知）上最有用。
 	budget := width - 2
-	if tag != "" {
-		budget -= textWidth(tag) + 1 // +1 是标记前面那个空格
+	if tagW > 0 {
+		budget -= tagW + 1 // +1 是标记前面那个空格
 	}
 	name = truncate(name, budget)
 
-	if mine {
-		name = styleMine.Render(name)
-	} else {
-		name = senderStyle(msg.From).Render(name)
-	}
+	name = chatNameStyle(msg, mine).Render(name)
 
 	head := name
-	if tag != "" {
-		head += " " + styleTag.Render(tag)
+	if tagW > 0 {
+		head += " " + renderTags(tags)
 	}
 
 	out := make([]string, 0, 8)
@@ -659,7 +735,6 @@ func (m Model) renderStatus() string {
 		return styleMuted.Render(line)
 	}
 }
-
 
 // fillPane 把行数补齐到 height，并给每行补足宽度，避免拼栏时错位。
 func fillPane(lines []string, width, height int) string {

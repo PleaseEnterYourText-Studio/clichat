@@ -47,7 +47,12 @@ import (
 	"time"
 )
 
-// Header 是聚合算法需要的最小邮件头部信息。
+// Header 是界面需要用到的邮件头部信息。
+//
+// 名字里那个「聚合算法需要」已经被 Flagged / Clichat 撑破了 —— 它们
+// 不参与聚合，但和其余字段一样属于「这封邮件的元信息」，而元信息在
+// 这个仓库里只有这一处存放点（正文走 mail.Message）。与其为它们另开
+// 一条从 IMAP 到界面的路，不如都挂在这里。
 //
 // 地址字段一律是 **纯地址且已小写规范化**（如 alice@example.com），
 // 显示名单独放在 FromName。解析与规范化由 mail 包负责，
@@ -67,6 +72,56 @@ type Header struct {
 	Seen       bool
 	// Flagged 对应 IMAP 的 \Flagged 标志，界面上呈现为星标。
 	Flagged bool
+
+	// Clichat 是发件人随信带来的客户端身份信息，nil 表示这封邮件
+	// **不是** clichat 发的（普通的邮件客户端、或者网页邮箱）。
+	//
+	// 形状定义在这里而不是 mail 包：thread 不能依赖 mail（是 mail
+	// 依赖 thread），而 Header 是两者的公共面 —— 和上面那堆地址字段
+	// 的归属方式一样。线上格式的唯一权威是 mail/chatmeta.go，那边
+	// 负责把 X-Clichat-Meta 头解成这个结构。
+	Clichat *ClichatMeta
+}
+
+// ClichatMeta 是 clichat 客户端之间互传的身份信息。
+//
+// 它描述的全是**发件人自己**的偏好，所以每个字段都可能为空：对面可能
+// 关掉了设备信息上报，也可能用的是刚装上的默认配置。界面上每个字段
+// 都得有「没有」的呈现方式，不能假定它一定有值。
+//
+// json tag 就是它在 X-Clichat-Meta 头里的字段名（值本身还要再过一层
+// base64，见 mail/chatmeta.go）。用单字母是为了压小载荷 —— 这个头会
+// 跟着**每一封**同步下来的邮件走。
+type ClichatMeta struct {
+	// Version 是发信方的 clichat 版本号，同时充当我们判断
+	// 「这是不是 clichat 消息」的**唯一依据**：它是空的就整个不算数
+	// （见 mail.DecodeChatMeta）。
+	Version   string `json:"v"`
+	Nick      string `json:"n,omitempty"`
+	NameColor string `json:"nc,omitempty"`
+	TextColor string `json:"tc,omitempty"`
+	Device    string `json:"d,omitempty"`
+}
+
+// FromClichat 报告这封邮件是不是 clichat 客户端发出来的。
+//
+// 提供这个方法而不是让调用方各自判 Clichat != nil：「是不是 clichat
+// 消息」的判据只能有一份，否则以后多一种识别方式时必然有一处忘掉。
+func (h Header) FromClichat() bool {
+	return h.Clichat != nil
+}
+
+// Thread 里有没有 clichat 消息。
+//
+// 问的是「至少有一条」：一个会话可能混着 clichat 发的和网页邮箱发的，
+// 列表上要认的是「这个会话里有 clichat 消息」。
+func (t Thread) HasClichat() bool {
+	for _, m := range t.Messages {
+		if m.FromClichat() {
+			return true
+		}
+	}
+	return false
 }
 
 // Thread 是一次聚合产出的会话。

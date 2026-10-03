@@ -117,6 +117,12 @@ type Model struct {
 	// query 是列表的搜索词，空串表示不搜索。
 	query string
 
+	// chatOnly 为真表示列表只显示 clichat 消息（见 filterThreads）。
+	//
+	// 它是**列表级的过滤器**，和 activeFolder / query 并列 —— 三者都
+	// 只影响「显示哪些」，不动底层数据，所以随时可以关掉、不丢东西。
+	chatOnly bool
+
 	// folders 是服务端上真实存在的文件夹名，供切换器用。nil 表示还没拉过。
 	folders      []string
 	folderCursor int
@@ -946,6 +952,20 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.busy = true
 		return m, m.foldersCmd()
 
+	case "c":
+		// 「只看 clichat 消息」开关。
+		//
+		// 不要确认框：这只是**换个看法**，关掉就回来，不丢东西 ——
+		// 和 a（接收全部邮件）不同，那个一打开就要拉几万封的头部，
+		// 是不可逆的代价，所以必须问一句。
+		//
+		// 光标归零：过滤之后原来的下标指向的是另一个会话了，
+		// 停在原地会让「我明明看着第三条」变成打开另一条。
+		m.chatOnly = !m.chatOnly
+		m.refreshVisible()
+		m.cursor = 0
+		m.scroll = 0
+
 	case "r":
 		if m.app != nil {
 			m.busy = true
@@ -1310,9 +1330,9 @@ func (m *Model) setThreads(list []thread.Thread) {
 	m.clampCursor()
 }
 
-// refreshVisible 按当前文件夹与搜索词重算要显示的会话。
+// refreshVisible 按当前文件夹、搜索词与 clichat 过滤重算要显示的会话。
 func (m *Model) refreshVisible() {
-	m.visible = filterThreads(m.threads, m.activeFolder, m.query)
+	m.visible = filterThreads(m.threads, m.activeFolder, m.query, m.chatOnly)
 }
 
 // currentThread 返回光标所在的会话。

@@ -5,6 +5,8 @@ import (
 	"mime/quotedprintable"
 	"strings"
 	"testing"
+
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
 func TestBuildMessage_Structure(t *testing.T) {
@@ -16,7 +18,7 @@ func TestBuildMessage_Structure(t *testing.T) {
 		References: []string{"<a@x>", "<b@x>"},
 	}
 
-	raw, msgID, err := BuildMessage("衡", "me@qq.com", out)
+	raw, msgID, err := BuildMessage("衡", "me@qq.com", out, thread.ClichatMeta{})
 	if err != nil {
 		t.Fatalf("BuildMessage: %v", err)
 	}
@@ -63,7 +65,7 @@ func TestBuildMessage_BlocksHeaderInjection(t *testing.T) {
 		Body:    "x",
 	}
 
-	raw, _, err := BuildMessage("", "me@qq.com", out)
+	raw, _, err := BuildMessage("", "me@qq.com", out, thread.ClichatMeta{})
 	if err != nil {
 		t.Fatalf("BuildMessage: %v", err)
 	}
@@ -88,13 +90,13 @@ func TestBuildMessage_EmptyOptionalHeaders(t *testing.T) {
 		To:      []string{"bob@x.com"},
 		Subject: "hi",
 		Body:    "x",
-	})
+	}, thread.ClichatMeta{})
 	if err != nil {
 		t.Fatalf("BuildMessage: %v", err)
 	}
 
 	head, _, _ := strings.Cut(string(raw), "\r\n\r\n")
-	for _, unwanted := range []string{"Cc:", "In-Reply-To:", "References:"} {
+	for _, unwanted := range []string{"Cc:", "In-Reply-To:", "References:", ChatMetaHeader + ":"} {
 		if strings.Contains(head, unwanted) {
 			t.Errorf("不该出现的空头: %s\n%s", unwanted, head)
 		}

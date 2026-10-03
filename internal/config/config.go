@@ -127,6 +127,35 @@ type Sync struct {
 	AllMail bool `json:"all_mail"`
 }
 
+// Chat 是 clichat 用户之间的身份信息。
+//
+// 它随每一封发出去的信带给对方，放在 X-Clichat-Meta 头里 —— 对方只有
+// 用 clichat 才看得见，普通邮件客户端里连这个头都不显示（见
+// internal/mail/chatmeta.go 的 ChatMetaHeader）。
+type Chat struct {
+	// Nick 是对方看到的昵称。留空时退回当前账号的 DisplayName，
+	// 这样刚装好、什么都没配的人也是可读的（见 chatIdentityOf）。
+	Nick string `json:"nick"`
+
+	// NameColor / TextColor 是「我这边」用的两个颜色，写法是
+	// #rgb / #rrggbb / #rrggbbaa；留空就用默认配色。
+	//
+	// 只认十六进制：这个值要跨机器传，而颜色名表得跟着每台机器的终端
+	// 调色板走，没法保证两边看到的是同一个颜色。非法值会被静默丢弃
+	// （见 mail.cleanChatColor），这在收信那一侧尤其重要 —— 对方发来
+	// 的是一个会画到我终端上的字符串。
+	NameColor string `json:"name_color"`
+	TextColor string `json:"text_color"`
+
+	// HideDevice 为真表示**不**上报设备信息。
+	//
+	// ⚠️ 字段名是反的，这是有意的：默认要「上报」，而这个字段的零值
+	// 必须是「上报」。写成 ShareDevice bool 的话，零值 false 就成了
+	// 「不上报」，于是「升级上来的老配置（没有 chat 段）」和「主动关掉
+	// 的人」会塌成同一种状态 —— 两者本该不同（见 mail.RuntimeDevice）。
+	HideDevice bool `json:"hide_device,omitempty"`
+}
+
 // Profile 是**一个账号**的完整配置。
 //
 // v1 里这三样直接摊在 Config 上（那时只有单账号）。收进一个结构是因为
@@ -208,6 +237,11 @@ type Config struct {
 	SMTP    Endpoint `json:"-"`
 
 	Sync Sync `json:"sync"`
+
+	// Chat 描述的是**我这个人**，不是某个邮箱账号，所以它和 Sync 一样
+	// 挂在 Config 上而不是 Profile 里 —— 用两个邮箱和同一个人聊天时，
+	// 不该出现两个昵称。
+	Chat Chat `json:"chat"`
 
 	path string // config.json 的绝对路径，不参与序列化
 }

@@ -426,31 +426,61 @@ func mkThread(root string, folder string, subject string, peers ...string) threa
 	return th
 }
 
+// mkChatThread 造一个「对方是拿 clichat 发来的」会话。
+//
+// ⚠️ 刻意造**两条**消息，而且只有第一条挂 meta。
+//
+// 现实就是这样：会话第一条来自 clichat，后面对方很可能在网页邮箱里回。
+// 于是「这个会话算不算 clichat 会话」问的必须是「里面**有没有**」，不是
+// 「最后一条是不是」—— 只造一条消息的话，两种实现在测试里长得一模一样，
+// 判据就没在测它声称的那件事（本仓库栽过：夹具顺手满足前提，判据绿了，
+// 绿的理由却不是它主张的规矩）。
+func mkChatThread(root string, folder string, subject string, peers ...string) thread.Thread {
+	th := mkThread(root, folder, subject, peers...)
+	th.Messages[0].Clichat = &thread.ClichatMeta{Version: "1.2.3"}
+	th.Messages = append(th.Messages, thread.Header{
+		MessageID: root + "-later",
+		Folder:    folder,
+		Subject:   "回复：" + subject,
+	})
+	return th
+}
+
 func TestFilterThreads(t *testing.T) {
 	list := []thread.Thread{
-		mkThread("<1>", "INBOX", "会议安排", "alice@example.com"),
+		mkChatThread("<1>", "INBOX", "会议安排", "alice@example.com"),
 		mkThread("<2>", "INBOX", "周末爬山", "bob@example.com"),
 		mkThread("<3>", "Sent", "发出去的", "carol@example.com"),
 	}
 
 	tests := []struct {
-		name   string
-		folder string
-		query  string
-		want   int
+		name     string
+		folder   string
+		query    string
+		chatOnly bool
+		want     int
 	}{
-		{"都不过滤", "", "", 3},
-		{"只按文件夹", "INBOX", "", 2},
-		{"只按搜索词", "", "爬山", 1},
-		{"文件夹 + 搜索词", "INBOX", "alice", 1},
-		{"文件夹和搜索词互斥", "Sent", "alice", 0},
-		{"搜索词大小写不敏感", "", "ALICE", 1},
-		{"搜不存在的词", "", "zzz", 0},
+		{"都不过滤", "", "", false, 3},
+		{"只按文件夹", "INBOX", "", false, 2},
+		{"只按搜索词", "", "爬山", false, 1},
+		{"文件夹 + 搜索词", "INBOX", "alice", false, 1},
+		{"文件夹和搜索词互斥", "Sent", "alice", false, 0},
+		{"搜索词大小写不敏感", "", "ALICE", false, 1},
+		{"搜不存在的词", "", "zzz", false, 0},
+
+		// 只看 clichat：<1> 挂过 meta，<2> <3> 是普通邮件。
+		{"只看 clichat", "", "", true, 1},
+		{"只看 clichat + 文件夹", "INBOX", "", true, 1},
+		{"只看 clichat：这个文件夹里没有", "Sent", "", true, 0},
+		// 三个条件是与的关系：命中搜索词的是一条**普通**邮件，
+		// 所以开了 clichat 过滤之后它必须消失。
+		{"只看 clichat + 搜索词命中普通邮件", "", "爬山", true, 0},
+		{"只看 clichat + 搜索词命中 clichat 邮件", "", "alice", true, 1},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := len(filterThreads(list, tc.folder, tc.query)); got != tc.want {
+			if got := len(filterThreads(list, tc.folder, tc.query, tc.chatOnly)); got != tc.want {
 				t.Errorf("过滤出 %d 个, want %d", got, tc.want)
 			}
 		})
@@ -460,7 +490,7 @@ func TestFilterThreads(t *testing.T) {
 // 不过滤时必须原样返回同一个切片 —— 界面靠这个判断"现在没在过滤"。
 func TestFilterThreads_NoFilterReturnsInput(t *testing.T) {
 	list := []thread.Thread{mkThread("<1>", "INBOX", "x", "a@b.c")}
-	got := filterThreads(list, "", "   ")
+	got := filterThreads(list, "", "   ", false)
 	if len(got) != 1 || got[0].ID != "<1>" {
 		t.Errorf("不过滤时不该改变内容: %v", got)
 	}

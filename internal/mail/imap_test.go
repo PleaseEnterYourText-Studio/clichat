@@ -299,21 +299,23 @@ func TestApplyRawHeaders_RawHeaderWinsOverEnvelope(t *testing.T) {
 // ⚠️ Body 那张表的键必须是**响应形态**（Peek=false）：GetBody 会先
 // `section.resp()` 把 Peek 清掉再去查表，用请求形态的键永远查不到 —— 而那
 // 会让这条判据假绿（拿不到原始头，于是只剩 ENVELOPE 的值）。
+//
+// ⚠️ 形态**从 headerSection() 派生**，不在这里把字段表重列一遍。
+// 重列的代价刚付过一次：往 headerSection 的 Fields 里加一个
+// X-Clichat-Meta，请求形态就变了，而这里硬编码的响应形态没跟着变 ——
+// 查表落空、原始头没接上，红条指着的却是「产品坏了」。判据的夹具必须
+// 跟着被它守的数据走。
 func TestHeaderFromMessage_WiresTheRawHeaderIn(t *testing.T) {
 	req := headerSection()
-	respForm := &imap.BodySectionName{
-		BodyPartName: imap.BodyPartName{
-			Specifier: imap.HeaderSpecifier,
-			Fields:    []string{"References", "Message-ID", "In-Reply-To"},
-		},
-	}
+	respForm := *req
+	respForm.Peek = false
 	raw := "Message-ID: <from-header@example.com>\r\n\r\n"
 
 	msg := &imap.Message{
 		Uid:      7,
 		Flags:    []string{imap.SeenFlag},
 		Envelope: &imap.Envelope{Subject: "甲"}, // 刻意不带 MessageId
-		Body:     map[*imap.BodySectionName]imap.Literal{respForm: strings.NewReader(raw)},
+		Body:     map[*imap.BodySectionName]imap.Literal{&respForm: strings.NewReader(raw)},
 	}
 
 	got := headerFromMessage(msg, "INBOX", req)

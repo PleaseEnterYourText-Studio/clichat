@@ -6,12 +6,18 @@ import (
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
-// filterThreads 按文件夹和搜索词过滤会话。
+// filterThreads 按文件夹、搜索词和「只看 clichat 消息」过滤会话。
 //
-// folder 为空串表示不按文件夹过滤，query 为空串表示不搜索。
-func filterThreads(list []thread.Thread, folder, query string) []thread.Thread {
+// folder 为空串表示不按文件夹过滤，query 为空串表示不搜索，chatOnly 为假
+// 表示不管这封邮件是谁发的。
+//
+// 三个条件写在同一个函数里而不是叠成三层调用：它们是**同一种操作**
+// （从列表里挑出要显示的那些），界面上任何一处改变过滤条件都要重算这一份
+// 结果。分开写的话，「改了条件却只重算了其中一层」迟早会发生，而症状是
+// 列表显示的和条件对不上 —— 那种错很难看出来。
+func filterThreads(list []thread.Thread, folder, query string, chatOnly bool) []thread.Thread {
 	q := strings.ToLower(strings.TrimSpace(query))
-	if folder == "" && q == "" {
+	if folder == "" && q == "" && !chatOnly {
 		// 不过滤时原样返回：省一次拷贝，也让「没在过滤」这件事
 		// 在测试里可以直接断言。
 		return list
@@ -20,6 +26,14 @@ func filterThreads(list []thread.Thread, folder, query string) []thread.Thread {
 	out := make([]thread.Thread, 0, len(list))
 	for _, th := range list {
 		if folder != "" && !threadInFolder(th, folder) {
+			continue
+		}
+		if chatOnly && !th.HasClichat() {
+			// 判据问的是整个会话（HasClichat 看的是「至少有一条」）：
+			// 一个会话里常常混着对方从网页邮箱发的邮件，按「这个会话
+			// 里有没有 clichat 消息」过滤才符合「跟用 clichat 的人聊天」
+			// 这个诉求。只认最后一条的话，对方换个客户端回一句，整个
+			// 会话就从列表里消失了。
 			continue
 		}
 		if q != "" && !threadMatches(th, q) {
