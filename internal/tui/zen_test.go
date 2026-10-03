@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/thread"
 )
 
@@ -375,6 +376,10 @@ func TestZenStartsGroup(t *testing.T) {
 
 // ---- 尺寸 ----
 
+// zenContentWidth 在四种屏幕宽度下的档位。
+//
+// ⚠️ 这里的 Model 是**手搓的**（只要 cfg 和 width 两样），不走 newSampleModel：
+// 这条判据量的是纯计算，掺进 app / 假邮箱之后，哪个数是从哪儿来的就说不清了。
 func TestZenContentWidth(t *testing.T) {
 	cases := []struct {
 		width int
@@ -394,13 +399,49 @@ func TestZenContentWidth(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := zenContentWidth(c.width)
+		m := Model{cfg: config.Default(), width: c.width}
+		got := m.zenContentWidth()
 		if got != c.want {
 			t.Errorf("zenContentWidth(%d) = %d, want %d（%s）", c.width, got, c.want, c.why)
 		}
 		if got > c.width {
 			t.Errorf("zenContentWidth(%d) = %d —— 正文列比终端还宽，会横向溢出",
 				c.width, got)
+		}
+	}
+}
+
+// 配置里的 zen_width 必须**真的**传到排版这一层。
+//
+// 这是「设置页改了宽度」这个功能唯一的判据：设置页只负责把数写进 cfg，
+// 真正决定正文列宽的是这里。没有这条的话，配置项被读了一半的实现
+// （比如 zen.go 里留了个自己的常量）也能全绿 —— 而那正是用户报的
+// 「我明明改成 60 了，还是那么宽」。
+func TestZenContentWidth_FollowsConfig(t *testing.T) {
+	cases := []struct {
+		limit    int
+		terminal int
+		want     int
+		why      string
+	}{
+		{60, 120, 60, "120 列终端上按配置收窄到 60（不封顶在 78）"},
+		{100, 200, 100, "配置允许比默认的 78 更宽"},
+		{48, 120, 48, "配置的 48 必须赢过实现自己的经验下限 56"},
+		{48, 60, 48, "窄终端上也不该被下限顶回去 —— 用户明确选了 48"},
+		{100, 100, 84, "屏幕比上限窄时以屏幕为准（100-16=84）"},
+		// ⚠️ 这一条量的是「谁赢」不是「谁不溢出」：70 列终端上正文列本来算得 54，
+		// 但被下限垫到 56。屏幕仍放得下 —— zenLeftPad 会把它居中，两侧各留 7 列
+		// 而不是惯常的 8 列，最后还有 m.width-2 那道兜底。**下限赢，屏幕的留白让位**。
+		{60, 70, 56, "屏幕窄到连下限都放不下时，下限胜出（54 → 56，留白 8→7 列）"},
+	}
+
+	for _, c := range cases {
+		cfg := config.Default()
+		cfg.Appearance.ZenWidth = c.limit
+		m := Model{cfg: cfg, width: c.terminal}
+		if got := m.zenContentWidth(); got != c.want {
+			t.Errorf("上限 %d / 终端 %d 列：得 %d，want %d（%s）",
+				c.limit, c.terminal, got, c.want, c.why)
 		}
 	}
 }
@@ -448,7 +489,7 @@ func TestZen_HasNoSidebarAndNoStatusBar(t *testing.T) {
 func TestZen_ContentColumnIsCentred(t *testing.T) {
 	m := zenChatModel(t)
 
-	contentW := zenContentWidth(m.width)
+	contentW := m.zenContentWidth()
 	wantLeft := zenLeftPad(m.width, contentW)
 
 	var ruleLine string
@@ -678,7 +719,7 @@ func TestZen_StatusBeatsHint(t *testing.T) {
 	m, _ = update(m, keyMsg("f2"))
 	m.connected = false
 
-	got := m.renderZenStatus(zenContentWidth(m.width))
+	got := m.renderZenStatus(m.zenContentWidth())
 	if !strings.Contains(got, "offline") {
 		t.Errorf("掉线时该显示 offline，got %q", got)
 	}

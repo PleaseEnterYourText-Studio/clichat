@@ -37,16 +37,26 @@ func TestList_MarksChatThreads(t *testing.T) {
 
 	lines := strings.Split(m.renderThreadList(40, 10), "\n")
 
+	// 先钉住这句话的前提：两个标记**都是两列**。前提不成立的话，
+	// 下面那条对齐判据红得再对也没法解释（分不清是标记变宽了还是错位了）。
+	if a, b := textWidth("@ "), textWidth("· "); a != b {
+		t.Fatalf("两个标记的宽度不一样（@ 是 %d 列，· 是 %d 列）", a, b)
+	}
+
 	// 从**画出来的那一行里**找，不信声明的位置。
+	//
+	// ⚠️ 量的是**显示列**，不是 `strings.Index` 给的**字节下标**。标记那一列
+	// 一边是 `@`（UTF-8 一字节）、一边是 `·`（两字节），字节下标会**天然差 1**
+	// —— 那 1 来自编码长度，不是屏幕上错位。真按字节比，代码完全正确也会红。
 	chatCol, plainCol := -1, -1
 	var chatRow, plainRow string
 	for _, line := range lines {
 		p := plainText(line)
 		if i := strings.Index(p, "alice"); i >= 0 {
-			chatCol, chatRow = i, p
+			chatCol, chatRow = textWidth(p[:i]), p
 		}
 		if i := strings.Index(p, "noreply"); i >= 0 {
-			plainCol, plainRow = i, p
+			plainCol, plainRow = textWidth(p[:i]), p
 		}
 	}
 	if chatRow == "" || plainRow == "" {

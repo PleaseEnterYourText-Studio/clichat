@@ -18,8 +18,13 @@ import (
 // 界面要显示「对方会看到我什么」时也该从这儿取，而不是自己再拼一份。
 // 两份拼法迟早有一份忘了跟着配置改（本仓库为这类「两处各写各的」付过
 // 好几次账）。
+//
+// 身份信息按**当前活动账号**取（cfg.ChatFor）：每个账号可以有自己的
+// 昵称和配色，没单独配过就落回全局默认。直接读 cfg.Chat 会静默忽略
+// 掉账号那份，症状是「我明明在设置里改了，发出去还是老的」。
 func chatIdentityOf(cfg *config.Config) thread.ClichatMeta {
-	nick := cfg.Chat.Nick
+	id := cfg.ChatFor(cfg.Account.Email)
+	nick := id.Nick
 	if nick == "" {
 		// 没单独设昵称就退回账号的显示名：绝大多数人不会去改这一项，
 		// 而「没有昵称」在对方那边只能显示成邮箱前缀，比显示名难认。
@@ -28,10 +33,10 @@ func chatIdentityOf(cfg *config.Config) thread.ClichatMeta {
 	m := thread.ClichatMeta{
 		Version:   clientIDVersion,
 		Nick:      nick,
-		NameColor: cfg.Chat.NameColor,
-		TextColor: cfg.Chat.TextColor,
+		NameColor: id.NameColor,
+		TextColor: id.TextColor,
 	}
-	if !cfg.Chat.HideDevice {
+	if !id.HideDevice {
 		m.Device = RuntimeDevice()
 	}
 	return m
@@ -176,6 +181,32 @@ func cleanChatText(s string, max int) string {
 	return truncateRunes(strings.TrimSpace(b.String()), max)
 }
 
+// ValidChatColor 报告 s 是不是合法的颜色写法（大小写与首尾空格不计）。
+//
+// 界面在**提交之前**问它，为的是当场告诉用户「这个值我不会用」；
+// 而收信那侧不问、直接丢弃（见 cleanChatColor）—— 那里不能因为一个坏
+// 颜色就把整封邮件的身份信息扔掉，宁可退回默认配色。
+//
+// 两处共用这一份判定，免得界面放行了一个 cleanChatColor 会丢掉的值：
+// 那种情况下用户看到「设好了」，对方那边却是默认色，而谁都不会往
+// 「两边校验规则不一致」上想。
+func ValidChatColor(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if len(s) != 4 && len(s) != 7 && len(s) != 9 {
+		return false
+	}
+	if s[0] != '#' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // cleanChatColor 校验一个颜色值，不合法就返回空串。
 //
 // 只认 #rgb / #rrggbb / #rrggbbaa 三种写法。刻意**不**支持颜色名
@@ -184,17 +215,8 @@ func cleanChatText(s string, max int) string {
 // 对方没给 —— 界面上退回默认颜色，而不是把一串疑似控制序列画上去。
 func cleanChatColor(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	if len(s) != 4 && len(s) != 7 && len(s) != 9 {
+	if !ValidChatColor(s) {
 		return ""
-	}
-	if s[0] != '#' {
-		return ""
-	}
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return ""
-		}
 	}
 	return s
 }

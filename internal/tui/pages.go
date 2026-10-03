@@ -649,9 +649,16 @@ func (m Model) handleUnlockKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "down", "tab", "shift+tab":
 		return m.moveAccount(msg.String())
 
-	case "ctrl+n":
-		// 添加账号。**不动**已有配置与凭据（见 beginSetup 的注释）；
-		// 向导走完按邮箱 Upsert，填了同一个邮箱就是重配。
+	case "ctrl+n", "ctrl+r":
+		// 添加账号 / 重配当前账号。**不动**已有配置与凭据（见 beginSetup
+		// 的注释）；向导走完按邮箱 Upsert，填了同一个邮箱就是重配 ——
+		// 所以这两个键本来就是同一个动作，帮助页和这一屏的提示分了两个，
+		// 只是为了让用户按自己心里那个词去按。
+		//
+		// ⚠️ ctrl+r 原先只写在帮助页和这一屏的提示里，handleUnlockKey 里
+		// 根本没有这个分支 —— 于是它落进「其余按键进输入框」，按下去
+		// 什么都不会发生。提示了一个不存在的功能，比少一个键更坑人：
+		// 用户会反复按，然后认为整个程序是坏的。
 		m.status = ""
 		m.beginSetup()
 		return m, nil

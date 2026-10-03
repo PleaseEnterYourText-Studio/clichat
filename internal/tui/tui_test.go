@@ -94,6 +94,16 @@ func TestMain(m *testing.M) {
 // 刻意不走 New() —— 它会去读真实的配置目录，测试不该碰用户的家目录。
 func newMockModel(t *testing.T) (Model, *mail.Fake) {
 	t.Helper()
+	return mockModel(t, nil)
+}
+
+// mockModel 和 newMockModel 一样，但允许调用方在**构造之前**改配置。
+//
+// 有些判据要的正是「构造那一刻配置里就已经是某个值」：比如启动布局 ——
+// 模型造完再改 cfg 的话，那条「构造时读一次」的路径根本没被走到，
+// 判据就变成了在测别的东西。
+func mockModel(t *testing.T, tweak func(*config.Config)) (Model, *mail.Fake) {
+	t.Helper()
 
 	cfg := config.Default()
 	cfg.Account.Email = "me@example.com"
@@ -101,6 +111,9 @@ func newMockModel(t *testing.T) (Model, *mail.Fake) {
 	cfg.IMAP.Host = "imap.example.com"
 	cfg.SMTP.Host = "smtp.example.com"
 	cfg.Sync.InitialDays = 0
+	if tweak != nil {
+		tweak(cfg)
+	}
 
 	fake := mail.NewFake()
 	fake.AddMessage("INBOX", mail.Header{

@@ -44,6 +44,14 @@ const (
 	modeForward
 	// modeConfirm 是删除这类操作前的确认。
 	modeConfirm
+	// modeSettings 是设置页（从列表按 s 进）。
+	modeSettings
+	// modeSettingsEdit 是设置页里正在改某一项，输入框装着新值。
+	//
+	// 拆成两个 mode 而不是在设置页里加一个「在编辑吗」的布尔：编辑态下
+	// ↑/↓/回车 全归输入框，返回设置页时要**重新拾起**光标位置，
+	// 而「现在在跟哪个界面打交道」本来就是这个枚举回答的问题。
+	modeSettingsEdit
 )
 
 // confirmKind 是待确认的操作类型。
@@ -152,6 +160,18 @@ type Model struct {
 	setup setupState
 	// unlock 是解锁页的状态（账号光标、明文开关、删账号的二次确认）。
 	unlock unlockState
+
+	// ---- 设置页 ----
+	//
+	// setCursor 存的是**字段**（setField）而不是行下标：这一页的行列表会随
+	// 上下文变（换个编辑目标，「恢复为全局默认」那一行就没了），存下标会让
+	// 光标在行列表一变之后指到**另一个设置**上 —— 用户按回车就会改错东西。
+	// 见 settings.go 的 moveSetCursor。
+	setCursor setField
+	// editField 是正在编辑的那个字段（只在 modeSettingsEdit 下有意义）。
+	editField setField
+	// setTarget 是身份那一段「编辑哪个账号」：0 = 全局默认，i > 0 = 第 i 个账号。
+	setTarget int
 
 	status    string
 	lastSync  time.Time
@@ -660,6 +680,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleForwardKey(msg)
 	case modeConfirm:
 		return m.handleConfirmKey(msg)
+	case modeSettings:
+		return m.handleSettingsKey(msg)
+	case modeSettingsEdit:
+		return m.handleSettingsEditKey(msg)
 	}
 	return m, nil
 }
@@ -974,6 +998,14 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "?":
 		return m.openHelp()
+
+	case "s":
+		// 设置页。
+		//
+		// 裸字母在这里是安全的：列表上没有输入框，而设置页自己只认
+		// ↑↓←→ / 回车 / Esc，不会把 s 再吃一遍。
+		m.openSettings()
+		return m, nil
 
 	case "a":
 		// 「接收全部邮件」开关。要确认 —— 打开之后首次同步可能要把
@@ -1436,7 +1468,7 @@ func (m Model) maxChatScroll() int {
 func (m Model) chatViewport() int {
 	if m.zenInChat() {
 		statusH := 0
-		if m.renderZenStatus(zenContentWidth(m.width)) != "" {
+		if m.renderZenStatus(m.zenContentWidth()) != "" {
 			statusH = 1
 		}
 		if h := m.height - zenChromeHeight - statusH; h > 1 {
@@ -1618,7 +1650,33 @@ func (m *Model) attach(client mail.Client) error {
 	// 「配好账号之后」才被看到。
 	m.applyInputStyle()
 	m.input.Blur()
+	m.applyStartupLayout()
 	return nil
+}
+
+// applyStartupLayout 按配置把界面摆到「启动时该用的布局」。
+//
+// ⚠️ 只在 attach（连上之后）调用，**绝不能**放进 New()。
+//
+// View 的第一道分支就是 zenActive()，它排在 mode 判断**前面** —— 启动时
+// 就把 layout 置成 Zen 的话，解锁页和配置向导会被禅模式的首页盖掉，
+// 而那两个页面上根本还没有「会话列表」这种东西可列。
+//
+// 放在 attach 里则天然不会出这个问题：解锁 / 配向导期间 layout 一直是
+// Normal（零值），用户第一次看到 Zen 的时刻是「进了列表之后」——
+// 那正是「启动布局」这句话的意思。
+func (m *Model) applyStartupLayout() {
+	if m.cfg.StartupLayout() != config.LayoutZen {
+		return
+	}
+	m.layout = layoutZen
+	m.zenScreen = zenHome
+	// 和按 F2 进来一样先亮一下怎么用：用户没有按过任何键，
+	// 屏幕上却是个陌生的界面，这时候那行提示最有用。
+	m.zenShowHint = true
+	m.applyInputStyle()
+	m.setZenFocus()
+	m.syncInputWidth()
 }
 
 // Close 收尾：断开连接并落盘索引。

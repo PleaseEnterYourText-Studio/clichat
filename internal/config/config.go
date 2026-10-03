@@ -52,9 +52,12 @@ const (
 //
 //	v1  单账号：Account / IMAP / SMTP 直接摊在 Config 上
 //	v2  多账号：Accounts 列表 + Active（上一次用的那个邮箱）
+//	v3  每账号身份：Profile.Chat 覆盖全局的 Chat，外加 Appearance
 //
 // v1 → v2 的迁移在 migrate() 里，读到旧文件自动升上来，用户无感。
-const CurrentVersion = 2
+// v2 → v3 无需改写（新增的都是可选字段），但版本号照样升 ——
+// 这样「配置文件是哪一代」一眼可见，将来真要改结构时有地方挂。
+const CurrentVersion = 3
 
 // Endpoint 是一个 IMAP 或 SMTP 服务端点。
 type Endpoint struct {
@@ -132,6 +135,23 @@ type Sync struct {
 // 它随每一封发出去的信带给对方，放在 X-Clichat-Meta 头里 —— 对方只有
 // 用 clichat 才看得见，普通邮件客户端里连这个头都不显示（见
 // internal/mail/chatmeta.go 的 ChatMetaHeader）。
+//
+// # 它有两个挂载点：全局默认 + 每账号覆盖
+//
+// Config.Chat 是**全局默认**，Profile.Chat 是**这个账号自己的**，
+// 取用一律走 Config.ChatFor(email)，别直接读其中任意一个。
+//
+// 两个挂载点是「每账号 + 全局兜底」，而不是二选一。原先只有全局那一份，
+// 理由是「Chat 描述的是我这个人，不是某个邮箱，用两个邮箱和同一个人聊天
+// 时不该出现两个昵称」。这个理由对**昵称**成立，对别的字段不成立：
+//
+//   - 工作邮箱的昵称常要写「张工」、私人邮箱写「张三」，同一个人在不同
+//     场合本来就有不同的自称；
+//   - 颜色同理由：工作账号用低调的灰、私人账号用亮色，是有意义的区分；
+//   - 而「上不上报设备信息」这件事，很多人只在意公司邮箱那一头。
+//
+// 所以保留全局那份当默认（新账号、没单独配过的人零成本可用），
+// 每个账号可以整套覆盖掉。
 type Chat struct {
 	// Nick 是对方看到的昵称。留空时退回当前账号的 DisplayName，
 	// 这样刚装好、什么都没配的人也是可读的（见 chatIdentityOf）。
@@ -165,6 +185,21 @@ type Profile struct {
 	Account Account  `json:"account"`
 	IMAP    Endpoint `json:"imap"`
 	SMTP    Endpoint `json:"smtp"`
+
+	// Chat 是这个账号**自己**的身份信息。nil 表示「跟随全局默认」
+	// （Config.Chat），取用一律走 Config.ChatFor(email)。
+	//
+	// ⚠️ 覆盖是**整套**的，不做逐字段合并。逐字段合并看起来更贴心，实际
+	// 做不到：「没设」和「设成了零值」在 JSON 里是同一个东西，而
+	// HideDevice 恰恰是个反向布尔（零值 = 上报设备）—— 用零值表示
+	// 「没设」就等于永远没法表达「这个账号要上报设备」。要真做逐字段
+	// 就得把每个字段改成指针，读配置的每一处都得解引用一层，为一点点
+	// 便利把整块配置搞脏，不划算。
+	//
+	// 所以界面上的做法是：进设置页时先拿**生效值**（全局兜底之后的那份）
+	// 填进去，用户改哪一项就把整套实体化写下来；另有「恢复为全局默认」
+	// 把这一项清回 nil。
+	Chat *Chat `json:"chat,omitempty"`
 
 	// OAuth 只在 Auth=AuthOAuth2 的服务商上有值。
 	//
@@ -210,6 +245,61 @@ func (t Token) Valid() bool {
 	return t.AccessToken != "" && time.Now().Add(2*time.Minute).Before(t.Expiry)
 }
 
+// 布局模式。存的是字符串而不是数字：配置文件是给人看、给人改的，
+// "zen" 比 1 有用得多，而且加一种布局时不会让老文件里的数字含义漂移。
+const (
+	LayoutNormal = "normal"
+	LayoutZen    = "zen"
+)
+
+// 禅模式正文列宽的上下限和默认值。
+//
+// 和 tui 里那份是**两份**，但用途不同：这里是「配置值合法区间」，
+// 那边是「排版算出来的兜底区间」。校验配置时用这份，渲染时仍以那边的
+// 屏幕约束为准（配置说 78 列、终端只有 40 列，当然按 40 列画）。
+//
+// ⚠️ **默认值必须等于 zen.go 里那个硬编码的上限**，不能图省事用 ZenMaxWidth。
+// ZenMaxWidth 是「允许你调到多宽」，不是「默认多宽」：拿它当默认值，等于
+// 每个升级上来的老配置一启动就把禅模式正文列从 78 撑到 100 列 —— 一个
+// 没人要求过的视觉变化，而且它会**静默**发生（老配置里没有 appearance 段，
+// 补默认值这一步在用户看不见的地方）。
+const (
+	ZenMinWidth = 48
+	// ZenMaxWidth 是允许的最大值。它比默认值宽，是给想要「一行尽量长」的人
+	// 留的余量；真用满 100 列值不值得（眼睛回扫会累）由用户自己判断。
+	ZenMaxWidth = 100
+	// ZenDefaultWidth 是没设过时的宽度，等于 Zen 一直以来的表现。
+	ZenDefaultWidth = 78
+)
+
+// Appearance 是界面外观。
+//
+// 和 Chat 不同，它是**全局**的，没有每账号那一层：「我喜欢禅模式」
+// 跟用哪个邮箱无关，为它再加一套 per-profile 覆盖只会让人以为
+// 「换个账号界面就变了」。
+type Appearance struct {
+	// Layout 是**启动时**用哪种布局：LayoutNormal（两栏）或 LayoutZen。
+	//
+	// 它只决定初始值，运行中按 F2 切走的那个选择不写回来 ——
+	// 「今天想用禅模式看一封信」和「以后默认就用禅模式」是两件事，
+	// 把前者当成后者会让下次启动莫名其妙地换了个界面。
+	Layout string `json:"layout"`
+
+	// ZenWidth 是禅模式正文列宽的上限（默认 ZenDefaultWidth）。
+	//
+	// 它是在「屏幕能放下」的前提下再收一道：一行超过七八十个字符之后
+	// 眼睛回扫会累，这个值让人可以按自己的字体和屏幕再收紧一点。
+	ZenWidth int `json:"zen_width"`
+
+	// ZenSplit 为真表示禅模式里**不**把同一个人连着说的几句并成一组。
+	//
+	// ⚠️ 字段名是反的，理由和 Chat.HideDevice 一样：默认行为是「合并」，
+	// 零值必须对应「合并」。写成 ZenGroup bool 的话，零值 false 会让
+	// 「升级上来的老配置（没有 appearance 段）」和「主动关掉合并的人」
+	// 塌成同一种状态。
+	ZenSplit bool `json:"zen_split,omitempty"`
+}
+
 // Config 是落在磁盘上的非敏感配置。
 type Config struct {
 	Version int `json:"version"`
@@ -238,10 +328,13 @@ type Config struct {
 
 	Sync Sync `json:"sync"`
 
-	// Chat 描述的是**我这个人**，不是某个邮箱账号，所以它和 Sync 一样
-	// 挂在 Config 上而不是 Profile 里 —— 用两个邮箱和同一个人聊天时，
-	// 不该出现两个昵称。
+	// Chat 是身份信息的**全局默认**，每个账号可以用 Profile.Chat 整套
+	// 覆盖它。取用一律走 ChatFor(email)，别直接读这里 —— 直接读会
+	// 静默忽略掉账号自己那一份，而且症状是「我明明设了却不生效」。
 	Chat Chat `json:"chat"`
+
+	// Appearance 是界面外观。它没有每账号那一层，理由见 Appearance 的注释。
+	Appearance Appearance `json:"appearance"`
 
 	path string // config.json 的绝对路径，不参与序列化
 }
@@ -255,6 +348,10 @@ func Default() *Config {
 			InitialDays:         90,
 			InitialMaxMessages:  500,
 			Folders:             []string{"INBOX", "Sent"},
+		},
+		Appearance: Appearance{
+			Layout:   LayoutNormal,
+			ZenWidth: ZenDefaultWidth,
 		},
 	}
 }
@@ -415,6 +512,68 @@ func (c *Config) Profiles() []Profile {
 	return out
 }
 
+// ChatFor 返回某个账号**实际生效**的身份信息。
+//
+// 这是取身份的唯一入口：账号自己那份优先，没有就退回全局默认。
+// 发信（mail.chatIdentityOf）和设置页显示都用它 —— 两处各取各的话，
+// 设置页会显示「跟全局」而发出去的却是另一份，症状极其难查。
+func (c *Config) ChatFor(email string) Chat {
+	if p := c.ProfileOf(email); p != nil && p.Chat != nil {
+		return *p.Chat
+	}
+	return c.Chat
+}
+
+// SetChatFor 覆盖某个账号的身份信息。ch 为 nil 表示恢复「跟随全局默认」。
+// 账号不存在时返回 false。
+//
+// 存的是**副本**：传进来的 ch 常常是调用方手里那个可变的临时值，
+// 直接存指针会让「改完界面上的草稿还没提交、配置已经跟着变了」。
+func (c *Config) SetChatFor(email string, ch *Chat) bool {
+	p := c.ProfileOf(email)
+	if p == nil {
+		return false
+	}
+	if ch == nil {
+		p.Chat = nil
+		return true
+	}
+	cp := *ch
+	p.Chat = &cp
+	return true
+}
+
+// OwnChat 报告某个账号有没有自己那份身份信息。
+//
+// 给设置页用：要显示「跟随全局默认」还是「本账号单独设」。
+func (c *Config) OwnChat(email string) bool {
+	p := c.ProfileOf(email)
+	return p != nil && p.Chat != nil
+}
+
+// ZenWidthLimit 返回禅模式正文列宽的上限。
+//
+// 越界或没设时退回 ZenDefaultWidth：0 是「没设」不是「宽度为零」，
+// 直接把 0 交给排版会算出空列。
+//
+// ⚠️ 退回的是**默认值**不是上限。这两个数很容易混，后果是「没设过的人
+// 拿到一个他从没选过的宽度」—— 见 ZenDefaultWidth 的注释。
+func (c *Config) ZenWidthLimit() int {
+	w := c.Appearance.ZenWidth
+	if w < ZenMinWidth || w > ZenMaxWidth {
+		return ZenDefaultWidth
+	}
+	return w
+}
+
+// StartupLayout 返回启动时该用的布局，非法值退回两栏。
+func (c *Config) StartupLayout() string {
+	if c.Appearance.Layout == LayoutZen {
+		return LayoutZen
+	}
+	return LayoutNormal
+}
+
 // SetActive 把活动账号切到 email 并展开镜像。找不到这个账号返回 false。
 func (c *Config) SetActive(email string) bool {
 	p := c.ProfileOf(email)
@@ -498,33 +657,45 @@ func (c *Config) collapseActive() {
 // migrate 把老格式的配置升到当前版本。
 //
 // v1 → v2：单账号的 account / imap / smtp 收进 Accounts[0]，Active 指向它。
+// v2 → v3：**不需要改写**。v3 新增的 Profile.Chat 和 Appearance 都是可选的，
+// 缺省即「跟随全局默认」/「用默认外观」；顶层那个 chat 段在 v2 里就是全局的，
+// v3 里它仍然是全局那份，语义没变。
 //
 // ⚠️ 它**直接解析原始字节**，不是看已经反序列化好的 Config —— v2 里那三个
 // 字段的标签是 `json:"-"`（它们只是活动账号的镜像），从 v1 文件里**读不出来**。
 // 曾经写成「检查 c.Account.Email 是否非空」，结果是：v1 文件读进来之后
 // Account 永远是空的 → 迁移判定「没有账号可迁」→ **用户的账号凭空消失**，
 // 界面上直接跳回配置向导。这一类必须由「拿真实 v1 文件喂进去」的判据守着。
+//
+// 按版本号分段的写法也是从那次教训来的：原先只有一句
+// `if c.Version >= CurrentVersion { return nil }`，再加一版时就会把 v2 的
+// 文件也送进 v1 的解析路径（这次侥幸无害，因为 v2 文件里读不出 account），
+// 下一次就未必了。
 func (c *Config) migrate(data []byte) error {
 	if c.Version >= CurrentVersion {
 		return nil
 	}
 
-	var v1 struct {
-		Account Account  `json:"account"`
-		IMAP    Endpoint `json:"imap"`
-		SMTP    Endpoint `json:"smtp"`
+	if c.Version < 2 {
+		var v1 struct {
+			Account Account  `json:"account"`
+			IMAP    Endpoint `json:"imap"`
+			SMTP    Endpoint `json:"smtp"`
+		}
+		if err := json.Unmarshal(data, &v1); err != nil {
+			return fmt.Errorf("解析 v1 配置失败: %w", err)
+		}
+		if v1.Account.Email != "" && len(c.Accounts) == 0 {
+			c.Accounts = []Profile{{
+				Account: v1.Account,
+				IMAP:    v1.IMAP,
+				SMTP:    v1.SMTP,
+			}}
+			c.Active = v1.Account.Email
+		}
 	}
-	if err := json.Unmarshal(data, &v1); err != nil {
-		return fmt.Errorf("解析 v1 配置失败: %w", err)
-	}
-	if v1.Account.Email != "" && len(c.Accounts) == 0 {
-		c.Accounts = []Profile{{
-			Account: v1.Account,
-			IMAP:    v1.IMAP,
-			SMTP:    v1.SMTP,
-		}}
-		c.Active = v1.Account.Email
-	}
+
+	// v2 → v3 落到这里，什么也不做。
 	c.Version = CurrentVersion
 	return nil
 }
@@ -639,6 +810,20 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SMTP.TLS == "" {
 		c.SMTP.TLS = TLSImplicit
+	}
+	if c.Appearance.Layout != LayoutZen {
+		c.Appearance.Layout = LayoutNormal
+	}
+	// 越界一律夹回区间，而不是只补 0：手改配置时把宽度写成 500 或 -3
+	// 是很容易的事，夹一下比渲染时再兜底更早、也更好解释。
+	//
+	// ⚠️ 夹回去的是**默认值**，不是 ZenMaxWidth —— 写错一个数的用户
+	// 该拿回默认宽度，而不是顺手被塞一个从没选过的最大值。
+	if c.Appearance.ZenWidth < ZenMinWidth {
+		c.Appearance.ZenWidth = ZenDefaultWidth
+	}
+	if c.Appearance.ZenWidth > ZenMaxWidth {
+		c.Appearance.ZenWidth = ZenDefaultWidth
 	}
 }
 

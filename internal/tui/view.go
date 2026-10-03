@@ -30,6 +30,11 @@ func (m Model) View() string {
 		return m.viewHelp()
 	case modeFolder:
 		return m.viewFolderPicker()
+	case modeSettings, modeSettingsEdit:
+		// 编辑态和浏览态画的是**同一页**，差别只有中间那几行里有一行换成了
+		// 输入框（见 settingsLines）。分成两个 case 各画一遍的话，改一处
+		// 版式就会漏另一处。
+		return m.viewSettings()
 	}
 
 	if m.width < singlePaneWidth {
@@ -181,19 +186,28 @@ func (m Model) renderThreadList(width, height int) string {
 			star = "★ "
 		}
 
-		// clichat 标记再跟在后面，同样占两列。
+		// 来源标记：**clichat 会话和普通邮件各有一个**，不用「有/无」区分。
 		//
-		// 它是**来源**标记，和上面两个（状态标记）不是一类东西，所以
-		// 排在最后、紧挨着名字 —— 读起来是「这几个状态 + 这个人是从
-		// clichat 来的」。用 @ 而不是某个图标：这个字形在任何终端、
-		// 任何 locale 下都恰好一列宽，而图形字符（尤其 East Asian
-		// Ambiguous 那批）在两把宽度尺子下会不一致，名字就会错位。
-		chat := "  "
+		// 早先是「clichat 加 @，普通邮件留空」，后来改成两边都画：留空的那种
+		// 写法要用户在扫视时做一次「没有标记 = 普通邮件」的推理，而这行本来
+		// 就挤着未读和星标三个前缀，少一个标记和「这行我根本没看」在余光里
+		// 长得一模一样。
+		//
+		// 两者都是**两列**，所以来回换也不会让名字错位（有判据：
+		// chatmsg_test.go::TestList_MarksChatThreads，它按**显示列**量
+		// 名字的起始位置 —— 不是按字节下标，那两个标记的 UTF-8 长度不同）。
+		//
+		// 字形选择：@ 是纯 ASCII，任何 locale 下都恰好一列。· 属于
+		// East Asian Ambiguous 那批，在本仓库的尺子（cellWidth 把
+		// Ambiguous 钉成 1 列）下也是一列 —— 和这里已经在用的 ● ★ 同类。
+		// 之所以不用信封之类的图标：真正的图形字符宽度跟着字体走，CJK
+		// 字体下会被撑到两列，整列名字就错开一格。
+		source := "· "
 		if th.HasClichat() {
-			chat = "@ "
+			source = "@ "
 		}
 
-		title := truncate(marker+star+chat+threadTitle(th), width-2)
+		title := truncate(marker+star+source+threadTitle(th), width-2)
 		// 副行是「现在在聊什么」—— 会话里最新一条的主题。一个会话可以
 		// 横跨很多话题，所以它和标题（对方的名字）回答的是两个问题。
 		subject := th.Subject

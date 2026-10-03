@@ -214,7 +214,7 @@ func (m *Model) syncInputWidth() {
 		m.input.Width = 0
 		return
 	}
-	avail := zenContentWidth(m.width)
+	avail := m.zenContentWidth()
 	w := avail - textWidth(m.input.Prompt)
 	if w < 10 {
 		w = 10
@@ -297,24 +297,31 @@ func zenLogo(contentW int) []string {
 // 下一行开头就开始费劲 —— 这是排版常识，也是 Zen 和 Normal 最直观的差别：
 // Normal 用满整幅（信息密度优先），Zen 主动留白（可读性优先）。
 //
-// 三段式：先按「两边各留 8 列」算，窄终端上退到「至少 56 列」，
-// 超宽终端上封顶 78 列，最后兜一道「绝不能超出屏幕」。
-// 最后那道是必需的 —— 前面为了凑 56 列会把宽度顶上去，40 列的终端上
-// 直接溢出，横向滚动条就出来了。
-func zenContentWidth(width int) int {
-	const (
-		maxContent = 78
-		minContent = 56
-	)
-	w := width - 16
-	if w < minContent {
-		w = minContent
+// 四段式：先按「两边各留 8 列」算，窄终端上**垫到 zenMinContent**（别让
+// 正文列缩成一条），再按**配置里的上限**收窄，最后兜一道「绝不能超出屏幕」。
+// 最后那道是必需的 —— 前面为了凑下限会把宽度顶上去，40 列的终端上直接
+// 溢出，横向滚动条就出来了。
+//
+// ⚠️ 配置那道**必须排在下限之后**。反过来的话，用户把宽度设成 48（配置允许）
+// 就永远落不了地：下限 56 会把它顶回去。让「用户明确选的数」赢过「实现自己
+// 定的经验下限」，只在窄终端上（连 48 列都放不下）才轮到屏幕兜底。
+//
+// ⚠️ 上限不是写死在这里的常量，而是 `cfg.ZenWidthLimit()`。写死的话，
+// 设置页改了 zen_width 就是个**只在界面上生效**的假开关 —— 这一类「配置
+// 项被读了一半」的 bug，症状是「我明明改成 60 了，还是那么宽」。
+func (m Model) zenContentWidth() int {
+	const zenMinContent = 56
+	limit := m.cfg.ZenWidthLimit()
+
+	w := m.width - 16
+	if w < zenMinContent {
+		w = zenMinContent
 	}
-	if w > maxContent {
-		w = maxContent
+	if w > limit {
+		w = limit
 	}
-	if w > width-2 {
-		w = width - 2
+	if w > m.width-2 {
+		w = m.width - 2
 	}
 	if w < 1 {
 		w = 1
@@ -399,6 +406,18 @@ func (m Model) zenPresentation(th thread.Thread) []zenItem {
 		})
 	}
 
+	// 分组是**视觉**的（这一条要不要重新标一次名字和时间），所以开关也活在
+	// 这一层：ZenSplit 开着就是「每条都单独标」，关掉（默认）才按人+时间窗并组。
+	//
+	// 不并组时每条自己既是一组的开头也是结尾 —— 渲染那边只看这两个布尔，
+	// 不需要知道「分组被关掉了」这回事。
+	if m.cfg.Appearance.ZenSplit {
+		for i := range items {
+			items[i].GroupStart, items[i].GroupEnd = true, true
+		}
+		return items
+	}
+
 	for i := range items {
 		items[i].GroupStart = i == 0 || zenStartsGroup(items[i-1], items[i])
 		items[i].GroupEnd = i == len(items)-1 || zenStartsGroup(items[i], items[i+1])
@@ -420,7 +439,7 @@ type zenFrame struct {
 }
 
 func (m Model) zenFrame() zenFrame {
-	contentW := zenContentWidth(m.width)
+	contentW := m.zenContentWidth()
 	return zenFrame{width: m.width, contentW: contentW, left: zenLeftPad(m.width, contentW)}
 }
 
@@ -719,7 +738,7 @@ func (m Model) renderZenHeader(th thread.Thread, width int) string {
 // 和 renderChatBody 一样是「渲染」而不是「渲染 + 裁剪」，因为
 // 「最多能卷多少行」（maxChatScroll）要用未裁剪的总行数。
 func (m Model) renderZenBody(th thread.Thread) []string {
-	width := zenContentWidth(m.width)
+	width := m.zenContentWidth()
 
 	var out []string
 	prevBlocky := false

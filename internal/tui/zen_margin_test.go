@@ -66,7 +66,7 @@ func TestZen_ContentColumnCentredAtEveryWidth(t *testing.T) {
 		if left != right {
 			t.Errorf("宽度 %d：正文列左 %d 右 %d —— 没居中", w, left, right)
 		}
-		if want := zenContentWidth(w); ruleW != want {
+		if want := m.zenContentWidth(); ruleW != want {
 			t.Errorf("宽度 %d：分隔线 %d 列，want %d", w, ruleW, want)
 		}
 	}
@@ -107,7 +107,7 @@ func TestZenList_TitleCentredInContentColumn(t *testing.T) {
 			t.Fatalf("宽度 %d：列表里找不到标题行", w)
 		}
 
-		contentW := zenContentWidth(w)
+		contentW := m.zenContentWidth()
 		got := lipgloss.Width(title) - lipgloss.Width(strings.TrimLeft(title, " "))
 		want := zenLeftPad(w, contentW) + (contentW-textWidth("会话"))/2
 		if got != want {
