@@ -42,7 +42,7 @@ func TestLiveHeal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("主密码：%v", err)
 	}
-	idxPath, err := config.IndexPath()
+	idxPath, err := config.IndexPath(cfg.Account.Email)
 	if err != nil {
 		t.Fatalf("IndexPath: %v", err)
 	}

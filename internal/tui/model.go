@@ -1506,8 +1506,22 @@ func (m *Model) connect(creds config.Credentials) error {
 }
 
 // attach 把客户端和索引装配成 app，并切换界面状态。
+//
+// 索引与正文缓存都是**按账号**的（见 config.IndexPath）：它们装的是那个
+// 邮箱的邮件和同步游标，两个账号共用一份等于把两家的信搅进同一张列表。
 func (m *Model) attach(client mail.Client) error {
-	idxPath, err := config.IndexPath()
+	email := m.cfg.Account.Email
+
+	// 认领 v1 时代的单账号文件（index.json / bodies.json）。
+	//
+	// 只在升级后的第一次启动发生：那时目录里躺着一份没有账号前缀的索引，
+	// 而它本来就是**这个账号**的。不认领的话，用户升级完会看到一张空列表，
+	// 然后眼睁睁看着它从头同步一遍。
+	if _, err := config.AdoptLegacyFiles(email); err != nil {
+		return err
+	}
+
+	idxPath, err := config.IndexPath(email)
 	if err != nil {
 		return err
 	}
@@ -1520,12 +1534,10 @@ func (m *Model) attach(client mail.Client) error {
 	//
 	// ⚠️ 这一处**不是前端的事**，是后端优化落在界面层的接线：缓存的实现、
 	// 上限、LRU 全在 store 里，但「谁去把它打开、交给 App」只有这里能做。
-	// 前端回退到 main 那一版时它被一起带走了 —— 结果是 app.cache 永远是 nil，
-	// 正文缓存整个变成死代码（重启后照旧把眼前那一屏重新下载一遍）。
 	//
 	// 打不开不算错误：它只是缓存，最坏情况是这次启动把刚看过的重新下载一遍。
 	var cache *store.BodyCache
-	if cachePath, err := config.BodyCachePath(); err == nil {
+	if cachePath, err := config.BodyCachePath(email); err == nil {
 		cache = store.OpenBodyCache(cachePath, store.DefaultBodyCacheBytes)
 	}
 
