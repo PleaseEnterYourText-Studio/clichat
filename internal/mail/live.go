@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/oauth"
 
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
@@ -49,9 +51,12 @@ const minTLSVersion = tls.VersionTLS12
 // 连接策略：IMAP 长连接复用（断了自动重连），SMTP 每次发送新建连接。
 // SMTP 用短连接是有意的 —— 发信是低频操作，为它维护一条常连不值当。
 type liveClient struct {
-	cfg  *config.Config
-	user string
-	pass string
+	cfg *config.Config
+	// auth 是这次会话的认证方式（密码或 OAuth2）。
+	//
+	// 它必须在**每次建立连接**时重新取 token —— 见 mail.Auth.Token 的注释：
+	// 长连接被掐断之后重连，拿一个过期的 token 去认证只会得到「认证失败」。
+	auth Auth
 
 	mu   sync.Mutex
 	conn *imapclient.Client
@@ -98,23 +103,63 @@ func (c *liveClient) markAliveLocked() { c.verifiedAt = time.Now() }
 // 一条就能发现并重连。省探活不能省掉「发现连接死了」这个能力。
 func (c *liveClient) markSuspectLocked() { c.verifiedAt = time.Time{} }
 
-// NewClient 用配置和凭据创建一个真实的邮箱客户端。
-func NewClient(cfg *config.Config, creds config.Credentials) (Client, error) {
+// NewClient 用配置与认证方式创建一个真实的邮箱客户端。
+func NewClient(cfg *config.Config, auth Auth) (Client, error) {
 	if !cfg.Configured() {
 		return nil, ErrNotConfigured
 	}
-	return &liveClient{
-		cfg:  cfg,
-		user: cfg.Account.Email,
-		pass: creds.Password,
-	}, nil
+	if auth.User == "" {
+		auth.User = cfg.Account.Email
+	}
+	return &liveClient{cfg: cfg, auth: auth}, nil
 }
 
+// cipherSuites 是客户端愿意谈的 TLS 1.0–1.2 套件。
+//
+// ⚠️ 这里**必须**显式列出，而且必须补上 RSA 密钥交换的那两个 ——
+// 不补的话 139 邮箱和新浪邮箱的 IMAP 一台都连不上，而且报的是一句
+// 完全指不到原因的 `tls: handshake failure`。
+//
+// 实测（2026-10-03，逐套件单发）：
+
+//	imap.139.com:993 / imap.sina.com:993 / imap.sina.cn:993
+//	  RSA-GCM-128        ✓        RSA-CBC-128        ✓
+//	  RSA-GCM-256        ✓        RSA-CBC-256        ✓
+//	  ECDHE-RSA-GCM-128  ×        ECDHE-RSA-CBC-128  ×
+//
+// 也就是说这两家**只肯谈 RSA 密钥交换**，一个 ECDHE 套件都不认；而 Go 从
+// 1.22 起不再默认提供 RSA 密钥交换的套件（它们全在 tls.InsecureCipherSuites()
+// 里）。两边一夹，默认配置下就是握手失败。
+//
+// 补哪几个是有取舍的：
+//   - 只补 GCM 的两个，不补 CBC 的两个。RSA 密钥交换本身没有前向保密，这是
+//     不得不接受的代价（对面只给这个），但 CBC 还额外带填充预言问题，没必要
+//     一起接过来。
+//   - 顺序上把 tls.CipherSuites() 放前面、RSA 那两个放最后：只有对面**不支持**
+//     任何 ECDHE 套件时才会用到它们。其余服务商走的还是原来那套。
+//   - 另一个选项是干脆不支持这两家 —— 那更糟：它们在国内的用户量摆在那儿。
+var cipherSuites = func() []uint16 {
+	var ids []uint16
+	// 安全的那批在前：它们是绝大多数服务商实际会用的。
+	for _, s := range tls.CipherSuites() {
+		ids = append(ids, s.ID)
+	}
+	// RSA 密钥交换的两个放最后：只有对面不支持任何 ECDHE 套件时才会轮到它们。
+	return append(ids,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	)
+}()
+
 // tlsConfig 返回适用于某个主机的 TLS 配置。
+//
+// CipherSuites 只作用于 TLS 1.2 及以下（TLS 1.3 的套件不可配置），所以
+// 上面那件事不影响任何正常支持 TLS 1.3 的服务商。
 func tlsConfig(host string) *tls.Config {
 	return &tls.Config{
-		ServerName: host,
-		MinVersion: minTLSVersion,
+		ServerName:   host,
+		MinVersion:   minTLSVersion,
+		CipherSuites: cipherSuites,
 	}
 }
 
@@ -150,7 +195,20 @@ func (c *liveClient) ensureLocked() error {
 		log.Printf("⚠️ %s=1：完整 IMAP 会话正在写进日志，其中包含邮件头部与正文", imapDebugEnv)
 	}
 
-	if err := conn.Login(c.user, c.pass); err != nil {
+	// 两种认证方式二选一。OAuth2 服务商（Gmail / Outlook）**不接受密码**，
+	// 密码服务商也不认 XOAUTH2 —— 走错一条报出来都是「认证失败」，
+	// 所以这里必须按账号配的方式走，不能"两个都试一遍"。
+	if c.auth.UsesOAuth() {
+		tok, err := c.auth.accessToken(context.Background())
+		if err != nil {
+			_ = conn.Logout()
+			return fmt.Errorf("%w: %v", ErrAuth, err)
+		}
+		if err := conn.Authenticate(oauth.XOAuth2(c.auth.User, tok)); err != nil {
+			_ = conn.Logout()
+			return fmt.Errorf("%w: %v", ErrAuth, err)
+		}
+	} else if err := conn.Login(c.auth.User, c.auth.Password); err != nil {
 		_ = conn.Logout()
 		return fmt.Errorf("%w: %v", ErrAuth, err)
 	}

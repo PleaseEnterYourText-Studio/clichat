@@ -119,6 +119,24 @@ func TestProviders_OAuthEntriesAreMarkedAndExplained(t *testing.T) {
 	if seen == 0 {
 		t.Error("预设里没有任何 OAuth2 条目 —— 带着 Outlook 账号来的人会找不到自己那一条")
 	}
+
+	// 「两条路都行」的服务商同样要给 OAuthURL。
+	//
+	// 它和上面那一条的理由不同：不是"拦住之后要解释"，而是**它提供的那个
+	// 选项必须能用**。用户在密码那一步按了 Ctrl+O、被问到 client id，这时
+	// 没有一个"去哪注册"的链接，他就卡在这儿了 —— 而且很容易以为是自己
+	// 填错了，回头去反复重试。
+	for _, p := range Providers {
+		if p.Auth != AuthEither {
+			continue
+		}
+		if !p.SupportsOAuth2() {
+			t.Errorf("预设 %q 是 AuthEither，SupportsOAuth2 却不认它", p.ID)
+		}
+		if p.OAuthURL == "" {
+			t.Errorf("预设 %q 提供了 OAuth2 这条路，却没给 OAuthURL", p.ID)
+		}
+	}
 }
 
 // 预设里的收/发两半要各自对得上**官方文档**。
@@ -130,6 +148,9 @@ func TestProviders_OAuthEntriesAreMarkedAndExplained(t *testing.T) {
 // iCloud 和 Outlook 是表里仅有的两个**两半不对称**的服务商（收 993 隐式、
 // 发 587 STARTTLS）。它们也是当初"两边共用一个隐式 TLS"那个 bug 唯一能
 // 暴露出来的地方 —— 所以这两行不许被简化掉。
+//
+// 表里的值全部来自 2026-10-03 那次核对：每一条都拿 Go 的 crypto/tls 真连过
+// （见 internal/mail 的 TestLive_PresetEndpoints），外加官方帮助页对照。
 func TestProviders_MatchOfficialSettings(t *testing.T) {
 	want := map[string]struct{ imap, smtp Endpoint }{
 		"qq":      {Endpoint{"imap.qq.com", 993, TLSImplicit}, Endpoint{"smtp.qq.com", 465, TLSImplicit}},
@@ -138,6 +159,24 @@ func TestProviders_MatchOfficialSettings(t *testing.T) {
 		"gmail":   {Endpoint{"imap.gmail.com", 993, TLSImplicit}, Endpoint{"smtp.gmail.com", 465, TLSImplicit}},
 		"icloud":  {Endpoint{"imap.mail.me.com", 993, TLSImplicit}, Endpoint{"smtp.mail.me.com", 587, TLSStartTLS}},
 		"outlook": {Endpoint{"outlook.office365.com", 993, TLSImplicit}, Endpoint{"smtp-mail.outlook.com", 587, TLSStartTLS}},
+
+		"qqexmail": {Endpoint{"imap.exmail.qq.com", 993, TLSImplicit}, Endpoint{"smtp.exmail.qq.com", 465, TLSImplicit}},
+		// 官方 Thunderbird 文档写的是 994；实测 994 与 465 都通，取通行的 465。
+		"qiye163": {Endpoint{"imap.qiye.163.com", 993, TLSImplicit}, Endpoint{"smtp.qiye.163.com", 465, TLSImplicit}},
+		"aliyun":  {Endpoint{"imap.qiye.aliyun.com", 993, TLSImplicit}, Endpoint{"smtp.qiye.aliyun.com", 465, TLSImplicit}},
+		// 新浪和 139 的 IMAP 只认 RSA 密钥交换套件 —— 那两条能出现在这张表里，
+		// 前提是 internal/mail 的 cipherSuites 补了它们（见那边的注释）。
+		// 新浪按后缀分服务器，所以是两条：合成一条的话 @sina.cn 的用户
+		// 会拿到一套连不上的地址，界面上还没有任何地方提示他要换域名。
+		"sina":    {Endpoint{"imap.sina.com", 993, TLSImplicit}, Endpoint{"smtp.sina.com", 465, TLSImplicit}},
+		"sina-cn": {Endpoint{"imap.sina.cn", 993, TLSImplicit}, Endpoint{"smtp.sina.cn", 465, TLSImplicit}},
+		"139":     {Endpoint{"imap.139.com", 993, TLSImplicit}, Endpoint{"smtp.139.com", 465, TLSImplicit}},
+		// 139 的官方帮助**只列了 143/25 明文端口**，而 143 实测不广告 STARTTLS。
+		// 所以这里刻意不是 143 —— 有人"照着官方帮助改回去"时这条会红。
+
+		"yahoo":    {Endpoint{"imap.mail.yahoo.com", 993, TLSImplicit}, Endpoint{"smtp.mail.yahoo.com", 465, TLSImplicit}},
+		"zoho":     {Endpoint{"imap.zoho.com", 993, TLSImplicit}, Endpoint{"smtp.zoho.com", 465, TLSImplicit}},
+		"fastmail": {Endpoint{"imap.fastmail.com", 993, TLSImplicit}, Endpoint{"smtp.fastmail.com", 465, TLSImplicit}},
 	}
 
 	for id, w := range want {

@@ -38,13 +38,23 @@ func runCheck(cfg *config.Config, deep bool) int {
 		return checkCantRun
 	}
 
-	creds, err := unlockCredentials()
+	creds, master, err := unlockCredentials()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "clichat:", err)
 		return checkCantRun
 	}
 
-	client, err := mail.NewClient(cfg, creds)
+	// 认证方式走和界面**同一份**判断（见 mail.AuthFor）：OAuth2 账号
+	// 在自检里也要能连上，而且刷新出来的 token 要落盘，否则自检会把
+	// 一份新 token 用完就丢。
+	auth, err := mail.AuthFor(cfg, &creds, func() error {
+		return config.SaveCredentials(master, creds)
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "clichat:", err)
+		return checkCantRun
+	}
+	client, err := mail.NewClient(cfg, auth)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "clichat: 创建客户端失败:", err)
 		return checkCantRun
@@ -75,15 +85,20 @@ func runCheck(cfg *config.Config, deep bool) int {
 // **刻意不支持把密码当命令行参数传**：argv 会进 shell 历史，也会出现在
 // ps / 任务管理器的进程列表里，同机器的其他用户直接能读到。而 -check 的
 // 场景（用户正焦头烂额地排查连不上）尤其容易被人顺手把密码贴到命令行上。
-func unlockCredentials() (config.Credentials, error) {
+//
+// 返回的主密码要给调用方留着 —— OAuth 的 token 刷新之后要重新加密落盘，
+// 而加密要用它。这里返回而不是让调用方自己再取一次，是为了保证「用来
+// 解密的」和「用来再加密的」一定是同一个（取两次在交互式路径上会问两遍）。
+func unlockCredentials() (config.Credentials, string, error) {
 	if master := os.Getenv("CLICHAT_MASTER"); master != "" {
-		return config.LoadCredentials(master)
+		creds, err := config.LoadCredentials(master)
+		return creds, master, err
 	}
 
 	// 非交互式终端（管道、CI、双击运行）没法提示输入，直接说清楚怎么办，
 	// 别让用户对着一个不动的光标猜。
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return config.Credentials{}, errors.New(
+		return config.Credentials{}, "", errors.New(
 			"需要主密码，但当前不是交互式终端。\n" +
 				"  在脚本里请设环境变量 CLICHAT_MASTER；在终端里直接运行 clichat -check")
 	}
@@ -92,15 +107,16 @@ func unlockCredentials() (config.Credentials, error) {
 	raw, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr) // ReadPassword 不回显换行，自己补一个
 	if err != nil {
-		return config.Credentials{}, fmt.Errorf("读取主密码失败: %w", err)
+		return config.Credentials{}, "", fmt.Errorf("读取主密码失败: %w", err)
 	}
+	master := string(raw)
 
-	creds, err := config.LoadCredentials(string(raw))
+	creds, err := config.LoadCredentials(master)
 	if errors.Is(err, config.ErrWrongPassword) {
 		// 把它翻译成用户能懂的话：底层那句是实现细节，不是给用户看的。
-		return creds, errors.New("主密码错误")
+		return creds, master, errors.New("主密码错误")
 	}
-	return creds, err
+	return creds, master, err
 }
 
 // providerLabel 返回服务商的显示名，找不到预设时退回 ID。

@@ -152,7 +152,9 @@ clichat
 
 On first run a four-step wizard asks for:
 
-1. **Provider** — QQ Mail, 163, 126, Gmail, or custom (fill in the servers yourself)
+1. **Provider** — 15 built-in presets (QQ Mail, 163, 126, Sina, 139, Tencent Exmail,
+   NetEase Enterprise, Alibaba Mail, Gmail, Outlook, iCloud, Yahoo, Zoho, Fastmail),
+   or custom (fill in the servers yourself)
 2. **Email address**
 3. **Auth code** — *not* your login password. Nearly every provider requires an
    app-specific password or authorization code for IMAP/SMTP. The wizard shows
@@ -506,16 +508,56 @@ all?".
 
 **Which providers work out of the box?**
 
-QQ Mail, 163, 126 and Gmail ship as presets — they fill in the servers and ports
-and tell you where to get the auth code. Anything else works via *Custom*.
+Fifteen presets ship in the box. They fill in the servers and ports, and tell you
+**what to put in the password field and where to get it**:
 
-**Why is personal Outlook / Outlook.com not in the list?**
+| Category | Presets |
+|---|---|
+| China, personal | QQ Mail, 163, 126, Sina (@sina.com and @sina.cn), 139 |
+| China, business | Tencent Exmail, NetEase Enterprise, Alibaba Mail |
+| International | Gmail, Outlook / Microsoft 365, iCloud, Yahoo, Zoho, Fastmail |
 
-Microsoft disabled IMAP/SMTP basic authentication for personal accounts on
-2024-09-16. A password will not connect; it requires OAuth2, which v1 does not
-implement. This is a deliberate omission, not an oversight. iCloud is left out
-too — its server addresses were never verified, and a wrong preset is worse than
-no preset.
+Anything else works via *Custom*.
+
+⚠️ Every address in that table was **actually connected to** with Go's crypto/tls
+before being written down — it is not copied out of the docs. Several providers
+(139, Sina, NetEase Enterprise) only document their plaintext ports, so copying
+the docs gives you a preset that cannot connect. The check itself is a runnable
+test:
+
+```bash
+CLICHAT_LIVE_TLS=1 go test ./internal/mail/ -run TestLive_PresetEndpoints -v
+```
+
+**Why does Outlook need me to register an app?**
+
+Microsoft disabled IMAP/SMTP basic authentication across all tenants on
+2024-09-16 — no password will connect, and personal accounts' app passwords died
+with it. So after you pick Outlook the wizard asks for the **client ID of an
+OAuth app you register yourself**, then sends you to the browser to consent.
+
+clichat embeds no client secret (embedding one publishes it — anyone could
+impersonate the app), which is why that step happens in your own console. It is
+also why the wizard prints the full ~200-character authorization URL: over SSH
+the browser is not on this machine, so copying it is the only way through.
+
+**What about Gmail?**
+
+Both routes work: an **app password** (fewer steps; requires two-step verification
+on your Google account) or **OAuth2**. The default is the former; press `Ctrl+O` on
+the password step to switch to the latter — Google Workspace admins often disable
+app passwords, leaving OAuth2 as the only way. `Esc` takes you back.
+
+**139 and Sina fail to connect in other mail clients?**
+
+Their IMAP servers offer **RSA key exchange cipher suites only** — they reject
+every ECDHE suite. Go stopped offering RSA key exchange by default in 1.22, so a
+default Go TLS config always fails the handshake with `tls: handshake failure`.
+clichat explicitly adds those two suites back (only the GCM ones; not the CBC
+variants, which also carry padding-oracle issues).
+
+Keep this in mind if you copy these two accounts into another mail client: it is
+not a wrong address, it is a very old cipher suite on their side.
 
 **163 / 126 fails with `Unsafe Login. Please contact kefu@188.com`**
 

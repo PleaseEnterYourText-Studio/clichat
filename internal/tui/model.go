@@ -70,6 +70,19 @@ type Model struct {
 	cfg *config.Config
 	app *app.App
 
+	// master 是本次会话的主密码，**只在内存里**。
+	//
+	// OAuth2 的 access token 会过期，刷新之后要把新的写回 credentials.enc，
+	// 而那份文件是用主密码加密的 —— 所以刷新时手里必须有它。解锁页刚问过
+	// 一次，留在内存里是唯一不必再问一遍的办法。
+	//
+	// ⚠️ 绝不落盘。落盘就等于把加密解掉了（见用户对「启动页默认填入上一次
+	// 登录的密码」的选择：他选了不存）。
+	master string
+
+	// creds 是本次会话的凭据副本。刷新 token 之后更新它并落盘。
+	creds config.Credentials
+
 	width  int
 	height int
 	ready  bool
@@ -131,6 +144,8 @@ type Model struct {
 
 	input textinput.Model
 	setup setupState
+	// unlock 是解锁页的状态（账号光标、明文开关、删账号的二次确认）。
+	unlock unlockState
 
 	status    string
 	lastSync  time.Time
@@ -214,9 +229,12 @@ func New(cfg *config.Config) Model {
 
 	if cfg.Configured() && config.HasCredentials() {
 		m.mode = modeUnlock
+		m.applyPageInputStyle()
 		m.input.Placeholder = "主密码"
 		m.input.EchoMode = textinput.EchoPassword
 		m.input.Focus()
+		// 光标停在**上一次用的**那个账号上，不是第一个。
+		m.unlock.idx = activeIndex(cfg)
 	} else {
 		m.beginSetup()
 	}
@@ -429,6 +447,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.pollCmd()
 		}
 		return m, tea.Batch(m.syncCmd(), m.pollCmd())
+
+	case oauthResultMsg:
+		// 只在等授权那一步有意义。用户可能在结果回来之前就按 Esc 取消了
+		// （那会把 flow 置 nil 并退回上一步）—— 这时迟到的结果必须丢掉，
+		// 否则会把界面从「正在重填 client id」硬拽到下一步。
+		if m.mode != modeSetup || m.setup.step != stepOAuthWait {
+			return m, nil
+		}
+		return m.applyOAuthResult(msg)
 
 	case syncResultMsg:
 		m.busy = false
@@ -1498,11 +1525,27 @@ func (m Model) activeThread() (thread.Thread, bool) {
 
 // connect 用配置和凭据建立客户端，成功后切到会话列表。
 func (m *Model) connect(creds config.Credentials) error {
-	client, err := mail.NewClient(m.cfg, creds)
+	m.creds = creds
+	auth, err := mail.AuthFor(m.cfg, &m.creds, m.saveCreds)
+	if err != nil {
+		return err
+	}
+	client, err := mail.NewClient(m.cfg, auth)
 	if err != nil {
 		return err
 	}
 	return m.attach(client)
+}
+
+// saveCreds 把凭据重新加密写回。OAuth token 刷新之后要用它落盘。
+//
+// 没有主密码时（比如还没解锁）返回 nil 什么都不做 —— token 已经更新在
+// 内存里了，这一次操作不受影响，只是下次启动要重新授权。
+func (m *Model) saveCreds() error {
+	if m.master == "" {
+		return nil
+	}
+	return config.SaveCredentials(m.master, m.creds)
 }
 
 // attach 把客户端和索引装配成 app，并切换界面状态。
@@ -1547,6 +1590,13 @@ func (m *Model) attach(client mail.Client) error {
 	m.status = "正在同步…"
 	m.busy = true
 	m.connected = false
+	// 把输入框还给列表/会话那套口径。
+	//
+	// 整页那两屏（解锁、配置向导）把输入框嵌进自己的字段框里，所以进去时
+	// 把 Prompt 清掉了（见 applyPageInputStyle）。**离开时必须还原** ——
+	// 不还原的话，会话输入框前面那个 "> " 会永远消失，而这种事只会在
+	// 「配好账号之后」才被看到。
+	m.applyInputStyle()
 	m.input.Blur()
 	return nil
 }

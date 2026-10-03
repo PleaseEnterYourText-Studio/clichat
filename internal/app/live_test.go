@@ -70,7 +70,13 @@ func TestLiveHeal(t *testing.T) {
 	}
 	report("同步前")
 
-	c, err := mail.NewClient(cfg, creds)
+	// 认证方式走产品代码那份判断（AuthFor），别在这里手搓 Auth ——
+	// 手搓的话真机判据测的是「我以为产品怎么认证」，而不是产品真的怎么认证。
+	auth, err := mail.AuthFor(cfg, &creds, nil)
+	if err != nil {
+		t.Fatalf("AuthFor: %v", err)
+	}
+	c, err := mail.NewClient(cfg, auth)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

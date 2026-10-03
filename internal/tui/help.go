@@ -76,6 +76,17 @@ var helpSections = []helpSection{
 		},
 	},
 	{
+		title: "账户与解锁",
+		items: []helpItem{
+			{"回车", "解锁：用主密码解开本地凭据，然后连接邮箱"},
+			{"Ctrl+P", "显示 / 隐藏密码。几十位的授权码在掩码下抄错一位看不出来"},
+			{"↑ / ↓", "启动页上换账号（存了多个邮箱时才有用）"},
+			{"Ctrl+N", "添加账号：再走一遍配置向导，配好的账号都留着"},
+			{"Ctrl+R", "重配当前账号：重新选服务商、重填凭据（OAuth 的重新授权也走这里）"},
+			{"Ctrl+X", "启动页上删掉当前账号的本地凭据（服务器上的邮件不动）"},
+		},
+	},
+	{
 		title: "通用",
 		items: []helpItem{
 			{"?", "打开 / 关闭本页（F1 同）"},
@@ -94,6 +105,10 @@ var helpSections = []helpSection{
 			{"正文格式", "HTML 邮件会转成 Markdown（链接、按钮保留成可点的地址），" +
 				"这类消息头上带一个 HTML 标记"},
 			{"连不上", "退出后运行 clichat -check，它会报出断在哪一步"},
+			{"多账号", "每个账号各自记一份索引和正文缓存，各自用一个授权码；" +
+				"主密码只有一个，解锁时选哪个账号就进哪个"},
+			{"OAuth 登录", "Gmail 和 Microsoft 365 不再接受密码，只能用 OAuth2。" +
+				"要先去服务商控制台注册一个应用、把 client id 填进来（向导里会指路）"},
 			{"禅模式", "按 F2。它是一套独立的界面：首页（字标 + 输入框）→ 会话列表 → " +
 				"会话。三屏共用一列居中的窄栏，没有侧栏、状态栏和消息底色；" +
 				"同一个人连着说的几句并成一组，名字和时间只标一次"},
@@ -110,6 +125,49 @@ var helpSections = []helpSection{
 type hintKey struct {
 	key   string
 	short string
+}
+
+// hintDesc 是「键 → 描述」的映射，从 helpSections 派生。
+//
+// 提取出来给底部提示（listHints）和两个整页（pages.go 的解锁页 /
+// 配置向导）共用 —— 三处各自维护一张文案表的代价，本仓库已经付过了。
+func hintDesc() map[string]string {
+	desc := map[string]string{}
+	for _, s := range helpSections {
+		for _, it := range s.items {
+			if _, ok := desc[it.label]; !ok {
+				desc[it.label] = it.desc
+			}
+		}
+	}
+	return desc
+}
+
+// hintLine 把一组 hintKey 拼成「键 说明 · 键 说明」。不居中、不加缩进 ——
+// 那两件事由调用方按自己版面的需要做。
+//
+// 说明从 helpSections 取（跨全部组，因为 ? 在「通用」那组里）；找不到时
+// **不静默跳过**：那就是「提示里有个不存在的功能」，比少一个键更坑人。
+func hintLine(keys []hintKey) string {
+	desc := hintDesc()
+	parts := make([]string, 0, len(keys))
+	for _, h := range keys {
+		label := h.short
+		if label == "" {
+			d, ok := desc[h.key]
+			if !ok {
+				continue
+			}
+			// 描述可能很长（帮助页那列有宽度可用，这一行没有）：
+			// 在第一个分隔符处取前半句，「接收全部邮件：连历史…」→「接收全部邮件」。
+			if i := strings.IndexAny(d, "：:，,（("); i > 0 {
+				d = d[:i]
+			}
+			label = d
+		}
+		parts = append(parts, h.key+" "+label)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // hintKeys 是底部常驻提示要展示的键与顺序。
@@ -143,37 +201,7 @@ var hintKeys = []hintKey{
 // 文案从 helpSections 派生，不在这里另写一份 —— 两处各写各的，迟早有
 // 一处继续骗人，而且骗的是最该被发现的地方：用户每天看到的那行。
 func listHints() string {
-	// 跨全部组构建映射：? 在「通用」里，不在会话列表那组。
-	desc := map[string]string{}
-	for _, s := range helpSections {
-		for _, it := range s.items {
-			if _, ok := desc[it.label]; !ok {
-				desc[it.label] = it.desc
-			}
-		}
-	}
-
-	parts := make([]string, 0, len(hintKeys))
-	for _, h := range hintKeys {
-		label := h.short
-		if label == "" {
-			d, ok := desc[h.key]
-			if !ok {
-				// hintKeys 里写了个 helpSections 中不存在的键。
-				// 不静默跳过：那就是「提示里有个不存在的功能」，
-				// 比少一个键更坑人。测试会拦住这种情况。
-				continue
-			}
-			// 描述可能很长（帮助页那列有宽度可用，这一行没有）：
-			// 在第一个分隔符处取前半句，「接收全部邮件：连历史…」→「接收全部邮件」。
-			if i := strings.IndexAny(d, "：:，,（("); i > 0 {
-				d = d[:i]
-			}
-			label = d
-		}
-		parts = append(parts, h.key+" "+label)
-	}
-	return "  " + strings.Join(parts, " · ")
+	return "  " + hintLine(hintKeys)
 }
 
 // helpLines 把帮助内容摊平成待渲染的行。

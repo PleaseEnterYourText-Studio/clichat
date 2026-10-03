@@ -660,6 +660,15 @@ func (c *Credentials) ForgetAccount(email string) {
 	delete(c.OAuth, normalizeAddress(email))
 }
 
+// ForgetOAuthToken 只删 token，留着授权码。
+//
+// 一个账号可能从 OAuth2 改成用授权码（或者反过来）。留着另一条路的凭据，
+// 最轻的后果是文件里多一段谁也不看的垃圾；重一点的后果是「明明改成授权码
+// 了却还在走 OAuth」，而那条路的报错是「认证失败」，指不到真正的原因。
+func (c *Credentials) ForgetOAuthToken(email string) {
+	delete(c.OAuth, normalizeAddress(email))
+}
+
 // OAuthToken 取某个账号的 OAuth2 token。
 func (c Credentials) OAuthToken(email string) (Token, bool) {
 	t, ok := c.OAuth[normalizeAddress(email)]

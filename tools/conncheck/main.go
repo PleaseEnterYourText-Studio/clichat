@@ -44,7 +44,9 @@ func main() {
 	config.ApplyProvider(cfg, p)
 	cfg.Account.Email = user
 
-	client, err := mail.NewClient(cfg, config.Credentials{Password: pass})
+	// 自检工具只走「密码/授权码」这条路：它连的是任意服务商，
+	// 而 OAuth2 要用户先注册应用、走一遍浏览器授权，不适合一个一条命令的自检。
+	client, err := mail.NewClient(cfg, mail.Auth{User: user, Password: pass})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "创建客户端失败:", err)
 		os.Exit(2)

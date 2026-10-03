@@ -18,7 +18,27 @@ const (
 
 	// AuthOAuth2 是「必须走 OAuth2 授权」，没有一个能填进密码栏的等价物。
 	AuthOAuth2 AuthMethod = "oauth2"
+
+	// AuthEither 是「两条路都走得通」：默认填密钥（步骤少、不用注册应用），
+	// 用户想走 OAuth2 可以从那一步切过去。
+	//
+	// 为什么需要这一档：Gmail 既接受应用专用密码、也接受 XOAUTH2。把它写死成
+	// AuthSecret 的话，Google Workspace 里被管理员禁掉应用专用密码的用户就
+	// 完全没路可走 —— 而 OAuth2 那条路的代码本来是好的，只是没人能走到它。
+	AuthEither AuthMethod = "either"
 )
+
+// SupportsOAuth2 报告这个预设能不能走 OAuth2。
+//
+// ⚠️ 它必须和 oauth.ForProvider 的覆盖范围**一致**：说能走而那边不认识，
+// 用户会在填完 client id 之后撞上一句「这个版本还不认识 X 的 OAuth 流程」。
+// 有一条判据盯着这个等式（tui 包里的 TestProviders_OAuthSupportMatchesEndpoints）。
+func (p Provider) SupportsOAuth2() bool {
+	return p.Auth == AuthOAuth2 || p.Auth == AuthEither
+}
+
+// RequiresOAuth2 报告这个预设是不是**只能**走 OAuth2（没有密钥那条路）。
+func (p Provider) RequiresOAuth2() bool { return p.Auth == AuthOAuth2 }
 
 // Provider 是一个内置的邮箱服务商预设。
 //
@@ -80,11 +100,24 @@ func TLSOrDefault(v string) string {
 
 // Providers 是内置的服务商预设。
 //
-// 地址来源：各服务商官方文档（QQ/163/126 帮助中心、Google 支持页、
-// Apple 支持页 102525、Microsoft 支持页）。实现验收时会逐条实测连通性。
+// # 这些地址是怎么核对的
+//
+// **不是照抄文档，也不是照抄博客** —— 每一条的 host/port 都拿 Go 自己的
+// crypto/tls 真连过一次（TCP + TLS 握手 + 读 banner，不登录）：
+//
+//	CLICHAT_LIVE_TLS=1 go test ./internal/mail/ -run TestLive_PresetEndpoints -v
+//
+// 那条命令同时就是这份表的回归判据：谁换了端口、撤了加密方式、域名下线，
+// 跑一遍就红。为什么要这样：二手博客互相抄，官方帮助有时只列明文端口
+// （139 就是一例），而**只有连一次能定论**。核对日期 2026-10-03。
+//
+// # 读这张表要记住的两件事
 //
 // ⚠️ 每一条的 IMAP/SMTP 加密方式**都要单独看**，别照着"都是隐式 TLS"抄 ——
 // iCloud 和 Outlook 的发信端口都是 587（STARTTLS）。
+//
+// ⚠️ PasswordLabel 是「密码栏填什么」，它**几乎从来不是**账号登录密码。
+// 这一栏写错，用户会遇到最难自查的一类故障：配置看起来全对，就是认证失败。
 var Providers = []Provider{
 	{
 		ID: "qq", Name: "QQ 邮箱",
@@ -150,20 +183,180 @@ var Providers = []Provider{
 		},
 	},
 	{
+		ID: "qqexmail", Name: "腾讯企业邮 / 企业微信邮箱",
+		IMAPHost: "imap.exmail.qq.com", IMAPPort: 993,
+		SMTPHost: "smtp.exmail.qq.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "客户端专用密码",
+		// 这一条的两个坑都和别家不同，写清楚是因为用户在两处都会误判：
+		//   1. 发信不是"发不出去"，而是**发出去了但网页版看不到** ——
+		//      用户会以为发信失败、反复重发；
+		//   2. 「只同步到最近 30 天」正好压在本程序「首次同步从什么时候
+		//      开始拉」那条设置上，两边叠起来会少收一大截。
+		SMTPNote: "发信端口 465（隐式 TLS）。客户端发出的信默认不进网页版「已发送」，要去 收发信设置 勾上「保存已发送至服务器」。",
+		// 拿密码的那一页在登录态里面（设置 → 邮箱绑定），给不了深链接 ——
+		// 同 163 的理由：未登录访问会被重定向掉，路径保不住。
+		OpenURL: "https://exmail.qq.com/",
+		HelpURL: "https://open.work.weixin.qq.com/help2/pc/19886",
+		// Guide 比别家长，因为企业邮多一道**管理员**的闸：成员自己在网页版
+		// 点了「开启服务」也可能什么都开不了 —— 管理端没给这个成员开客户端
+		// 访问权限。不说这一步，用户会在网页版和客户端之间来回撞，
+		// 而两边都不告诉他去看管理端。
+		Guide: []string{
+			"先让管理员开通客户端权限，没开的话成员这边怎么设置都没用",
+			"管理端路径：企业微信 → 协作 → 邮件 → 安全管理 → 客户端访问权限",
+			"网页版登录企业邮箱：设置 → 收发信设置，开启 IMAP/SMTP 服务",
+			"开了「安全登录」的邮箱，密码栏填 设置 → 邮箱绑定 里的客户端专用密码",
+			"默认只同步最近 30 天邮件，收全部要在 收发信设置 里改收取范围",
+			"信创版主机名是 xcimap / xcsmtp.exmail.qq.com",
+		},
+	},
+	{
+		ID: "qiye163", Name: "网易企业邮",
+		IMAPHost: "imap.qiye.163.com", IMAPPort: 993,
+		// 994 那段不是废话：官方帮助确实写 994，实测两个都开着。写清楚是为了
+		// 让下一个看见 994 的文档、想"顺手改成官方说的那个"的人知道这里查过了。
+		SMTPHost: "smtp.qiye.163.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "客户端授权码",
+		SMTPNote:      "发信端口 465（隐式 TLS）。官方帮助写的是 994，实测 465 和 994 都开着 —— 465 是通行标准，选它。",
+		OpenURL:       "https://qiye.163.com/",
+		HelpURL:       "https://office.163.com/helpCenter/mail/d/1967865131602903042.html",
+		Guide: []string{
+			"网页版登录企业邮箱，在设置里开启 IMAP/SMTP 服务",
+			"到 设置 → 客户端授权码 生成一个，填进来 —— 不是网页登录密码",
+			"管理员可以关掉成员的自助开启权限，开不了就问管理员",
+		},
+	},
+	{
+		ID: "aliyun", Name: "阿里邮箱（企业邮）",
+		IMAPHost: "imap.qiye.aliyun.com", IMAPPort: 993,
+		SMTPHost: "smtp.qiye.aliyun.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "三方客户端安全密码",
+		// 80/587 明确未开通，所以这一句是"别自作聪明换端口"的护栏。
+		SMTPNote: "发信端口 465（隐式 TLS）。官方明确说明 80 和 587 端口未开通，别去试 587。" +
+			"中国香港地区的主机名是 imaphk / smtphk.qiye.aliyun.com，旧版是 imap / smtp.mxhichina.com。",
+		OpenURL: "https://qiye.aliyun.com/",
+		HelpURL: "https://help.aliyun.com/zh/document_detail/36576.html",
+		// 第一条是最要紧的：阿里邮箱**默认禁止第三方客户端**。用户拿到的
+		// 报错是「用户名或密码错误」，而密码是对的 —— 那道闸在管理员那边。
+		Guide: []string{
+			"⚠️ 阿里邮箱默认禁止第三方客户端：先确认管理员没在后台限制、且已开通 POP3/IMAP 权限",
+			"建议先在 设置 → 安全设置 里生成「三方客户端安全密码」再用来登录",
+			"组织强制开启安全密码时，填邮箱登录密码会被直接拒绝",
+			"老域名的地址 imap.mxhichina.com / smtp.mxhichina.com 仍然有效",
+		},
+	},
+	{
+		ID: "sina", Name: "新浪邮箱（@sina.com）",
+		IMAPHost: "imap.sina.com", IMAPPort: 993,
+		SMTPHost: "smtp.sina.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "授权码（16 位）",
+		SMTPNote:      "发信端口 465（隐式 TLS）。官方说 465 不通时可以换 587，但有些地区只开其中一个。",
+		OpenURL:       "https://mail.sina.com.cn/",
+		HelpURL:       "https://help.sina.com.cn/comquestiondetail/view/160/",
+		Guide: []string{
+			"网页版登录新浪邮箱，进入 设置区 → 客户端POP/IMAP/SMTP",
+			"开启 IMAP4/SMTP 服务",
+			"在同一页获取 16 位「授权码」，填进来 —— 不是登录密码",
+		},
+	},
+	{
+		// 与上一条**只差地址**，但必须独立成条：新浪按邮箱后缀分服务器，
+		// 而预设写进配置后用户在向导里改不了（只有「自定义」才让手填）。
+		// 合成一条的话，@sina.cn 的用户会拿到一套连不上的地址，而且
+		// 界面上没有任何地方提示他"该换域名"。
+		ID: "sina-cn", Name: "新浪邮箱（@sina.cn）",
+		IMAPHost: "imap.sina.cn", IMAPPort: 993,
+		SMTPHost: "smtp.sina.cn", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "授权码（16 位）",
+		SMTPNote:      "发信端口 465（隐式 TLS）。官方说 465 不通时可以换 587，但有些地区只开其中一个。",
+		OpenURL:       "https://mail.sina.com.cn/",
+		HelpURL:       "https://help.sina.com.cn/comquestiondetail/view/160/",
+		Guide: []string{
+			"网页版登录新浪邮箱，进入 设置区 → 客户端POP/IMAP/SMTP",
+			"开启 IMAP4/SMTP 服务",
+			"在同一页获取 16 位「授权码」，填进来 —— 不是登录密码",
+			"VIP 邮箱的主机名是 vip.sina.cn —— 用「自定义」手填",
+		},
+	},
+	{
+		ID: "139", Name: "139 邮箱（中国移动）",
+		IMAPHost: "imap.139.com", IMAPPort: 993,
+		SMTPHost: "smtp.139.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "授权码",
+		// ⚠️ 这一家里有个别家都没有的坑，记在这儿免得以后有人把它当成笔误：
+		// imap.139.com 的 993 **只提供 RSA 密钥交换的套件**（一个 ECDHE 都不认），
+		// 所以 Go 默认套件表下它握手就失败，报 `tls: handshake failure`。
+		// 用户端的表现是「配置明明和官方帮助一样，就是连不上」。
+		// 兜住它的是 internal/mail 的 cipherSuites —— 改那边之前先看这段。
+		//
+		// 官方帮助只列了 143/25 两个明文端口，而且 143 实测**不广告 STARTTLS**：
+		// 明文是这条路唯一的官方说法。所以别把预设改成 143。
+		SMTPNote: "发信端口 465（隐式 TLS）。139 的官方帮助只列了明文端口（143/110/25），加密端口是实测确认可用的。",
+		OpenURL:  "https://mail.10086.cn/",
+		HelpURL:  "https://help.mail.10086.cn/statichtml/1/Content/3620.html",
+		Guide: []string{
+			"登录 139 邮箱（手机号@139.com），开启 IMAP/SMTP 服务 —— 系统默认是关闭的",
+			"设置路径：设置 → 常规设置 → 账户与安全 → 邮箱协议设置",
+			"系统默认关闭 POP3/IMAP，不开通的话怎么连都只会报认证失败",
+			"在同一页获取「邮箱授权码」，填进来 —— 不是邮箱登录密码",
+		},
+	},
+	{
 		ID: "gmail", Name: "Gmail",
 		IMAPHost: "imap.gmail.com", IMAPPort: 993,
 		SMTPHost: "smtp.gmail.com", SMTPPort: 465,
-		Auth:          AuthSecret,
+		// 两条路都行，所以是 AuthEither 而不是 AuthSecret。
+		//
+		// 默认那条（应用专用密码）步骤少得多：不用去 Cloud Console 建应用、
+		// 不用填 client id。但 Google Workspace 的管理员可以把应用专用密码
+		// 整个关掉，那时只剩 OAuth2 —— 这两种情况都真实存在，所以两条都留着，
+		// 让用户在密码那一步自己选。
+		Auth:          AuthEither,
 		PasswordLabel: "应用专用密码",
-		SMTPNote:      "发信走同一个应用专用密码，端口 465（隐式 TLS）。免费版每天最多向 500 个收件人发信。",
+		SMTPNote: "发信走同一个应用专用密码，端口 465（隐式 TLS）。免费版每天最多向 500 个收件人发信。" +
+			"若管理员禁用了应用专用密码，就在密码那一步改用 OAuth2 授权。",
 		// 顺序有讲究：没有两步验证就没有应用专用密码，所以 HelpURL 指向
 		// 两步验证页（先决条件），OpenURL 指向真正要拿的凭据页。
 		OpenURL: "https://myaccount.google.com/apppasswords",
 		HelpURL: "https://myaccount.google.com/signinoptions/two-step-verification",
+		// 走 OAuth2 时要在自己的 Cloud Console 里建一个 OAuth 客户端。
+		// 类型选「桌面应用」—— 那份凭据才允许 http://localhost 回调。
+		OAuthURL: "https://console.cloud.google.com/apis/credentials",
 		Guide: []string{
 			"先在 Google 账号里开启「两步验证」—— 不开就没有应用专用密码",
 			"进入 账号 → 安全性 → 两步验证 → 应用专用密码",
 			"生成一个 16 位密码，把它填进来",
+			"（企业/学校账号常被管理员禁用应用专用密码，那就下一步选 OAuth2）",
+		},
+	},
+	{
+		ID: "outlook", Name: "Outlook / Microsoft 365",
+		IMAPHost: "outlook.office365.com", IMAPPort: 993,
+		// 个人 outlook.com 账号的官方值是 smtp-mail.outlook.com；工作/学校
+		// （Microsoft 365）官方值换成 smtp.office365.com。两个都实测过，都通。
+		// 这里取前者 —— 它对个人账号是官方值，而个人账号是本程序的主要用户。
+		SMTPHost: "smtp-mail.outlook.com", SMTPPort: 587, SMTPTLS: TLSStartTLS,
+		// 微软自 2024-09-16 起在全部租户里禁用了 IMAP/POP/SMTP 的基本认证，
+		// 现在只能走 OAuth2（官方原话：Outlook.com requires the use of
+		// Modern Auth / OAuth2）。所以这一条是 AuthOAuth2，不是 AuthEither：
+		// 密码栏填什么都是白填。
+		Auth:          AuthOAuth2,
+		PasswordLabel: "OAuth2 授权",
+		SMTPNote: "发信是 587 + STARTTLS（和收信不一样）。工作/学校账号把服务器换成 smtp.office365.com，端口不变。" +
+			"基本认证已停用，所以发信也要用同一个 OAuth2 授权。",
+		OAuthURL: "https://learn.microsoft.com/zh-cn/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth",
+		HelpURL:  "https://support.microsoft.com/zh-cn/office/pop-imap-%E5%92%8C-smtp-%E8%AE%BE%E7%BD%AE-d088b986-291d-42b8-9564-9c414e2aa040",
+		Guide: []string{
+			"微软已在所有租户里停用 IMAP/SMTP 的基本认证，密码登录这条路没有了",
+			"个人账号的「应用密码」也已随基本认证一起失效，不能当退路",
+			"下一步要填的是你自己注册的应用的 client id（下一步有说明）",
+			"注册时应用类型选「移动和桌面应用程序」，回调地址填 http://localhost",
 		},
 	},
 	{
@@ -188,22 +381,63 @@ var Providers = []Provider{
 		},
 	},
 	{
-		ID: "outlook", Name: "Outlook / Microsoft 365",
-		IMAPHost: "outlook.office365.com", IMAPPort: 993,
-		SMTPHost: "smtp-mail.outlook.com", SMTPPort: 587, SMTPTLS: TLSStartTLS,
-		// 微软自 2024-09-16 起在全部租户里禁用了 IMAP/POP/SMTP 的基本认证，
-		// 现在只能走 OAuth2（官方原话：Outlook.com requires the use of
-		// Modern Auth / OAuth2）。所以这一条**不是**可用的预设，是一条引导。
-		Auth:          AuthOAuth2,
-		PasswordLabel: "OAuth2 授权",
-		SMTPNote:      "地址列在这里只为说明现状：基本认证已停用，填任何密码都连不上。",
-		OAuthURL:      "https://learn.microsoft.com/zh-cn/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth",
-		HelpURL:       "https://support.microsoft.com/zh-cn/office/pop-imap-%E5%92%8C-smtp-%E8%AE%BE%E7%BD%AE-d088b986-291d-42b8-9564-9c414e2aa040",
+		ID: "yahoo", Name: "Yahoo 邮箱",
+		IMAPHost: "imap.mail.yahoo.com", IMAPPort: 993,
+		SMTPHost: "smtp.mail.yahoo.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "第三方应用密码",
+		// Yahoo 的 IMAP/SMTP **确实**广告 AUTH=XOAUTH2（实测），但它的 OAuth
+		// 对邮件协议只开放给商业合作方，个人开发者拿不到 —— 所以这里只能是
+		// AuthSecret，不能写成能走 OAuth2。
+		SMTPNote: "发信 465（隐式 TLS）。中国大陆访问 Yahoo 的服务会直接跳转到停止服务页，这个账号在国内基本用不了。",
+		OpenURL:  "https://login.yahoo.com/account/security",
+		HelpURL:  "https://my.help.yahoo.com/kb/mail/generate-third-party-passwords-sln15241.html",
 		Guide: []string{
-			"微软已在所有租户里停用 IMAP/SMTP 的基本认证，密码登录这条路没有了",
-			"替代办法只有 OAuth2：应用去微软申请、拿授权码、换令牌 —— clichat 本版本还没做",
-			"个人 Outlook 账号的「应用密码」也已随基本认证一起失效，不能当退路",
-			"现在的可行选择：换一个上面列出的服务商，或者用企业邮箱走「自定义」",
+			"打开 Yahoo 账户安全页，找到「生成第三方应用密码」",
+			"生成一个 16 位应用密码并复制",
+			"密码栏填它 —— 不是你的 Yahoo 账号密码",
+		},
+	},
+	{
+		ID: "zoho", Name: "Zoho Mail",
+		IMAPHost: "imap.zoho.com", IMAPPort: 993,
+		SMTPHost: "smtp.zoho.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "应用专用密码",
+		// Zoho 的 IMAP **广告 XOAUTH2**（实测），官方也有一篇 SASL XOAuth2
+		// 说明 —— 但它换 token 时**要求 client_secret**，而本程序的设计是
+		// 「不携带任何凭据、靠公开客户端 + PKCE」（见 internal/oauth 的包注释）。
+		// 塞一个 secret 进客户端等于公开它。所以这里只能是 AuthSecret。
+		//
+		// 区域说明：上面两个主机名是 .com 数据中心的。注册在 zoho.eu / .in /
+		// .jp / .com.au 的账号主机名后缀不同，得用「自定义」手填。
+		SMTPNote: "发信 465（隐式 TLS）。主机名按数据中心分：这里填的是 .com 那一套，" +
+			"账号注册在 zoho.eu / zoho.in / zoho.jp / zoho.com.au 的话要用对应的主机名。",
+		OpenURL: "https://accounts.zoho.com/home#security/app_password",
+		HelpURL: "https://www.zoho.com/mail/help/imap-access.html",
+		Guide: []string{
+			"登录 Zoho 账户，进入 安全 → App Password（应用专用密码）",
+			"生成一个应用专用密码并复制",
+			"密码栏填它 —— 账号密码在 IMAP 上是填不通的",
+		},
+	},
+	{
+		ID: "fastmail", Name: "Fastmail",
+		IMAPHost: "imap.fastmail.com", IMAPPort: 993,
+		SMTPHost: "smtp.fastmail.com", SMTPPort: 465,
+		Auth:          AuthSecret,
+		PasswordLabel: "App 专用密码",
+		// Fastmail 的 IMAP 广告 XOAUTH2（实测），但那是给自家 API/JMAP 的：
+		// 官方帮助里对第三方邮件客户端只说 App Password。所以是 AuthSecret。
+		//
+		// 还有一条套餐限制值得直说：Basic 套餐根本不含 IMAP/SMTP。
+		SMTPNote: "发信 465（隐式 TLS）。Basic 套餐不含 IMAP/SMTP 权限，用这个套餐的话第三方客户端连不上。",
+		OpenURL:  "https://app.fastmail.com/settings/security",
+		HelpURL:  "https://www.fastmail.help/hc/en-us/articles/1500000278342-Server-names-and-ports",
+		Guide: []string{
+			"登录 Fastmail 网页版，进入 Settings → Privacy & Security",
+			"在「Connected apps & API tokens」里新建一个 App password",
+			"权限选「Mail, Contacts & Calendars」，复制生成的 16 位密码填进来",
 		},
 	},
 	{
@@ -213,6 +447,7 @@ var Providers = []Provider{
 		Guide: []string{
 			"手填 IMAP / SMTP 服务器地址与端口",
 			"大多数服务商不接受登录密码，需要用授权码或应用专用密码",
+			"加密方式：993 / 465 选隐式 TLS，143 / 587 选 STARTTLS",
 		},
 	},
 }

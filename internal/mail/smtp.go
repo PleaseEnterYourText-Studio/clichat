@@ -2,6 +2,7 @@ package mail
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/PleaseEnterYourText-Studio/clichat/internal/config"
+	"github.com/PleaseEnterYourText-Studio/clichat/internal/oauth"
 
 	"github.com/emersion/go-message/charset"
 )
@@ -67,7 +69,7 @@ func (c *liveClient) Send(msg Outgoing) (string, error) {
 		}
 	}
 
-	raw, msgID, err := BuildMessage(c.cfg.Account.DisplayName, c.user, msg)
+	raw, msgID, err := BuildMessage(c.cfg.Account.DisplayName, c.auth.User, msg)
 	if err != nil {
 		return "", err
 	}
@@ -79,10 +81,19 @@ func (c *liveClient) Send(msg Outgoing) (string, error) {
 	}
 	defer conn.Close()
 
-	if err := conn.Auth(smtp.PlainAuth("", c.user, c.pass, ep.Host)); err != nil {
+	// 和收信那边同一套判断：OAuth2 服务商不接受密码。
+	if c.auth.UsesOAuth() {
+		tok, err := c.auth.accessToken(context.Background())
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", ErrAuth, err)
+		}
+		if err := conn.Auth(oauth.SMTPAuth(c.auth.User, tok)); err != nil {
+			return "", fmt.Errorf("%w: %v", ErrAuth, err)
+		}
+	} else if err := conn.Auth(smtp.PlainAuth("", c.auth.User, c.auth.Password, ep.Host)); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrAuth, err)
 	}
-	if err := conn.Mail(c.user); err != nil {
+	if err := conn.Mail(c.auth.User); err != nil {
 		return "", fmt.Errorf("SMTP MAIL FROM 被拒: %w", err)
 	}
 	for _, rcpt := range recipients {

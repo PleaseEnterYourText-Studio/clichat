@@ -23,3 +23,4 @@ docs/images/raw/
 # Python（tools/ 下的截图脚本）
 __pycache__/
 *.pyc
+/conncheck.exe

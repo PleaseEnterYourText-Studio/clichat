@@ -329,8 +329,7 @@ func (ms *mailServer) client(t *testing.T) *liveClient {
 
 	return &liveClient{
 		cfg:  &config.Config{IMAP: config.Endpoint{Host: "127.0.0.1", Port: 1}},
-		user: "username",
-		pass: "password",
+		auth: Auth{User: "username", Password: "password"},
 	}
 }
 
